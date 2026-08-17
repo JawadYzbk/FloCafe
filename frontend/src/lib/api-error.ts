@@ -25,7 +25,7 @@ export function apiErrorText(
 ): string {
   const data = (err as { response?: { data?: ApiErrorBody } })?.response?.data;
   const code = data?.reason || data?.code;
-  if (code) {
+  if (typeof code === 'string' && code) {
     const key = `${namespace}.${code}`;
     const translated = t(key);
     // t() falls back to the key itself when missing — only use a real translation.

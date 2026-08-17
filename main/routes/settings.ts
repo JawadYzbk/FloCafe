@@ -89,14 +89,14 @@ function boolFlag(value: unknown): string | undefined {
   return value ? 'true' : 'false';
 }
 
-const LOCALE_PREFERENCE_VALUES: Record<string, Set<string>> = {
-  currency_display: new Set(['rial', 'toman', 'toman_short']),
-  number_digits: new Set(['locale', 'latin']),
-  calendar: new Set(['locale', 'persian', 'gregorian']),
-};
+const LOCALE_PREFERENCE_VALUES = new Map<string, Set<string>>([
+  ['currency_display', new Set(['rial', 'toman', 'toman_short'])],
+  ['number_digits', new Set(['locale', 'latin'])],
+  ['calendar', new Set(['locale', 'persian', 'gregorian'])],
+]);
 
 function validLocalePreference(key: string, value: unknown): boolean {
-  const allowed = LOCALE_PREFERENCE_VALUES[key];
+  const allowed = LOCALE_PREFERENCE_VALUES.get(key);
   if (!allowed) return true;
   return typeof value === 'string' && allowed.has(value);
 }

@@ -23,20 +23,16 @@ jobs:
         include:
           - os: ubuntu-latest
             target: --linux
-            extra-deps: sudo apt-get update -qq && sudo apt-get install -y fakeroot dpkg
           # better-sqlite3 >= v13 ships prebuilt binaries for all platforms,
           # so no native cross-compilation is needed. Both builds run on the
           # same ARM64 runner; electron-builder packages the correct prebuild
           # and afterPack.js validates the architecture.
           - os: macos-latest
             target: --mac --x64
-            extra-deps: echo "No extra deps needed"
           - os: macos-latest
             target: --mac --arm64
-            extra-deps: echo "No extra deps needed"
           - os: windows-latest
             target: --win
-            extra-deps: echo "No extra deps needed"
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
@@ -52,7 +48,8 @@ jobs:
             frontend/package-lock.json
 
       - name: Install platform dependencies
-        run: ${{ matrix.extra-deps }}
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y fakeroot dpkg
 
       - name: Install npm dependencies
         run: npm ci
@@ -71,8 +68,10 @@ jobs:
         run: npm test
 
       - name: Package (unpacked directory, no installer)
-        run: npx electron-builder ${{ matrix.target }} --dir --publish never
+        shell: bash
+        run: npx electron-builder $BUILD_TARGET --dir --publish never
         env:
+          BUILD_TARGET: ${{ matrix.target }}
           CSC_IDENTITY_AUTO_DISCOVERY: false
 
       - name: Upload build artifacts

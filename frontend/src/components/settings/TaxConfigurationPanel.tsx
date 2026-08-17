@@ -212,10 +212,17 @@ function categoryIdOf(override: TaxOverride): string {
 type Translate = (key: string, params?: Record<string, string | number>) => string;
 
 function entityTypeLabel(t: Translate, entityType: unknown): string {
-  if (typeof entityType === 'string' && entityType in ENTITY_LABELS) {
+  if (typeof entityType === 'string' && Object.prototype.hasOwnProperty.call(ENTITY_LABELS, entityType)) {
     return t(ENTITY_LABELS[entityType as OverrideEntityType]);
   }
   return t('tax.target');
+}
+
+function actionLabel(t: Translate, action: string): string {
+  if (typeof action === 'string' && Object.prototype.hasOwnProperty.call(ACTION_LABELS, action)) {
+    return t(ACTION_LABELS[action]);
+  }
+  return action;
 }
 
 function auditDescription(row: AuditRow, t: Translate): string {
@@ -1346,7 +1353,7 @@ export function TaxConfigurationPanel({ isOwner }: { isOwner: boolean }) {
             <tbody>
               {detail?.overrides.map((override) => (
                 <tr key={override.id} className="border-b border-gray-50">
-                  <td className="py-3 pe-3"><span className="text-xs text-gray-400">{t(ENTITY_LABELS[override.entity_type])}</span><br />{override.entity_name || t('tax.storeWide')}</td>
+                  <td className="py-3 pe-3"><span className="text-xs text-gray-400">{entityTypeLabel(t, override.entity_type)}</span><br />{override.entity_name || t('tax.storeWide')}</td>
                   <td className="py-3 pe-3">{categoriesById.get(categoryIdOf(override)) || categoryIdOf(override)}</td>
                   <td className="py-3 pe-3 text-xs text-gray-500">{formatDateTime(override.updated_at)}{override.created_by_name ? ` · ${override.created_by_name}` : ''}</td>
                   <td className="py-3 text-end">
@@ -1416,7 +1423,7 @@ export function TaxConfigurationPanel({ isOwner }: { isOwner: boolean }) {
             <div key={row.id} className="flex items-start gap-3 rounded-lg border border-gray-100 px-3 py-3">
               <Clock3 size={15} className="mt-0.5 shrink-0 text-gray-400" />
               <div className="min-w-0 flex-1">
-                <p className="text-sm font-medium text-gray-800">{t(ACTION_LABELS[row.action] || row.action)}</p>
+                <p className="text-sm font-medium text-gray-800">{actionLabel(t, row.action)}</p>
                 {auditDescription(row, t) && <p className="truncate text-xs text-gray-600">{auditDescription(row, t)}</p>}
                 <p className="text-xs text-gray-500">{row.actor_name || (row.actor_user_id ? t('tax.auditUnknownUser') : t('tax.auditSystem'))} · {formatDateTime(row.created_at)}</p>
               </div>
