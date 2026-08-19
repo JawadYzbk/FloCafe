@@ -319,7 +319,7 @@ export function generateBillHtml(
       </thead>
       <tbody>
         ${bill.payment_details.map(p => `
-          <tr><td>${escapeHtml(resolvePaymentMethodLabel(p.method, lang))}</td><td class="text-end num">${fmtAmount(p.amount)}</td></tr>
+          <tr><td>${escapeHtml(resolvePaymentMethodLabel(p.method, lang))}${p.tender_currency && p.tender_amount ? ` <span style="opacity:.6">(${escapeHtml(p.tender_amount.toLocaleString())} ${escapeHtml(p.tender_currency)})</span>` : ''}</td><td class="text-end num">${fmtAmount(p.amount)}</td></tr>
         `).join('')}
       </tbody>
     </table>

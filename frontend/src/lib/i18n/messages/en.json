@@ -625,6 +625,7 @@
     "taxLine": "{title} @{rate}%",
     "total": "Total",
     "totalDue": "Total Due",
+    "tenderCurrency": "Tender currency",
     "unpaid": "Unpaid",
     "updateDiscount": "Update Discount",
     "walletMaxAmount": "Wallet amount exceeds available balance. Max: {max}"
@@ -1574,7 +1575,29 @@
     "whatsapp": "WhatsApp",
     "whatsappSharing": "WhatsApp Sharing",
     "yes": "Yes",
-    "zeroNoLimit": "(0 = no limit)"
+    "zeroNoLimit": "(0 = no limit)",
+    "currencies": "Currencies",
+    "currenciesHint": "Your prices and reports stay in the base currency. Add other currencies you accept as payment; the exchange rate is applied at checkout.",
+    "baseCurrency": "Base currency",
+    "rateSource": "Rate source",
+    "rateManual": "Manual",
+    "rateAuto": "Live (Frankfurter)",
+    "rate": "Rate (per 1 base)",
+    "roundTo": "Round tender to nearest",
+    "roundingMode": "Rounding",
+    "roundingModeHalfUp": "Nearest (half up)",
+    "roundingModeFloor": "Down",
+    "roundingModeCeil": "Up",
+    "roundingPreview": "Rounding preview",
+    "currencyCodePlaceholder": "e.g. LBP",
+    "refreshRates": "Refresh live rates",
+    "currencyCodeInvalid": "Enter a valid 3-letter currency code",
+    "currencyDuplicate": "That currency is already in the list",
+    "currencyRateInvalid": "Enter a positive rate",
+    "currencyNotAuto": "This currency has no live rate — set it manually",
+    "saved": "Saved",
+    "ratesRefreshed": "Rates updated",
+    "languageAr": "العربية (AR)"
   },
   "setup": {
     "alreadyCompleted": "Setup has already been completed on this install. Redirecting to login…",
@@ -1661,7 +1684,8 @@
     "tagline": "Create the owner account and choose the restaurant setup.",
     "terms": "Terms and Conditions",
     "termsIntro": "I agree to the FloPOS",
-    "welcome": "Welcome to FloCafe"
+    "welcome": "Welcome to FloCafe",
+    "languageArabic": "Arabic"
   },
   "staff": {
     "addButton": "Add Staff",

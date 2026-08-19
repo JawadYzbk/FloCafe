@@ -8,6 +8,15 @@ import { requireMasterPin } from '../middleware/master-pin';
 import { validateTaxRegistrationNumber } from '../services/tax';
 import { sendEvent } from '../services/telemetry';
 import { getCountryByCode, getCurrencySymbol } from '../countries';
+import {
+  isValidCurrencyCode,
+  isFrankfurterSupported,
+  parseSecondaryCurrency,
+  parseSecondaryCurrenciesJson,
+  serializeSecondaryCurrencies,
+  FRANKFURTER_CURRENCIES,
+} from '../currency-config';
+import { refreshRates } from '../services/fx-rate';
 import { getHttpRequestSignal, trackHttpRequestWork } from '../shutdown';
 import { asyncHandler } from '../middleware/async-handler';
 import { normalizeOptionalPhone } from '../lib/phone';
@@ -231,6 +240,91 @@ router.put('/business', requireRole('owner', 'manager'), (req: Request, res: Res
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
+// ── Multi-currency (base + accepted tender) ──────────────────────────────────
+
+function currenciesShape(s: Record<string, string>) {
+  const base = (isValidCurrencyCode(s.base_currency) ? s.base_currency : (s.currency || 'INR')).toUpperCase();
+  return {
+    base_currency: base,
+    secondary_currencies: parseSecondaryCurrenciesJson(s.secondary_currencies),
+    // Currencies Frankfurter can auto-quote; anything else must use a manual rate.
+    frankfurter_currencies: [...FRANKFURTER_CURRENCIES],
+  };
+}
+
+router.get('/currencies', requireRole('owner', 'manager', 'cashier', 'server', 'chef'), (req: Request, res: Response) => {
+  try {
+    res.json(currenciesShape(getAllSettings(getDatabase())));
+  } catch (error: any) {
+    console.error('[API] Internal error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.put('/currencies', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+  try {
+    const { base_currency, secondary_currencies } = req.body;
+    const db = getDatabase();
+    const current = getAllSettings(db);
+
+    const effectiveBase = (base_currency !== undefined
+      ? String(base_currency).toUpperCase()
+      : (isValidCurrencyCode(current.base_currency) ? current.base_currency : (current.currency || 'INR')).toUpperCase());
+    if (!isValidCurrencyCode(effectiveBase)) {
+      return res.status(400).json({ error: 'Invalid base currency code' });
+    }
+
+    let serialized: string | undefined;
+    let hasFrankfurter = false;
+    if (secondary_currencies !== undefined) {
+      if (!Array.isArray(secondary_currencies)) {
+        return res.status(400).json({ error: 'secondary_currencies must be an array' });
+      }
+      const seen = new Set<string>();
+      const cleaned = [];
+      for (const item of secondary_currencies) {
+        const parsed = parseSecondaryCurrency(item);
+        if (!parsed) {
+          return res.status(400).json({ error: 'Each secondary currency needs a valid 3-letter code and a positive rate' });
+        }
+        if (parsed.code === effectiveBase) {
+          return res.status(400).json({ error: `${parsed.code} is the base currency and cannot also be a secondary currency` });
+        }
+        if (parsed.rate_source === 'frankfurter' && !isFrankfurterSupported(parsed.code)) {
+          return res.status(400).json({ error: `${parsed.code} is not supported by Frankfurter — set its rate manually` });
+        }
+        if (seen.has(parsed.code)) {
+          return res.status(400).json({ error: `Duplicate secondary currency ${parsed.code}` });
+        }
+        seen.add(parsed.code);
+        if (parsed.rate_source === 'frankfurter') hasFrankfurter = true;
+        cleaned.push(parsed);
+      }
+      serialized = serializeSecondaryCurrencies(cleaned);
+    }
+
+    upsertSettings(db, {
+      base_currency: base_currency !== undefined ? effectiveBase : undefined,
+      secondary_currencies: serialized,
+    });
+
+    // Pull fresh Frankfurter rates in the background so a newly-added auto
+    // currency shows a live rate promptly. Offline/failure is a no-op.
+    if (hasFrankfurter) void refreshRates();
+
+    res.json(currenciesShape(getAllSettings(db)));
+  } catch (error: any) {
+    console.error('[API] Internal error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Force an immediate Frankfurter refresh (e.g. the owner tapping "Update rates").
+router.post('/currencies/refresh', requireRole('owner', 'manager'), asyncHandler(async (req: Request, res: Response) => {
+  const updated = await refreshRates();
+  res.json({ updated, ...currenciesShape(getAllSettings(getDatabase())) });
+}));
 
 router.get('/tax', requireRole('owner', 'manager', 'cashier', 'server', 'chef'), (req: Request, res: Response) => {
   try {

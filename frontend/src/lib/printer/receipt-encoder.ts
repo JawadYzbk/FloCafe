@@ -15,7 +15,7 @@
 import ReceiptPrinterEncoder from '@point-of-sale/receipt-printer-encoder';
 import type { Bill, Tenant } from '@/lib/types';
 import { normalizeCurrencyToAscii, padCurrencyPrefix } from './unicode';
-import { getCountryByCode, getCurrencySymbol } from '@/lib/countries';
+import { getCountryByCode, getCurrencySymbol, formatNumber } from '@/lib/countries';
 import { formatDate } from './format-date';
 import { formatTaxComponentLabel, resolveTaxComponents } from './tax-components';
 import { safePrinterText, type PrintWarning } from './warnings';
@@ -333,7 +333,7 @@ export function buildClassicReceiptBytes(
   // Payment methods
   if (bill.payment_details && bill.payment_details.length > 0) {
     for (const p of bill.payment_details) {
-      enc.text(padRow(capitalize(p.method), formatAmount(p.amount, currency, locale, trimDecimals), cols)).newline();
+      enc.text(padRow(paymentMethodLabel(p, locale), formatAmount(p.amount, currency, locale, trimDecimals), cols)).newline();
     }
   }
 
@@ -483,7 +483,7 @@ export function buildCompactReceiptBytes(
 
   if (bill.payment_details && bill.payment_details.length > 0) {
     for (const p of bill.payment_details) {
-      enc.text(padRow(capitalize(p.method), formatAmount(p.amount, currency, locale, trimDecimals), cols)).newline();
+      enc.text(padRow(paymentMethodLabel(p, locale), formatAmount(p.amount, currency, locale, trimDecimals), cols)).newline();
     }
   }
 
@@ -652,7 +652,7 @@ export function buildDetailedReceiptBytes(
   // Payment methods
   if (bill.payment_details && bill.payment_details.length > 0) {
     for (const p of bill.payment_details) {
-      enc.text(padRow(capitalize(p.method), formatAmount(p.amount, currency, locale, trimDecimals), cols)).newline();
+      enc.text(padRow(paymentMethodLabel(p, locale), formatAmount(p.amount, currency, locale, trimDecimals), cols)).newline();
     }
   }
 
@@ -711,4 +711,14 @@ function formatAmount(value: number | string, currency: string, locale: string, 
 
 function capitalize(str: string): string {
   return str.charAt(0).toUpperCase() + str.slice(1);
+}
+
+// Payment method label with an optional secondary-currency tender annotation,
+// e.g. "Cash (22,250,000 LBP)". The value column still shows the base amount.
+function paymentMethodLabel(p: { method: string; tender_currency?: string; tender_amount?: number }, locale: string): string {
+  const base = capitalize(p.method);
+  if (p.tender_currency && p.tender_amount) {
+    return `${base} (${formatNumber(p.tender_amount, locale)} ${p.tender_currency})`;
+  }
+  return base;
 }

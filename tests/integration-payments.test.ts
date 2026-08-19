@@ -348,6 +348,66 @@ async function main() {
     const walletAfterG2 = await api(baseUrl, '/api/customers/cust-split/wallet', { headers: authHeader });
     assertEqual(walletAfterG2.data.balance, expectedBalanceG1, 'wallet balance unchanged after cash payment');
 
+    // ═══════════════════════════════════════════════════════════════════
+    // Scenario H: Secondary-currency tender (multi-currency)
+    // Base currency USD; accept LBP at 89,000 LBP per 1 USD. A bill is settled
+    // partly in LBP cash and partly in USD cash. Tender converts to base
+    // authoritatively; the LBP snapshot is persisted on the payment record.
+    // ═══════════════════════════════════════════════════════════════════
+    console.log('\n─── Scenario H: Secondary-currency tender ───');
+    db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('base_currency', 'USD', ?)").run(now());
+    db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('secondary_currencies', ?, ?)")
+      .run(JSON.stringify([{ code: 'LBP', rate: 89000, rate_source: 'manual', rounding: { increment: 1000, mode: 'half_up' } }]), now());
+
+    const orderH = await api(baseUrl, '/api/orders', {
+      method: 'POST',
+      body: { type: 'takeaway', items: [{ product_id: 'prod-pay-1', quantity: 1 }] }, // Burger 500
+      headers: authHeader,
+    });
+    assertEqual(orderH.status, 201, 'order H created');
+    const billH = await api(baseUrl, '/api/bills/generate', { method: 'POST', body: { order_id: orderH.data.order.id }, headers: authHeader });
+    const billHId = billH.data.bill.id;
+    const billHTotal = billH.data.bill.total; // base (USD) units
+
+    // Pay half in LBP cash: half the base total × rate = LBP tender.
+    const halfBase = Math.round((billHTotal / 2) * 100) / 100;
+    const lbpTender = halfBase * 89000;
+    const payH1 = await api(baseUrl, `/api/bills/${billHId}/payments`, {
+      method: 'POST',
+      body: { payments: [{ method: 'cash', amount: lbpTender, tender_currency: 'LBP', exchange_rate: 89000 }] },
+      headers: authHeader,
+    });
+    assertEqual(payH1.status, 200, 'LBP tender accepted');
+    assertEqual(payH1.data.bill.payment_status, 'partial', 'partial after LBP tender');
+    // The LBP tender must credit its base equivalent (within a cent).
+    assert(Math.abs(payH1.data.bill.paid_amount - halfBase) <= 0.01, `LBP tender credited ${halfBase} base (got ${payH1.data.bill.paid_amount})`);
+    const paymentsH1 = Array.isArray(payH1.data.bill.payment_details) ? payH1.data.bill.payment_details : JSON.parse(payH1.data.bill.payment_details);
+    assertEqual(paymentsH1[0].tender_currency, 'LBP', 'tender currency snapshotted');
+    assertEqual(paymentsH1[0].exchange_rate, 89000, 'exchange rate snapshotted');
+    assertEqual(paymentsH1[0].tender_amount, lbpTender, 'tender amount snapshotted');
+
+    // Pay the rest in USD (base) cash.
+    const payH2 = await api(baseUrl, `/api/bills/${billHId}/payments`, {
+      method: 'POST',
+      body: { payments: [{ method: 'cash', amount: payH1.data.bill.balance }] },
+      headers: authHeader,
+    });
+    assertEqual(payH2.status, 200, 'USD remainder accepted');
+    assertEqual(payH2.data.bill.payment_status, 'paid', 'bill fully paid across two currencies');
+    assertEqual(payH2.data.bill.balance, 0, 'balance = 0');
+
+    // An unaccepted tender currency is rejected.
+    const orderH2 = await api(baseUrl, '/api/orders', { method: 'POST', body: { type: 'takeaway', items: [{ product_id: 'prod-pay-2', quantity: 1 }] }, headers: authHeader });
+    const billH2 = await api(baseUrl, '/api/bills/generate', { method: 'POST', body: { order_id: orderH2.data.order.id }, headers: authHeader });
+    const payReject = await api(baseUrl, `/api/bills/${billH2.data.bill.id}/payments`, {
+      method: 'POST',
+      body: { payments: [{ method: 'cash', amount: 1000, tender_currency: 'EUR', exchange_rate: 1 }] },
+      headers: authHeader,
+    });
+    assertEqual(payReject.status, 400, 'unaccepted tender currency rejected');
+
+    db.prepare("DELETE FROM settings WHERE key IN ('base_currency', 'secondary_currencies')").run();
+
   } finally {
     server.close();
     closeDatabase();

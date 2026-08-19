@@ -15,6 +15,11 @@ import { PAYMENT_METHODS, type CustomPaymentMethod } from '@/lib/payment-methods
 import { useFormatCurrency } from '@/hooks/useFormatCurrency';
 import { useFormatNumber } from '@/hooks/useFormatNumber';
 import { useCurrencyUnitAdapter } from '@/hooks/useCurrencyUnitAdapter';
+import {
+  convertTenderToBase,
+  convertBaseToTender,
+  type SecondaryCurrency,
+} from '@/lib/countries';
 import { useWhatsAppReady } from '@/hooks/useWhatsAppReady';
 import { sendBillViaFlo, shareBillViaWhatsApp } from '@/lib/whatsapp-share';
 import { useAuthStore } from '@/store/auth';
@@ -38,6 +43,9 @@ interface Payment {
   method: string;
   payment_method_id?: number;
   amount: string;
+  // Tender currency code when paying in a secondary currency (e.g. LBP);
+  // undefined means the tenant base currency.
+  currency?: string;
 }
 
 // Fixed conversion rate for redeeming loyalty wallet points as payment (points per 1 currency unit).
@@ -99,6 +107,8 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
   const [walletBalance, setWalletBalance] = useState<number | null>(null);
   const [walletAmount, setWalletAmount] = useState('');
   const [customMethods, setCustomMethods] = useState<CustomPaymentMethod[]>([]);
+  const [secondaryCurrencies, setSecondaryCurrencies] = useState<SecondaryCurrency[]>([]);
+  const baseCurrency = currentTenant?.currency ?? 'INR';
 
   // Discount state
   const [showDiscount, setShowDiscount] = useState(false);
@@ -175,6 +185,12 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
         setDiscountRequiresApproval(!!res.data.discount_requires_approval);
       })
       .catch(() => {});
+    api.get('/settings/currencies')
+      .then((res) => {
+        const list: SecondaryCurrency[] = Array.isArray(res.data?.secondary_currencies) ? res.data.secondary_currencies : [];
+        setSecondaryCurrencies(list.filter((c) => c && typeof c.code === 'string' && Number(c.rate) > 0));
+      })
+      .catch(() => setSecondaryCurrencies([]));
     api.get('/payment-methods')
       .then((res) => {
         const methods: CustomPaymentMethod[] = res.data.payment_methods || [];
@@ -187,17 +203,45 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
       .catch(() => setCustomMethods([]));
   }, [bill.customer_id, cartCustomerId]);
 
+  // Look up the exchange rate for a line's tender currency (null = base currency).
+  const secondaryFor = (code?: string): SecondaryCurrency | undefined =>
+    code && code !== baseCurrency ? secondaryCurrencies.find((c) => c.code === code) : undefined;
+
+  // Convert a payment line's entered amount into stored base-currency units so
+  // every sum, balance check, and change figure stays single-currency.
+  const lineToStoredBase = (p: Payment): number => {
+    const amt = parseFloat(p.amount) || 0;
+    const secondary = secondaryFor(p.currency);
+    return secondary ? convertTenderToBase(amt, secondary.rate) : toStoredUnit(amt);
+  };
+
   const walletAmt = toStoredUnit(parseFloat(walletAmount) || 0);
-  const totalPayment = payments.reduce((s, p) => s + toStoredUnit(parseFloat(p.amount) || 0), 0) + walletAmt;
+  const totalPayment = payments.reduce((s, p) => s + lineToStoredBase(p), 0) + walletAmt;
 
   const updatePaymentAmount = (idx: number, value: string) => {
     setPaymentsTouched(true);
     setPayments(payments.map((payment, index) => index === idx ? { ...payment, amount: value } : payment));
   };
 
+  const setPaymentCurrency = (idx: number, code: string) => {
+    setPaymentsTouched(true);
+    setPayments(payments.map((payment, index) => index === idx
+      ? { ...payment, currency: code === baseCurrency ? undefined : code, amount: '' }
+      : payment));
+  };
+
   const allocateRemainingTo = (idx: number) => {
-    const allocatedElsewhere = payments.reduce((sum, payment, index) => index === idx ? sum : sum + toStoredUnit(parseFloat(payment.amount) || 0), walletAmt);
+    const allocatedElsewhere = payments.reduce((sum, payment, index) => index === idx ? sum : sum + lineToStoredBase(payment), walletAmt);
     const dueStored = Math.max(0, remaining - allocatedElsewhere);
+    const target = payments[idx];
+    const secondary = secondaryFor(target?.currency);
+    if (secondary) {
+      // Allocate the remaining base balance as a rounded tender amount.
+      const { rounded } = convertBaseToTender(dueStored, secondary);
+      setPaymentsTouched(true);
+      setPayments(payments.map((payment, index) => index === idx ? { ...payment, amount: rounded > 0 ? String(rounded) : '' } : payment));
+      return;
+    }
     const dueDisplay = toDisplayUnit(dueStored);
     setPaymentsTouched(true);
     setPayments(payments.map((payment, index) => index === idx ? { ...payment, amount: dueDisplay > 0 ? String(dueDisplay) : '' } : payment));
@@ -274,7 +318,7 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
     }
     const nonCashTotal = payments
       .filter((p) => p.method !== 'cash')
-      .reduce((sum, p) => sum + toStoredUnit(Number(p.amount) || 0), 0) + walletAmt;
+      .reduce((sum, p) => sum + lineToStoredBase(p), 0) + walletAmt;
     if (nonCashTotal > remaining + 0.000001) {
       toast.error(t('paymentAboveBalance'));
       return;
@@ -296,11 +340,20 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
     setProcessing(true);
     try {
       const splitLines = payments
-        .map((p) => ({
-          method: p.payment_method_id === undefined ? p.method : 'custom',
-          ...(p.payment_method_id !== undefined ? { payment_method_id: p.payment_method_id } : {}),
-          amount: toStoredUnit(parseFloat(p.amount) || 0),
-        }))
+        .map((p) => {
+          const base = {
+            method: p.payment_method_id === undefined ? p.method : 'custom',
+            ...(p.payment_method_id !== undefined ? { payment_method_id: p.payment_method_id } : {}),
+          };
+          const secondary = secondaryFor(p.currency);
+          if (secondary) {
+            // Send the tender amount in the secondary currency plus the rate;
+            // the backend converts to base authoritatively.
+            const tenderAmount = parseFloat(p.amount) || 0;
+            return { ...base, amount: tenderAmount, tender_currency: secondary.code, exchange_rate: secondary.rate };
+          }
+          return { ...base, amount: toStoredUnit(parseFloat(p.amount) || 0) };
+        })
         .filter((p) => p.amount > 0 && !isNaN(p.amount));
       if (walletAmt > 0) splitLines.push({ method: 'wallet', amount: walletAmt });
 
@@ -563,23 +616,46 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
               const label = builtIn ? t(BUILT_IN_PAYMENT_KEYS[builtIn.key]) : custom?.name || tCommon('unknown');
               const Icon = builtIn?.icon;
               const active = (parseFloat(payment.amount) || 0) > 0;
-              return <div key={payment.payment_method_id === undefined ? payment.method : `custom:${payment.payment_method_id}`} className="flex h-11">
-                <button type="button" title={label} onClick={() => allocateRemainingTo(idx)} className={`w-36 shrink-0 rounded-s-xl border px-3 flex items-center gap-2 text-sm font-semibold transition-colors ${active ? 'bg-brand text-white border-brand' : 'bg-gray-50 text-gray-700 border-gray-200 hover:border-brand hover:text-brand'}`}>
-                  {Icon && <Icon size={15} />}
-                  <span className="truncate">{label}</span>
-                </button>
-                <div className="flex flex-1 items-center border border-s-0 border-gray-200 rounded-e-xl bg-white focus-within:ring-2 focus-within:ring-brand focus-within:border-transparent">
-                  <span className="ps-3 text-gray-400 text-xs">{inputCurrencyLabel}</span>
-                  <input
-                    type="number"
-                    value={payment.amount}
-                    onChange={(e) => updatePaymentAmount(idx, e.target.value)}
-                    placeholder="0.00"
-                    className="min-w-0 flex-1 px-2 py-2 text-end text-sm font-semibold outline-none rounded-e-xl"
-                    step={inputCurrencyStep}
-                    min="0"
-                  />
+              const secondary = secondaryFor(payment.currency);
+              const lineLabel = secondary ? (secondary.symbol || secondary.code) : inputCurrencyLabel;
+              const lineStep = secondary ? '1' : inputCurrencyStep;
+              // Base-currency equivalent of what the cashier typed in the secondary currency.
+              const baseEquivalent = secondary && (parseFloat(payment.amount) || 0) > 0
+                ? currencyFmt(convertTenderToBase(parseFloat(payment.amount) || 0, secondary.rate))
+                : null;
+              return <div key={payment.payment_method_id === undefined ? payment.method : `custom:${payment.payment_method_id}`} className="space-y-1">
+                <div className="flex h-11">
+                  <button type="button" title={label} onClick={() => allocateRemainingTo(idx)} className={`w-32 shrink-0 rounded-s-xl border px-3 flex items-center gap-2 text-sm font-semibold transition-colors ${active ? 'bg-brand text-white border-brand' : 'bg-gray-50 text-gray-700 border-gray-200 hover:border-brand hover:text-brand'}`}>
+                    {Icon && <Icon size={15} />}
+                    <span className="truncate">{label}</span>
+                  </button>
+                  {secondaryCurrencies.length > 0 && (
+                    <select
+                      value={payment.currency ?? baseCurrency}
+                      onChange={(e) => setPaymentCurrency(idx, e.target.value)}
+                      aria-label={t('tenderCurrency')}
+                      className="shrink-0 border border-s-0 border-gray-200 bg-gray-50 text-xs font-semibold text-gray-600 px-1.5 outline-none focus:ring-2 focus:ring-brand"
+                    >
+                      <option value={baseCurrency}>{baseCurrency}</option>
+                      {secondaryCurrencies.map((c) => <option key={c.code} value={c.code}>{c.code}</option>)}
+                    </select>
+                  )}
+                  <div className="flex flex-1 items-center border border-s-0 border-gray-200 rounded-e-xl bg-white focus-within:ring-2 focus-within:ring-brand focus-within:border-transparent">
+                    <span className="ps-3 text-gray-400 text-xs">{lineLabel}</span>
+                    <input
+                      type="number"
+                      value={payment.amount}
+                      onChange={(e) => updatePaymentAmount(idx, e.target.value)}
+                      placeholder={secondary ? '0' : '0.00'}
+                      className="min-w-0 flex-1 px-2 py-2 text-end text-sm font-semibold outline-none rounded-e-xl"
+                      step={lineStep}
+                      min="0"
+                    />
+                  </div>
                 </div>
+                {baseEquivalent && (
+                  <p className="px-1 text-[11px] text-gray-400 text-end">≈ {baseEquivalent}</p>
+                )}
               </div>;
             })}
           </div>

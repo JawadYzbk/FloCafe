@@ -9,6 +9,7 @@ import { startServer, stopServer, getLocalIP, isServerRunning, getServerPort } f
 import { cloudSync } from './services/cloud-sync';
 import { telemetry, sendEvent as sendTelemetryEvent } from './services/telemetry';
 import { googleDrive } from './services/google-drive';
+import { fxRateService } from './services/fx-rate';
 import { startKdsServer, stopKdsServer, getKdsPort, isKdsServerRunning } from './kds-server';
 import { startServerApp, stopServerApp, getServerAppPort, isServerAppRunning } from './server-app';
 import { initPrinter } from './printers/thermal';
@@ -652,6 +653,7 @@ async function initialize(): Promise<void> {
     cloudSync.start();
     telemetry.start();
     googleDrive.start();
+    fxRateService.start();
 
     console.log('[Flo] Starting KDS server on port 3002...');
     await startKdsServer();
@@ -803,6 +805,7 @@ const cleanupCoordinator = createShutdownCoordinator(() => [
   { name: 'cloud sync', run: () => cloudSync.shutdown(), blocksDatabase: true },
   { name: 'telemetry', run: () => telemetry.stop(), blocksDatabase: true },
   { name: 'Google Drive', run: () => googleDrive.stop(), blocksDatabase: true },
+  { name: 'FX rate', run: () => fxRateService.stop() },
   { name: 'WhatsApp', run: () => shutdownWhatsApp(), blocksDatabase: true },
   { name: 'Bonjour', run: () => stopMdns() },
   { name: 'HTTP handler cleanup', run: () => waitForHttpShutdownWork(), blocksDatabase: true },

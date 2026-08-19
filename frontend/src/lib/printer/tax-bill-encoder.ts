@@ -9,7 +9,7 @@
 import ReceiptPrinterEncoder from '@point-of-sale/receipt-printer-encoder';
 import type { Bill, Tenant } from '@/lib/types';
 import { normalizeCurrencyToAscii, padCurrencyPrefix } from './unicode';
-import { getCountryByCode, getCurrencySymbol } from '@/lib/countries';
+import { getCountryByCode, getCurrencySymbol, formatNumber } from '@/lib/countries';
 import { formatDate } from './format-date';
 import { formatTaxComponentLabel, resolveTaxComponents } from './tax-components';
 import { safePrinterText, type PrintWarning } from './warnings';
@@ -246,7 +246,10 @@ export function buildTaxBillBytes(
     enc.newline();
     enc.text('Payments:').newline();
     for (const p of bill.payment_details) {
-      enc.text(padRow(capitalize(p.method), formatAmount(p.amount, currency, amountLocale, trimDecimals, rawEscPos), cols)).newline();
+      const methodLabel = p.tender_currency && p.tender_amount
+        ? `${capitalize(p.method)} (${formatNumber(p.tender_amount, amountLocale)} ${p.tender_currency})`
+        : capitalize(p.method);
+      enc.text(padRow(methodLabel, formatAmount(p.amount, currency, amountLocale, trimDecimals, rawEscPos), cols)).newline();
     }
   }
 

@@ -64,6 +64,7 @@ const FILES = [
   { lang: 'es', file: path.join(I18N_DIR, 'es.json') },
   { lang: 'pt', file: path.join(I18N_DIR, 'pt.json') },
   { lang: 'fa', file: path.join(I18N_DIR, 'fa.json') },
+  { lang: 'ar', file: path.join(I18N_DIR, 'ar.json') },
 ] as const;
 
 function assert(condition: boolean, msg: string): void {
@@ -388,6 +389,7 @@ const FA_INTENTIONAL_IDENTICAL: ReadonlySet<string> = new Set([
   'settings.instagramPlaceholder', // example handle
   'settings.ipAddressPlaceholder', // example IP
   'settings.kds', // technical acronym
+  'settings.languageAr', // native language name (العربية), shared across locales
   'settings.paperSize58', // measurement
   'settings.paperSize80', // measurement
   'settings.paperWidth58', // measurement

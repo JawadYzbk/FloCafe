@@ -625,6 +625,7 @@
     "taxLine": "{title} @{rate}%",
     "total": "جمع کل",
     "totalDue": "کل قابل پرداخت",
+    "tenderCurrency": "ارز پرداخت",
     "unpaid": "پرداخت‌نشده",
     "updateDiscount": "به‌روزرسانی تخفیف",
     "walletMaxAmount": "مبلغ کیف از مانده در دسترس بیشتر است. بیشینه: {max}"
@@ -1574,7 +1575,29 @@
     "whatsapp": "واتساپ",
     "whatsappSharing": "اشتراک‌گذاری واتساپ",
     "yes": "آری",
-    "zeroNoLimit": "(۰ = بدون محدودیت)"
+    "zeroNoLimit": "(۰ = بدون محدودیت)",
+    "currencies": "ارزها",
+    "currenciesHint": "قیمت‌ها و گزارش‌های شما در ارز پایه باقی می‌مانند. ارزهای دیگری را که به‌عنوان پرداخت می‌پذیرید اضافه کنید؛ نرخ تبدیل هنگام تسویه اعمال می‌شود.",
+    "baseCurrency": "ارز پایه",
+    "rateSource": "منبع نرخ",
+    "rateManual": "دستی",
+    "rateAuto": "زنده (Frankfurter)",
+    "rate": "نرخ (به ازای ۱ پایه)",
+    "roundTo": "گِرد کردن پرداخت به نزدیک‌ترین",
+    "roundingMode": "گِرد کردن",
+    "roundingModeHalfUp": "نزدیک‌ترین (نیمه به بالا)",
+    "roundingModeFloor": "به پایین",
+    "roundingModeCeil": "به بالا",
+    "roundingPreview": "پیش‌نمایش گِرد کردن",
+    "currencyCodePlaceholder": "مثلاً LBP",
+    "refreshRates": "به‌روزرسانی نرخ‌های زنده",
+    "currencyCodeInvalid": "یک کد ارز معتبر سه‌حرفی وارد کنید",
+    "currencyDuplicate": "این ارز از قبل در فهرست است",
+    "currencyRateInvalid": "یک نرخ مثبت وارد کنید",
+    "currencyNotAuto": "این ارز نرخ زنده ندارد — آن را دستی تنظیم کنید",
+    "saved": "ذخیره شد",
+    "ratesRefreshed": "نرخ‌ها به‌روزرسانی شدند",
+    "languageAr": "العربية (AR)"
   },
   "setup": {
     "alreadyCompleted": "راه‌اندازی در این نصب پیش‌تر انجام شده است. در حال بازگشت به ورود…",
@@ -1661,7 +1684,8 @@
     "tagline": "حساب دارنده را بسازید و راه‌اندازی رستوران را برگزینید.",
     "terms": "شرایط و ضوابط",
     "termsIntro": "من با FloPOS موافقم",
-    "welcome": "به FloCafe خوش آمدید"
+    "welcome": "به FloCafe خوش آمدید",
+    "languageArabic": "عربی"
   },
   "staff": {
     "addButton": "افزودن کارمند",

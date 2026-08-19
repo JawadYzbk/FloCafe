@@ -86,6 +86,12 @@ const SUPPORTED: Record<string, Row> = {
   LK: { locale: 'en-LK', currency: 'LKR', tz: 'Asia/Colombo',                    taxIdLabel: 'TIN',   taxName: 'VAT' },
   NP: { locale: 'ne-NP', currency: 'NPR', tz: 'Asia/Kathmandu',                  taxIdLabel: 'TIN',   taxName: 'VAT' },
   EG: { locale: 'ar-EG', currency: 'EGP', tz: 'Africa/Cairo',                    taxIdLabel: 'TIN',   taxName: 'VAT' },
+  // Lebanon's national currency is LBP (the country default seeded at setup).
+  // Businesses that keep USD as their accounting base + accept LBP as a
+  // secondary tender configure that via the multi-currency settings, which are
+  // decoupled from this country default. `en-LB` gives clean Latin-digit
+  // formatting ("L£89,000"). taxName 'VAT' — Lebanon levies 11% VAT.
+  LB: { locale: 'en-LB', currency: 'LBP', tz: 'Asia/Beirut',                     taxIdLabel: 'VAT',   taxName: 'VAT' },
   IL: { locale: 'he-IL', currency: 'ILS', tz: 'Asia/Jerusalem',                                                      taxName: 'VAT' },
   TR: { locale: 'tr-TR', currency: 'TRY', tz: 'Europe/Istanbul',                 taxIdLabel: 'VKN',   taxName: 'KDV' },
   IR: { locale: 'fa-IR', currency: 'IRR', tz: 'Asia/Tehran',                     taxIdLabel: 'Economic Code', taxName: 'VAT',
@@ -125,6 +131,21 @@ export const COUNTRIES: Country[] = Object.keys(SUPPORTED)
 export const getCountryByCode = (code: string): Country | undefined => {
   if (!code) return undefined;
   return COUNTRIES.find((c) => c.code === code.toUpperCase());
+};
+
+/**
+ * The number of minor-unit decimal places a currency uses (USD/INR → 2,
+ * LBP/JPY/KRW → 0), per the active Intl currency data. Falls back to 2 for
+ * unknown codes. Used to size payment inputs so a zero-decimal currency shows
+ * whole-unit stepping instead of a meaningless "0.00".
+ */
+export const currencyFractionDigits = (currency: string, locale = 'en-US'): number => {
+  if (!currency) return 2;
+  try {
+    return new Intl.NumberFormat(locale, { style: 'currency', currency }).resolvedOptions().maximumFractionDigits ?? 2;
+  } catch {
+    return 2;
+  }
 };
 
 export const getCurrencySymbol = (currency: string, locale = 'en-US'): string => {
@@ -254,14 +275,18 @@ export const getCurrencyUnitAdapter = (
     };
   }
 
+  // Size inputs to the currency's real minor units — 2 for USD/INR, 0 for
+  // zero-decimal currencies like LBP/JPY so the cashier types whole units.
+  const decimals = currencyFractionDigits(currency);
+  const step = decimals <= 0 ? '1' : `0.${'0'.repeat(Math.max(0, decimals - 1))}1`;
   return {
     scale: 1,
     label: currency,
-    step: '0.01',
-    maxDecimals: 2,
-    toDisplay: (storedAmount: number) => Number(storedAmount.toFixed(2)),
-    toStored: (displayAmount: number) => Number(displayAmount.toFixed(2)),
-    formatInput: (displayAmount: number) => String(Number(displayAmount.toFixed(2))),
+    step,
+    maxDecimals: decimals,
+    toDisplay: (storedAmount: number) => Number(storedAmount.toFixed(decimals)),
+    toStored: (displayAmount: number) => Number(displayAmount.toFixed(decimals)),
+    formatInput: (displayAmount: number) => String(Number(displayAmount.toFixed(decimals))),
   };
 };
 
@@ -271,6 +296,108 @@ export const formatCurrencyForTenant = (
   currency: string,
   prefs?: LocalePreferences,
 ): string => formatMoney(amount, currency, getCountryByCode(countryCode ?? 'IN')?.locale ?? 'en-US', prefs);
+
+// ── Multi-currency: rounding + base↔tender conversion ────────────────────────
+//
+// FloCafe accounts in a single base currency. A secondary currency (e.g. LBP in
+// Lebanon) may be accepted as *tender* at an exchange rate, converted only at
+// payment time. These helpers are the shared, authoritative primitives used by
+// both the Express settlement path and the payment UI so a converted/rounded
+// amount is computed identically on both sides.
+
+/**
+ * How a converted tender amount is snapped to a usable cash denomination.
+ * - `half_up`  → nearest increment (ties go up)
+ * - `floor`    → always down to the increment (favours the customer)
+ * - `ceil`     → always up to the increment (favours the merchant)
+ */
+export type RoundingMode = 'half_up' | 'floor' | 'ceil';
+
+export interface RoundingRule {
+  /** Denomination to snap to (e.g. 1000 = nearest 1,000). <= 1 disables snapping. */
+  increment: number;
+  mode: RoundingMode;
+}
+
+export const DEFAULT_ROUNDING_RULE: RoundingRule = { increment: 1, mode: 'half_up' };
+
+const FP_EPSILON = 1e-6;
+
+/**
+ * Rounds a non-negative monetary `amount` to the nearest `increment` using
+ * `mode`. `increment <= 1` (or non-finite) returns the amount cleaned of
+ * floating-point noise. Lebanon has no small notes, so LBP due is typically
+ * snapped to the nearest 1,000 or 5,000 — this is that snap.
+ */
+export const roundToIncrement = (
+  amount: number,
+  increment: number,
+  mode: RoundingMode = 'half_up',
+): number => {
+  if (!Number.isFinite(amount)) return 0;
+  if (!Number.isFinite(increment) || increment <= 1) {
+    // No denomination snapping — still strip FP noise to whole units.
+    return Math.round(amount);
+  }
+  const quotient = amount / increment;
+  let units: number;
+  if (mode === 'floor') units = Math.floor(quotient + FP_EPSILON);
+  else if (mode === 'ceil') units = Math.ceil(quotient - FP_EPSILON);
+  else units = Math.floor(quotient + 0.5 + FP_EPSILON); // half_up
+  return units * increment;
+};
+
+export const normalizeRoundingRule = (rule?: Partial<RoundingRule> | null): RoundingRule => {
+  const increment = Number(rule?.increment);
+  const mode = rule?.mode;
+  return {
+    increment: Number.isFinite(increment) && increment > 1 ? increment : DEFAULT_ROUNDING_RULE.increment,
+    mode: mode === 'floor' || mode === 'ceil' || mode === 'half_up' ? mode : DEFAULT_ROUNDING_RULE.mode,
+  };
+};
+
+/**
+ * A secondary currency accepted as tender at `rate` (secondary units per 1
+ * base unit) with an optional cash-rounding rule. `rate_updated_at` records
+ * when the rate was last refreshed (from Frankfurter or a manual override) so
+ * the UI can show staleness; `rate_source` distinguishes the two.
+ */
+export interface SecondaryCurrency {
+  code: string;
+  symbol?: string;
+  rate: number;
+  rate_source: 'frankfurter' | 'manual';
+  rate_updated_at?: string;
+  rounding: RoundingRule;
+}
+
+/**
+ * Converts a base-currency amount to a secondary tender amount and applies the
+ * secondary currency's cash-rounding rule. Returns both the raw and rounded
+ * values so the UI can show "≈ L£1,234,000 (rounded to L£1,235,000)".
+ */
+export const convertBaseToTender = (
+  baseAmount: number,
+  secondary: Pick<SecondaryCurrency, 'rate' | 'rounding'>,
+): { raw: number; rounded: number } => {
+  const rate = Number(secondary.rate);
+  if (!Number.isFinite(rate) || rate <= 0) return { raw: 0, rounded: 0 };
+  const raw = baseAmount * rate;
+  const rule = normalizeRoundingRule(secondary.rounding);
+  return { raw, rounded: roundToIncrement(raw, rule.increment, rule.mode) };
+};
+
+/**
+ * Converts a secondary tender amount back to the base currency. This is the
+ * authoritative direction for settlement: whatever the customer physically
+ * hands over in the secondary currency is credited to the bill at this rate.
+ * Base currencies are 2-decimal here (cents); callers round to base minor units.
+ */
+export const convertTenderToBase = (tenderAmount: number, rate: number): number => {
+  const r = Number(rate);
+  if (!Number.isFinite(r) || r <= 0) return 0;
+  return tenderAmount / r;
+};
 
 /**
  * Formats a plain (non-currency) number using the given locale's digits and

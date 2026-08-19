@@ -625,6 +625,7 @@
     "taxLine": "{title} @{rate}%",
     "total": "Total",
     "totalDue": "Total a Pagar",
+    "tenderCurrency": "Moeda de pagamento",
     "unpaid": "Não Pago",
     "updateDiscount": "Atualizar Desconto",
     "walletMaxAmount": "O valor da carteira excede o saldo disponível. Máx.: {max}"
@@ -1574,7 +1575,29 @@
     "whatsapp": "WhatsApp",
     "whatsappSharing": "Compartilhamento via WhatsApp",
     "yes": "Sim",
-    "zeroNoLimit": "(0 = sem limite)"
+    "zeroNoLimit": "(0 = sem limite)",
+    "currencies": "Moedas",
+    "currenciesHint": "Seus preços e relatórios permanecem na moeda base. Adicione outras moedas que você aceita como pagamento; a taxa de câmbio é aplicada no checkout.",
+    "baseCurrency": "Moeda base",
+    "rateSource": "Origem da taxa",
+    "rateManual": "Manual",
+    "rateAuto": "Ao vivo (Frankfurter)",
+    "rate": "Taxa (por 1 base)",
+    "roundTo": "Arredondar o pagamento para o mais próximo",
+    "roundingMode": "Arredondamento",
+    "roundingModeHalfUp": "Mais próximo (metade acima)",
+    "roundingModeFloor": "Para baixo",
+    "roundingModeCeil": "Para cima",
+    "roundingPreview": "Prévia do arredondamento",
+    "currencyCodePlaceholder": "ex. LBP",
+    "refreshRates": "Atualizar taxas ao vivo",
+    "currencyCodeInvalid": "Insira um código de moeda válido de 3 letras",
+    "currencyDuplicate": "Essa moeda já está na lista",
+    "currencyRateInvalid": "Insira uma taxa positiva",
+    "currencyNotAuto": "Esta moeda não tem taxa ao vivo — defina-a manualmente",
+    "saved": "Salvo",
+    "ratesRefreshed": "Taxas atualizadas",
+    "languageAr": "العربية (AR)"
   },
   "setup": {
     "alreadyCompleted": "A configuração já foi concluída nesta instalação. Redirecionando para o login…",
@@ -1661,7 +1684,8 @@
     "tagline": "Crie a conta de proprietário e escolha a configuração do restaurante.",
     "terms": "Termos e Condições",
     "termsIntro": "Eu concordo com o FloPOS",
-    "welcome": "Bem-vindo ao FloCafe"
+    "welcome": "Bem-vindo ao FloCafe",
+    "languageArabic": "Árabe"
   },
   "staff": {
     "addButton": "Adicionar Funcionário",

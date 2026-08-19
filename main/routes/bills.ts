@@ -25,6 +25,8 @@ import {
 } from '../services/tax';
 import { applyPayableRounding } from '../services/tax-engine';
 import { sendEvent } from '../services/telemetry';
+import { getBaseCurrency, getSecondaryCurrencies } from '../currency-config';
+import { convertTenderToBase } from '../countries';
 
 const router = Router();
 
@@ -1559,6 +1561,49 @@ interface PaymentInput {
   amount?: number | string | null;
   transaction_id?: string;
   notes?: string;
+  // Multi-currency tender: when `tender_currency` is a configured secondary
+  // currency (not the base), `amount` is the amount handed over in that
+  // currency and is converted to base at `exchange_rate` (secondary units per
+  // 1 base unit) before any settlement math. `tender_amount` is the persisted
+  // snapshot of what the customer actually tendered in the secondary currency.
+  tender_currency?: string;
+  exchange_rate?: number;
+  tender_amount?: number;
+}
+
+interface TenderContext {
+  isSecondary: boolean;
+  currency?: string;
+  rate?: number;
+}
+
+/**
+ * Resolves a payment line's tender currency against the tenant's base +
+ * accepted secondary currencies. Base-currency lines (or lines with no
+ * `tender_currency`) return `{ isSecondary: false }` and behave exactly as
+ * before. Secondary-currency lines validate the code is accepted and the rate
+ * is a positive finite number (falling back to the configured rate when the
+ * client omits one). Throws 400 on an unaccepted currency or bad rate.
+ */
+function resolveTenderContext(
+  payment: PaymentInput,
+  baseCurrency: string,
+  secondaryByCode: Map<string, { rate: number }>,
+  lineIndex: number,
+): TenderContext {
+  const raw = payment.tender_currency;
+  if (raw === undefined || raw === null || String(raw).trim() === '') return { isSecondary: false };
+  const code = String(raw).toUpperCase();
+  if (code === baseCurrency) return { isSecondary: false };
+  const secondary = secondaryByCode.get(code);
+  if (!secondary) {
+    throw Object.assign(new Error(`Currency ${code} at line ${lineIndex + 1} is not an accepted tender`), { statusCode: 400 });
+  }
+  const rate = payment.exchange_rate === undefined ? secondary.rate : Number(payment.exchange_rate);
+  if (!Number.isFinite(rate) || rate <= 0) {
+    throw Object.assign(new Error(`A positive exchange rate is required for ${code} at line ${lineIndex + 1}`), { statusCode: 400 });
+  }
+  return { isSecondary: true, currency: code, rate };
 }
 
 // A payment request is prepared and fully validated before any ledger or bill
@@ -1752,15 +1797,29 @@ function preparePaymentBatch(
   if (bill.payment_status === 'paid') throw Object.assign(new Error('Bill is already paid'), { statusCode: 400 });
   const remainingCents = Math.max(0, Math.round((Number(bill.total) - Number(bill.paid_amount || 0)) * 100));
   if (remainingCents <= 0) throw Object.assign(new Error('Bill is already fully paid'), { statusCode: 400 });
-  const raw = resolvedPayments.map((payment) => {
+  // Multi-currency: settle every line in base-currency cents. A secondary-
+  // currency tender is converted here, at the entry of the pipeline, so all
+  // downstream allocation/rounding stays single-currency and unchanged.
+  const baseCurrency = getBaseCurrency();
+  const secondaryByCode = new Map(getSecondaryCurrencies().map((c) => [c.code, c]));
+  const raw = resolvedPayments.map((payment, lineIndex) => {
+    const tender = resolveTenderContext(payment, baseCurrency, secondaryByCode, lineIndex);
     // Preserve omitted/null compatibility for the legacy single-line contracts.
     // Multi-line batches must state every amount explicitly so allocation is
     // deterministic before any write.
     const supportsOmittedAmount = allowOmittedAmount || payments.length === 1;
     const amountValue = supportsOmittedAmount && payment.amount === null ? undefined : payment.amount;
-    const amount = amountValue === undefined
+    if (tender.isSecondary && amountValue === undefined) {
+      throw Object.assign(new Error(`A tender amount is required for ${tender.currency} at line ${lineIndex + 1}`), { statusCode: 400 });
+    }
+    // For a secondary tender the client-supplied amount is in the secondary
+    // currency; convert to base (2-decimal) before turning it into cents.
+    const baseAmountValue = amountValue !== undefined && tender.isSecondary
+      ? convertTenderToBase(Number(amountValue), tender.rate as number).toFixed(2)
+      : amountValue;
+    const amount = baseAmountValue === undefined
       ? (supportsOmittedAmount ? remainingCents : undefined)
-      : paymentAmountCents(amountValue);
+      : paymentAmountCents(baseAmountValue);
     if (amount === undefined) throw Object.assign(new Error('Payment amount is required for split payments'), { statusCode: 400 });
     const normalizedPayment: PaymentInput = {
       method: String(payment.method),
@@ -1768,6 +1827,11 @@ function preparePaymentBatch(
     };
     if (payment.transaction_id !== undefined) normalizedPayment.transaction_id = payment.transaction_id;
     if (payment.notes !== undefined) normalizedPayment.notes = payment.notes;
+    if (tender.isSecondary) {
+      normalizedPayment.tender_currency = tender.currency;
+      normalizedPayment.exchange_rate = tender.rate;
+      normalizedPayment.tender_amount = Number(amountValue);
+    }
     return {
       payment: normalizedPayment,
       method: normalizedPayment.method,

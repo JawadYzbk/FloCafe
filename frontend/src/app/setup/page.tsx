@@ -300,7 +300,7 @@ export default function SetupPage() {
                 <div className="grid gap-3 sm:grid-cols-2">
                   {languageOptions.map((option) => {
                     const selected = language === option;
-                    const label = option === 'es' ? t('languageSpanish') : option === 'pt' ? t('languagePortuguese') : option === 'fa' ? t('languagePersian') : t('languageEnglish');
+                    const label = option === 'es' ? t('languageSpanish') : option === 'pt' ? t('languagePortuguese') : option === 'fa' ? t('languagePersian') : option === 'ar' ? t('languageArabic') : t('languageEnglish');
                     return (
                       <button
                         key={option}

@@ -22,6 +22,7 @@ import { InitializeDatabaseDialog } from '@/components/settings/InitializeDataba
 import { WhatsAppEnableCard } from '@/components/settings/WhatsAppEnableCard';
 import { TaxConfigurationPanel } from '@/components/settings/TaxConfigurationPanel';
 import { PaymentMethodsSettings } from '@/components/settings/PaymentMethodsSettings';
+import { CurrenciesPanel } from '@/components/settings/CurrenciesPanel';
 import { LocalePreferencesPanel } from '@/components/settings/LocalePreferencesPanel';
 import type { HealthCheckReport } from '@/types/electron';
 import { useI18n } from '@/hooks/useI18n';
@@ -2100,6 +2101,7 @@ export default function SettingsPage() {
             <SettingsNavItem label={t('settings.storeDetails')} value="store" active={activeTab} onClick={setActiveTab} />
             <SettingsNavItem label={t('settings.tabPrinters')} value="receipts-printers" active={activeTab} onClick={setActiveTab} />
             <SettingsNavItem label={t('settings.paymentMethods', { defaultValue: 'Payments' })} value="payments" active={activeTab} onClick={setActiveTab} />
+            <SettingsNavItem label={t('settings.currencies', { defaultValue: 'Currencies' })} value="currencies" active={activeTab} onClick={setActiveTab} />
             {canViewTaxConfiguration && (
               <SettingsNavItem label={t('settings.taxConfiguration')} value="tax" active={activeTab} onClick={setActiveTab} />
             )}
@@ -2532,6 +2534,7 @@ export default function SettingsPage() {
                     <option value="es">{t('settings.languageEs')}</option>
                     <option value="pt">{t('settings.languagePt')}</option>
                     <option value="fa">{t('settings.languageFa')}</option>
+                    <option value="ar">{t('settings.languageAr')}</option>
                   </select>
                 </div>
               </div>
@@ -2543,6 +2546,10 @@ export default function SettingsPage() {
 
         <TabsContent value="payments">
           <PaymentMethodsSettings isAdmin={isAdmin} />
+        </TabsContent>
+
+        <TabsContent value="currencies">
+          <CurrenciesPanel isAdmin={isAdmin} />
         </TabsContent>
 
         {canViewTaxConfiguration && (

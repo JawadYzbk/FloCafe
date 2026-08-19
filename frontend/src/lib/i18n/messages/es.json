@@ -625,6 +625,7 @@
     "taxLine": "{title} @{rate}%",
     "total": "Total",
     "totalDue": "Total a pagar",
+    "tenderCurrency": "Moneda de pago",
     "unpaid": "No pagado",
     "updateDiscount": "Actualizar descuento",
     "walletMaxAmount": "El saldo de la billetera supera el disponible. Máximo: {max}"
@@ -1574,7 +1575,29 @@
     "whatsapp": "WhatsApp",
     "whatsappSharing": "Compartir por WhatsApp",
     "yes": "Sí",
-    "zeroNoLimit": "(0 = sin límite)"
+    "zeroNoLimit": "(0 = sin límite)",
+    "currencies": "Monedas",
+    "currenciesHint": "Tus precios e informes permanecen en la moneda base. Agregá otras monedas que aceptes como pago; el tipo de cambio se aplica al cobrar.",
+    "baseCurrency": "Moneda base",
+    "rateSource": "Origen del tipo",
+    "rateManual": "Manual",
+    "rateAuto": "En vivo (Frankfurter)",
+    "rate": "Tipo (por 1 base)",
+    "roundTo": "Redondear el pago al más cercano",
+    "roundingMode": "Redondeo",
+    "roundingModeHalfUp": "Al más cercano (mitad arriba)",
+    "roundingModeFloor": "Abajo",
+    "roundingModeCeil": "Arriba",
+    "roundingPreview": "Vista previa de redondeo",
+    "currencyCodePlaceholder": "ej. LBP",
+    "refreshRates": "Actualizar tipos en vivo",
+    "currencyCodeInvalid": "Ingresá un código de moneda válido de 3 letras",
+    "currencyDuplicate": "Esa moneda ya está en la lista",
+    "currencyRateInvalid": "Ingresá un tipo positivo",
+    "currencyNotAuto": "Esta moneda no tiene tipo en vivo — configuralo manualmente",
+    "saved": "Guardado",
+    "ratesRefreshed": "Tipos actualizados",
+    "languageAr": "العربية (AR)"
   },
   "setup": {
     "alreadyCompleted": "La configuración ya se completó en esta instalación. Redirigiendo al inicio de sesión…",
@@ -1661,7 +1684,8 @@
     "tagline": "Crea la cuenta del propietario y elegí la configuración del restaurante.",
     "terms": "Términos y Condiciones",
     "termsIntro": "Acepto los",
-    "welcome": "Bienvenido a FloCafe"
+    "welcome": "Bienvenido a FloCafe",
+    "languageArabic": "Árabe"
   },
   "staff": {
     "addButton": "Agregar Personal",
