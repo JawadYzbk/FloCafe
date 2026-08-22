@@ -18,6 +18,7 @@ import {
   UserCircle,
   MessageCircle,
   LifeBuoy,
+  Banknote,
   type LucideIcon,
 } from 'lucide-react';
 import { useTranslations, type AppConfig } from 'use-intl';
@@ -57,6 +58,7 @@ const ALL_NAV_ITEMS: NavItem[] = [
   { href: '/pos', labelKey: 'pos', icon: ShoppingCart, roles: ['owner', 'manager', 'cashier'], businessTypes: null },
   { href: '/dashboard', labelKey: 'dashboard', icon: LayoutDashboard, roles: ['owner'], businessTypes: null },
   { href: '/orders', labelKey: 'orders', icon: ClipboardList, roles: ['owner', 'manager', 'cashier'], businessTypes: null },
+  { href: '/shift', labelKey: 'shift', icon: Banknote, roles: ['owner', 'manager'], businessTypes: null },
   { href: '/whatsapp', labelKey: 'whatsapp', icon: MessageCircle, roles: ['owner', 'manager', 'cashier'], businessTypes: null },
   { href: '/products', labelKey: 'products', icon: Package, roles: ['owner', 'manager'], businessTypes: null },
   { href: '/tables', labelKey: 'tables', icon: Grid3X3, roles: ['owner', 'manager'], businessTypes: ['restaurant'] },

@@ -3948,6 +3948,48 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
       `);
     },
   },
+  {
+    version: 72,
+    name: 'add_cash_shifts',
+    up: () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS shifts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+          opened_by TEXT,
+          opened_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          closed_by TEXT,
+          closed_at TEXT,
+          base_currency TEXT,
+          opening_floats TEXT NOT NULL DEFAULT '{}',
+          counted_close TEXT,
+          expected_close TEXT,
+          notes TEXT,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_shifts_status ON shifts(status);
+        CREATE INDEX IF NOT EXISTS idx_shifts_opened_at ON shifts(opened_at);
+
+        CREATE TABLE IF NOT EXISTS shift_movements (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          shift_id INTEGER NOT NULL,
+          type TEXT NOT NULL CHECK (type IN ('pay_in', 'pay_out', 'exchange')),
+          currency TEXT,
+          amount REAL,
+          from_currency TEXT,
+          from_amount REAL,
+          to_currency TEXT,
+          to_amount REAL,
+          reason TEXT,
+          user_id TEXT,
+          created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (shift_id) REFERENCES shifts(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_shift_movements_shift ON shift_movements(shift_id);
+      `);
+    },
+  },
 ];
 
 function syncBackupBeforeMigration(fromVersion: number, toVersion: number): void {
@@ -4341,6 +4383,38 @@ function createSchema(): void {
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS shifts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+      opened_by TEXT,
+      opened_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      closed_by TEXT,
+      closed_at TEXT,
+      base_currency TEXT,
+      opening_floats TEXT NOT NULL DEFAULT '{}',
+      counted_close TEXT,
+      expected_close TEXT,
+      notes TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS shift_movements (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      shift_id INTEGER NOT NULL,
+      type TEXT NOT NULL CHECK (type IN ('pay_in', 'pay_out', 'exchange')),
+      currency TEXT,
+      amount REAL,
+      from_currency TEXT,
+      from_amount REAL,
+      to_currency TEXT,
+      to_amount REAL,
+      reason TEXT,
+      user_id TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (shift_id) REFERENCES shifts(id)
+    );
+
     -- ── Config tables ────────────────────────────────────────────────────
 
     CREATE TABLE IF NOT EXISTS settings (
@@ -4470,6 +4544,9 @@ function createSchema(): void {
     CREATE INDEX IF NOT EXISTS idx_orders_user       ON orders(user_id);
     CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id);
     CREATE INDEX IF NOT EXISTS idx_bills_order       ON bills(order_id);
+    CREATE INDEX IF NOT EXISTS idx_shifts_status     ON shifts(status);
+    CREATE INDEX IF NOT EXISTS idx_shifts_opened_at  ON shifts(opened_at);
+    CREATE INDEX IF NOT EXISTS idx_shift_movements_shift ON shift_movements(shift_id);
     CREATE INDEX IF NOT EXISTS idx_country_pack_versions_pack ON country_pack_versions(pack_id);
     CREATE INDEX IF NOT EXISTS idx_tax_categories_pack_version ON tax_categories(pack_version_id);
     CREATE INDEX IF NOT EXISTS idx_tax_rules_pack_version ON tax_rules(pack_version_id);

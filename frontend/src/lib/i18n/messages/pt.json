@@ -295,7 +295,8 @@
     "toggleSidebar": "Alternar barra lateral",
     "uptimeLabel": "Ativo: ",
     "user": "Usuário",
-    "whatsapp": "WhatsApp"
+    "whatsapp": "WhatsApp",
+    "shift": "Turno"
   },
   "orders": {
     "active": "Ativos",
@@ -1598,7 +1599,10 @@
     "currencyNotAuto": "Esta moeda não tem taxa ao vivo — defina-a manualmente",
     "saved": "Salvo",
     "ratesRefreshed": "Taxas atualizadas",
-    "languageAr": "العربية (AR)"
+    "languageAr": "العربية (AR)",
+    "baseCurrencyHint": "Preços, impostos e relatórios permanecem nesta moeda. Alterá-la não reconverte os valores existentes.",
+    "baseNoLiveRates": "Taxas ao vivo não estão disponíveis para esta moeda base — as taxas secundárias devem ser definidas manualmente.",
+    "ratesUnchanged": "Nenhuma taxa ao vivo atualizada — verifique sua conexão, ou a moeda não tem taxa ao vivo"
   },
   "setup": {
     "alreadyCompleted": "A configuração já foi concluída nesta instalação. Redirecionando para o login…",
@@ -2162,5 +2166,39 @@
       "inbox": "Caixa de Entrada",
       "sent": "Enviadas"
     }
+  },
+  "shift": {
+    "title": "Turno de caixa",
+    "subtitle": "Abra o caixa, registre movimentos de dinheiro e concilie cada moeda no fechamento.",
+    "loadFailed": "Falha ao carregar o turno",
+    "noneOpen": "Nenhum turno aberto",
+    "openingFloatHint": "Informe o dinheiro já no caixa para cada moeda e abra o turno.",
+    "openingFloat": "Fundo inicial",
+    "opening": "Abertura",
+    "open": "Abrir turno",
+    "opened": "Turno aberto",
+    "openFailed": "Falha ao abrir o turno",
+    "openedAt": "Aberto",
+    "currency": "Moeda",
+    "cashSales": "Vendas em dinheiro",
+    "expected": "Esperado",
+    "movements": "Movimentos",
+    "payIn": "Entrada",
+    "payOut": "Saída",
+    "exchange": "Câmbio",
+    "noMovements": "Ainda sem movimentos.",
+    "amount": "Valor",
+    "reason": "Motivo (opcional)",
+    "from": "De",
+    "to": "Para",
+    "record": "Registrar",
+    "recorded": "Registrado",
+    "closeTitle": "Contar e fechar",
+    "closeHint": "Conte o dinheiro físico de cada moeda. A variação é a diferença do saldo esperado.",
+    "counted": "Contado",
+    "variance": "Variação",
+    "closeShift": "Fechar turno",
+    "closed": "Turno fechado",
+    "closeFailed": "Falha ao fechar o turno"
   }
 }

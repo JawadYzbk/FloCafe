@@ -7,6 +7,7 @@ import { addonGroupRoutes } from './addon-groups';
 import { orderRoutes } from './orders';
 import { orderItemRoutes } from './order-items';
 import { billRoutes, syncUnpaidBillsForOrder } from './bills';
+import { shiftRoutes } from './shifts';
 import { tableRoutes } from './tables';
 import { kitchenStationRoutes } from './kitchen-stations';
 import { kitchenRoutes } from './kitchen';
@@ -87,6 +88,7 @@ export function registerRoutes(app: Express): void {
   app.use('/api/users', staffRoutes);   // same router, dual-mounted
   app.use('/api/settings', settingsRoutes);
   app.use('/api/payment-methods', paymentMethodRoutes);
+  app.use('/api/shifts', shiftRoutes);
   app.use('/api/reports', reportRoutes);
   app.use('/api/kds', kdsRoutes);
   app.use('/api/kds-info', kdsInfoRoutes);

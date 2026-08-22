@@ -295,7 +295,8 @@
     "toggleSidebar": "Toggle sidebar",
     "uptimeLabel": "Up: ",
     "user": "User",
-    "whatsapp": "WhatsApp"
+    "whatsapp": "WhatsApp",
+    "shift": "Shift"
   },
   "orders": {
     "active": "Active",
@@ -1598,7 +1599,10 @@
     "currencyNotAuto": "This currency has no live rate — set it manually",
     "saved": "Saved",
     "ratesRefreshed": "Rates updated",
-    "languageAr": "العربية (AR)"
+    "languageAr": "العربية (AR)",
+    "baseCurrencyHint": "Prices, taxes, and reports are kept in this currency. Changing it does not reconvert existing amounts.",
+    "baseNoLiveRates": "Live rates aren't available for this base currency — secondary rates must be set manually.",
+    "ratesUnchanged": "No live rates updated — check your connection, or the currency has no live rate"
   },
   "setup": {
     "alreadyCompleted": "Setup has already been completed on this install. Redirecting to login…",
@@ -2162,5 +2166,39 @@
       "inbox": "Inbox",
       "sent": "Sent"
     }
+  },
+  "shift": {
+    "title": "Cash Shift",
+    "subtitle": "Open the drawer, record cash movements, and reconcile each currency at close.",
+    "loadFailed": "Failed to load shift",
+    "noneOpen": "No shift is open",
+    "openingFloatHint": "Enter the cash already in the drawer for each currency, then open the shift.",
+    "openingFloat": "Opening float",
+    "opening": "Opening",
+    "open": "Open shift",
+    "opened": "Shift opened",
+    "openFailed": "Failed to open shift",
+    "openedAt": "Opened",
+    "currency": "Currency",
+    "cashSales": "Cash sales",
+    "expected": "Expected",
+    "movements": "Movements",
+    "payIn": "Pay in",
+    "payOut": "Pay out",
+    "exchange": "Exchange",
+    "noMovements": "No movements yet.",
+    "amount": "Amount",
+    "reason": "Reason (optional)",
+    "from": "From",
+    "to": "To",
+    "record": "Record",
+    "recorded": "Recorded",
+    "closeTitle": "Count & close",
+    "closeHint": "Count the physical cash in each currency. The variance is the difference from the expected balance.",
+    "counted": "Counted",
+    "variance": "Variance",
+    "closeShift": "Close shift",
+    "closed": "Shift closed",
+    "closeFailed": "Failed to close shift"
   }
 }
