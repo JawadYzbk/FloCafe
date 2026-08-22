@@ -21,6 +21,7 @@ import {
 import toast from 'react-hot-toast';
 import api from '@/lib/api';
 import { Button } from '@/components/ui/button';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useFormatDate } from '@/hooks/useFormatDate';
 import { useI18n } from '@/hooks/useI18n';
 import { apiErrorText } from '@/lib/api-error';
@@ -1021,15 +1022,13 @@ export function TaxConfigurationPanel({ isOwner }: { isOwner: boolean }) {
                       placeholder={t('tax.componentPlaceholder')}
                       className="flex-1 rounded-md border border-gray-200 bg-white px-3 py-1.5 text-sm disabled:bg-gray-100"
                     />
-                    <select
-                      value={component.type}
-                      onChange={(event) => updateManualComponent(category.tempId, component.key, { type: event.target.value as 'percent' | 'fixed' })}
-                      disabled={!isOwner}
-                      className="rounded-md border border-gray-200 bg-white px-2 py-1.5 text-sm disabled:bg-gray-100"
-                    >
-                      <option value="percent">%</option>
-                      <option value="fixed">{t('tax.fixed')}</option>
-                    </select>
+                    <Select value={component.type} onValueChange={(v) => updateManualComponent(category.tempId, component.key, { type: v as 'percent' | 'fixed' })} disabled={!isOwner}>
+                      <SelectTrigger size="sm"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="percent">%</SelectItem>
+                        <SelectItem value="fixed">{t('tax.fixed')}</SelectItem>
+                      </SelectContent>
+                    </Select>
                     <input
                       type="number"
                       min="0"
@@ -1085,19 +1084,17 @@ export function TaxConfigurationPanel({ isOwner }: { isOwner: boolean }) {
               ['delivery', t('tax.defaultDelivery')],
               ['service_charge', t('tax.defaultServiceCharge')],
             ] as Array<[keyof ManualDefaults, string]>).map(([key, label]) => (
-              <label key={key} className="block">
+              <div key={key} className="block">
                 <span className="text-xs text-gray-500">{label}</span>
-                <select
-                  value={manualDefaults[key]}
-                  onChange={(event) => setManualDefaults((current) => ({ ...current, [key]: event.target.value }))}
-                  disabled={!isOwner}
-                  className="mt-1 w-full rounded-md border border-gray-200 bg-white px-2 py-1.5 text-sm disabled:bg-gray-100"
-                >
-                  {manualCategories.map((category) => (
-                    <option key={category.tempId} value={category.tempId}>{category.label || t('tax.untitledCategory')}</option>
-                  ))}
-                </select>
-              </label>
+                <Select value={manualDefaults[key] || undefined} onValueChange={(v) => setManualDefaults((current) => ({ ...current, [key]: v }))} disabled={!isOwner}>
+                  <SelectTrigger size="sm" className="mt-1 w-full"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {manualCategories.map((category) => (
+                      <SelectItem key={category.tempId} value={category.tempId}>{category.label || t('tax.untitledCategory')}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
             ))}
           </div>
         </div>
@@ -1219,9 +1216,12 @@ export function TaxConfigurationPanel({ isOwner }: { isOwner: boolean }) {
           <p className="mt-2 text-xs text-amber-700">{t('tax.packNotActive')}</p>
         )}
         <div className="mt-4 grid gap-3 sm:grid-cols-4">
-          <select disabled={!selectedPack?.active_for_store} value={testCategoryId} onChange={(event) => setTestCategoryId(event.target.value)} className="rounded-md border border-gray-200 px-3 py-2 text-sm disabled:bg-gray-100">
-            {detail?.categories.map((category) => <option key={category.category_id} value={category.category_id}>{category.label}</option>)}
-          </select>
+          <Select disabled={!selectedPack?.active_for_store} value={testCategoryId || undefined} onValueChange={(v) => setTestCategoryId(v)}>
+            <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {detail?.categories.map((category) => <SelectItem key={category.category_id} value={category.category_id}>{category.label}</SelectItem>)}
+            </SelectContent>
+          </Select>
           <input
             value={testAmount}
             onChange={(event) => setTestAmount(event.target.value)}
@@ -1230,12 +1230,15 @@ export function TaxConfigurationPanel({ isOwner }: { isOwner: boolean }) {
             disabled={!selectedPack?.active_for_store}
             className="rounded-md border border-gray-200 px-3 py-2 text-sm disabled:bg-gray-100"
           />
-          <select disabled={!selectedPack?.active_for_store} value={testBehavior} onChange={(event) => setTestBehavior(event.target.value)} className="rounded-md border border-gray-200 px-3 py-2 text-sm disabled:bg-gray-100">
-            <option value="country_default">{t('tax.behaviorCountryDefault')}</option>
-            <option value="exclusive">{t('tax.behaviorExclusive')}</option>
-            <option value="inclusive">{t('tax.behaviorInclusive')}</option>
-            <option value="exempt">{t('tax.behaviorExempt')}</option>
-          </select>
+          <Select disabled={!selectedPack?.active_for_store} value={testBehavior} onValueChange={(v) => setTestBehavior(v)}>
+            <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="country_default">{t('tax.behaviorCountryDefault')}</SelectItem>
+              <SelectItem value="exclusive">{t('tax.behaviorExclusive')}</SelectItem>
+              <SelectItem value="inclusive">{t('tax.behaviorInclusive')}</SelectItem>
+              <SelectItem value="exempt">{t('tax.behaviorExempt')}</SelectItem>
+            </SelectContent>
+          </Select>
           <Button disabled={!selectedPack?.active_for_store} onClick={() => void calculate()}>{t('tax.calculate')}</Button>
         </div>
         {calculation && (
@@ -1276,20 +1279,22 @@ export function TaxConfigurationPanel({ isOwner }: { isOwner: boolean }) {
               (override) => override.entity_type === chargeType && override.entity_id === null,
             );
             return (
-              <label key={chargeType} className="block">
+              <div key={chargeType} className="block">
                 <span className="text-sm font-medium text-gray-800">{t(ENTITY_LABELS[chargeType])}</span>
-                <select
-                  value={configured ? categoryIdOf(configured) : ''}
-                  onChange={(event) => void setChargeCategory(chargeType, event.target.value)}
+                <Select
+                  value={configured ? categoryIdOf(configured) : 'none'}
+                  onValueChange={(v) => void setChargeCategory(chargeType, v === 'none' ? '' : v)}
                   disabled={!isOwner || saving || !selectedPack?.active_for_store}
-                  className="mt-2 w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm disabled:bg-gray-100"
                 >
-                  <option value="">{t('tax.chargeNotConfigured')}</option>
-                  {detail?.categories.map((category) => (
-                    <option key={category.category_id} value={category.category_id}>{category.label}</option>
-                  ))}
-                </select>
-              </label>
+                  <SelectTrigger className="mt-2 w-full"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="none">{t('tax.chargeNotConfigured')}</SelectItem>
+                    {detail?.categories.map((category) => (
+                      <SelectItem key={category.category_id} value={category.category_id}>{category.label}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
             );
           })}
         </div>
@@ -1306,29 +1311,33 @@ export function TaxConfigurationPanel({ isOwner }: { isOwner: boolean }) {
 
         {isOwner && (
           <div className="mt-4 grid gap-3 rounded-lg border border-gray-100 bg-gray-50 p-4 sm:grid-cols-3">
-            <select
+            <Select
               value={entityType}
-              onChange={(event) => {
-                setEntityType(event.target.value as OverrideEntityType);
-                setEntityId('');
-              }}
-              className="rounded-md border border-gray-200 bg-white px-3 py-2 text-sm"
+              onValueChange={(v) => { setEntityType(v as OverrideEntityType); setEntityId(''); }}
             >
-              {(['product', 'addon'] as OverrideEntityType[]).map((value) => (
-                <option key={value} value={value}>{t(ENTITY_LABELS[value])}</option>
-              ))}
-            </select>
+              <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {(['product', 'addon'] as OverrideEntityType[]).map((value) => (
+                  <SelectItem key={value} value={value}>{t(ENTITY_LABELS[value])}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
             {needsEntity ? (
-              <select value={entityId} onChange={(event) => setEntityId(event.target.value)} className="rounded-md border border-gray-200 bg-white px-3 py-2 text-sm">
-                <option value="">{t('tax.chooseEntity', { entity: t(ENTITY_LABELS[entityType]) })}</option>
-                {targetOptions.map((target) => <option key={target.id} value={target.id}>{target.name}</option>)}
-              </select>
+              <Select value={entityId || undefined} onValueChange={(v) => setEntityId(v)}>
+                <SelectTrigger className="w-full"><SelectValue placeholder={t('tax.chooseEntity', { entity: t(ENTITY_LABELS[entityType]) })} /></SelectTrigger>
+                <SelectContent>
+                  {targetOptions.map((target) => <SelectItem key={target.id} value={String(target.id)}>{target.name}</SelectItem>)}
+                </SelectContent>
+              </Select>
             ) : (
               <div className="rounded-md border border-gray-200 bg-gray-100 px-3 py-2 text-sm text-gray-500">{t('tax.storeWideCharge')}</div>
             )}
-            <select value={categoryId} onChange={(event) => setCategoryId(event.target.value)} className="rounded-md border border-gray-200 bg-white px-3 py-2 text-sm">
-              {detail?.categories.map((category) => <option key={category.category_id} value={category.category_id}>{category.label}</option>)}
-            </select>
+            <Select value={categoryId || undefined} onValueChange={(v) => setCategoryId(v)}>
+              <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {detail?.categories.map((category) => <SelectItem key={category.category_id} value={category.category_id}>{category.label}</SelectItem>)}
+              </SelectContent>
+            </Select>
             <div className="flex gap-2 sm:col-span-3 sm:justify-end">
               {editingOverrideId && <Button variant="outline" onClick={resetOverrideForm}>{t('tax.cancel')}</Button>}
               <Button disabled={saving} onClick={() => void saveOverride()}>
