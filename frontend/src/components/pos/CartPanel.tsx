@@ -14,6 +14,7 @@ import { useTranslations } from 'use-intl';
 import toast from 'react-hot-toast';
 import type { Table, Order, OrderItem, CartItem } from '@/lib/types';
 import { useFormatCurrency } from '@/hooks/useFormatCurrency';
+import { useDualCurrency } from '@/hooks/useDualCurrency';
 
 interface Props {
   tables: Table[];
@@ -41,6 +42,7 @@ export default function CartPanel({ tables, submitting, onPlaceOrder, onEditItem
   const tCommon = useTranslations('common');
   const isRestaurant = (currentTenant?.business_type ?? 'restaurant') === 'restaurant';
   const fmt = useFormatCurrency();
+  const { hasSecondary, secondaryLine } = useDualCurrency();
   const canHold = isRestaurant && cart.orderType === 'dine_in' && cart.tableId && cart.items.length > 0 && billingType === 'postpaid';
 
   const handleHold = async () => {
@@ -225,12 +227,17 @@ export default function CartPanel({ tables, submitting, onPlaceOrder, onEditItem
           <span className="text-gray-500">{t('items')}</span>
           <span className="font-medium">{cart.itemCount()}</span>
         </div>
-        <div className="flex justify-between mb-4 text-lg">
+        <div className={`flex justify-between text-lg ${hasSecondary ? 'mb-0.5' : 'mb-4'}`}>
           <span className="font-semibold text-gray-900">{t('subtotal')}</span>
           <span className="font-bold text-brand">
             {fmt(cart.subtotal())}
           </span>
         </div>
+        {hasSecondary && (
+          <div className="flex justify-end mb-4">
+            <span className="text-sm font-semibold text-gray-400 ltr-island" dir="ltr">{secondaryLine(cart.subtotal())}</span>
+          </div>
+        )}
         <div className="flex gap-2">
           {canHold && (
             <Button variant="outline" onClick={handleHold} className="flex-1">
@@ -240,7 +247,7 @@ export default function CartPanel({ tables, submitting, onPlaceOrder, onEditItem
           <Button
             onClick={onPlaceOrder}
             disabled={submitting || cart.items.length === 0}
-            className="flex-1"
+            className="flex-1 min-h-12"
             size="lg"
           >
             {submitting ? t('placing') : t('placeOrderButton')}

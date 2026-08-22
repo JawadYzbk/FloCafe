@@ -105,6 +105,9 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
   // auto-rescaling payment splits (e.g. on discount edits) so we don't clobber their entry.
   const [paymentsTouched, setPaymentsTouched] = useState(false);
   const [processing, setProcessing] = useState(false);
+  // Blocking payment-validation message, shown inline (persistent) as well as
+  // toasted — so a failed check stays visible while the cashier corrects it.
+  const [payError, setPayError] = useState<string | null>(null);
   const [walletBalance, setWalletBalance] = useState<number | null>(null);
   const [walletAmount, setWalletAmount] = useState('');
   const [customMethods, setCustomMethods] = useState<CustomPaymentMethod[]>([]);
@@ -220,6 +223,7 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
   const totalPayment = payments.reduce((s, p) => s + lineToStoredBase(p), 0) + walletAmt;
 
   const updatePaymentAmount = (idx: number, value: string) => {
+    if (payError) setPayError(null);
     setPaymentsTouched(true);
     setPayments(payments.map((payment, index) => index === idx ? { ...payment, amount: value } : payment));
   };
@@ -305,27 +309,29 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
   };
 
   const handlePay = async () => {
+    const fail = (msg: string) => { setPayError(msg); toast.error(msg); };
+    setPayError(null);
     const amountIsValid = (value: string) => value.trim() === '' || /^\d+(?:\.\d{1,4})?$/.test(value.trim());
     if (payments.some((p) => (
       !PAYMENT_METHODS.some((allowed) => allowed.key === p.method)
       && !customMethods.some((method) => method.id === p.payment_method_id)
     ) || !amountIsValid(p.amount))) {
-      toast.error(t('paymentFailed'));
+      fail(t('paymentFailed'));
       return;
     }
     if (walletAmount.trim() && !/^\d+(?:\.\d{1,4})?$/.test(walletAmount.trim())) {
-      toast.error(t('paymentFailed'));
+      fail(t('paymentFailed'));
       return;
     }
     const nonCashTotal = payments
       .filter((p) => p.method !== 'cash')
       .reduce((sum, p) => sum + lineToStoredBase(p), 0) + walletAmt;
     if (nonCashTotal > remaining + 0.000001) {
-      toast.error(t('paymentAboveBalance'));
+      fail(t('paymentAboveBalance'));
       return;
     }
     if (totalPayment < remaining - 0.01) {
-      toast.error(t('paymentBelowBalance'));
+      fail(t('paymentBelowBalance'));
       return;
     }
     // Validate wallet amount against available balance (convert currency to points for comparison)
@@ -334,7 +340,7 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
       const walletPointsRequired = walletAmt * redemptionRate;
       if (walletPointsRequired > walletBalance) {
         const maxCurrency = Math.floor(walletBalance / redemptionRate);
-        toast.error(t('walletMaxAmount', { max: currencyFmt(maxCurrency) }));
+        fail(t('walletMaxAmount', { max: currencyFmt(maxCurrency) }));
         return;
       }
     }
@@ -778,9 +784,14 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
               </Button>
             </>
           ) : (
-            <Button onClick={handlePay} disabled={processing || totalPayment < remaining - 0.01} className="w-full min-h-12 text-base" size="lg">
-              {processing ? t('processingPayment') : `${t('pay')} ${currencyFmt(totalPayment)}`}
-            </Button>
+            <>
+              {payError && (
+                <p role="alert" className="text-sm font-medium text-red-600 text-center mb-1">{payError}</p>
+              )}
+              <Button onClick={handlePay} disabled={processing || totalPayment < remaining - 0.01} className="w-full min-h-12 text-base" size="lg">
+                {processing ? t('processingPayment') : `${t('pay')} ${currencyFmt(totalPayment)}`}
+              </Button>
+            </>
           )}
         </div>
       </div>
