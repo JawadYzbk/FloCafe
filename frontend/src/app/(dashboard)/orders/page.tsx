@@ -4,6 +4,7 @@ import { useState, useEffect, useRef } from 'react';
 import api from '@/lib/api';
 import { useAuthStore } from '@/store/auth';
 import { Button } from '@/components/ui/button';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { CreditCard, Trash2, RotateCcw, Clock, MessageCircle, Printer, XCircle, Lock, Percent, Banknote, Search, Plus, ChevronDown, ChevronRight, UserPlus, User, ShoppingBag, Send, Loader2, Ban, Download } from 'lucide-react';
 import toast from 'react-hot-toast';
 import PaymentModal from '@/components/pos/PaymentModal';
@@ -914,43 +915,38 @@ export default function OrdersPage() {
         </div>
 
         {/* Table filter */}
-        <select
-          value={filters.table}
-          onChange={(e) => setFilters(prev => ({ ...prev, table: e.target.value }))}
-          className="px-3 py-2 border border-gray-200 rounded-lg text-sm bg-white text-gray-700 focus:outline-none focus:ring-2 focus:ring-brand/30 focus:border-brand"
-        >
-          <option value="">{tOrders('allTables')}</option>
-          {tables.map((table: Table) => (
-            <option key={table.id} value={String(table.id)}>
-              {table.name}
-            </option>
-          ))}
-        </select>
+        <Select value={filters.table || 'all'} onValueChange={(v) => setFilters(prev => ({ ...prev, table: v === 'all' ? '' : v }))}>
+          <SelectTrigger className="w-auto"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">{tOrders('allTables')}</SelectItem>
+            {tables.map((table: Table) => (
+              <SelectItem key={table.id} value={String(table.id)}>{table.name}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
 
         {/* Type filter */}
-        <select
-          value={filters.type}
-          onChange={(e) => setFilters(prev => ({ ...prev, type: e.target.value }))}
-          className="px-3 py-2 border border-gray-200 rounded-lg text-sm bg-white text-gray-700 focus:outline-none focus:ring-2 focus:ring-brand/30 focus:border-brand"
-        >
-          <option value="">{tOrders('allTypes')}</option>
-          <option value="dine_in">{tOrders('dineIn')}</option>
-          <option value="takeaway">{tOrders('takeaway')}</option>
-          <option value="delivery">{tOrders('delivery')}</option>
-          <option value="online">{tOrders('online')}</option>
-        </select>
+        <Select value={filters.type || 'all'} onValueChange={(v) => setFilters(prev => ({ ...prev, type: v === 'all' ? '' : v }))}>
+          <SelectTrigger className="w-auto"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">{tOrders('allTypes')}</SelectItem>
+            <SelectItem value="dine_in">{tOrders('dineIn')}</SelectItem>
+            <SelectItem value="takeaway">{tOrders('takeaway')}</SelectItem>
+            <SelectItem value="delivery">{tOrders('delivery')}</SelectItem>
+            <SelectItem value="online">{tOrders('online')}</SelectItem>
+          </SelectContent>
+        </Select>
 
         {/* Status filter */}
-        <select
-          value={filters.status}
-          onChange={(e) => setFilters(prev => ({ ...prev, status: e.target.value }))}
-          className="px-3 py-2 border border-gray-200 rounded-lg text-sm bg-white text-gray-700 focus:outline-none focus:ring-2 focus:ring-brand/30 focus:border-brand"
-        >
-          <option value="">{tOrders('allStatuses')}</option>
-          <option value="active">{tOrders('active')}</option>
-          <option value="completed">{tOrders('completed')}</option>
-          <option value="cancelled">{tOrders('cancelled')}</option>
-        </select>
+        <Select value={filters.status || 'all'} onValueChange={(v) => setFilters(prev => ({ ...prev, status: v === 'all' ? '' : v }))}>
+          <SelectTrigger className="w-auto"><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">{tOrders('allStatuses')}</SelectItem>
+            <SelectItem value="active">{tOrders('active')}</SelectItem>
+            <SelectItem value="completed">{tOrders('completed')}</SelectItem>
+            <SelectItem value="cancelled">{tOrders('cancelled')}</SelectItem>
+          </SelectContent>
+        </Select>
       </div>
 
       {/* Orders List */}

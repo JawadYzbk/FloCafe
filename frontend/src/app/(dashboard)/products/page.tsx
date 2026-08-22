@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react';
 import api from '@/lib/api';
 import { useAuthStore } from '@/store/auth';
 import { Button } from '@/components/ui/button';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import toast from 'react-hot-toast';
 import { Plus, Pencil, Trash2, X, Package, Folder, Puzzle, FileSpreadsheet, Download, Upload, CheckCircle, AlertCircle, AlertTriangle } from 'lucide-react';
 import type { Product, Category, AddonGroup } from '@/lib/types';
@@ -671,11 +672,12 @@ export default function ProductsPage() {
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">{t('products.fieldCategory')}<span className="text-red-500 ms-1">*</span></label>
-                  <select value={form.category_id} onChange={(e) => setForm({ ...form, category_id: e.target.value })}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-brand outline-none" required>
-                    <option value="">{t('products.selectPlaceholder')}</option>
-                    {categories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-                  </select>
+                  <Select value={form.category_id || undefined} onValueChange={(v) => setForm({ ...form, category_id: v })}>
+                    <SelectTrigger className="w-full"><SelectValue placeholder={t('products.selectPlaceholder')} /></SelectTrigger>
+                    <SelectContent>
+                      {categories.map((c) => <SelectItem key={c.id} value={String(c.id)}>{c.name}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
                 </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">{t('products.fieldSku')}</label>
@@ -723,11 +725,13 @@ export default function ProductsPage() {
               )}
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">{t('products.taxRateGroupLabel')}</label>
-                <select value={form.tax_category_id} onChange={(e) => setForm({ ...form, tax_category_id: e.target.value })}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-brand outline-none">
-                  <option value="">{t('products.taxNoTax')}</option>
-                  {taxCategories.map((tc) => <option key={tc.id} value={tc.id}>{taxCategoryOptionLabel(tc)}</option>)}
-                </select>
+                <Select value={form.tax_category_id || 'none'} onValueChange={(v) => setForm({ ...form, tax_category_id: v === 'none' ? '' : v })}>
+                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="none">{t('products.taxNoTax')}</SelectItem>
+                    {taxCategories.map((tc) => <SelectItem key={tc.id} value={String(tc.id)}>{taxCategoryOptionLabel(tc)}</SelectItem>)}
+                  </SelectContent>
+                </Select>
                 {taxCategories.length === 0 && (
                   <p className="text-xs text-gray-400 mt-1">{t('products.taxNoGroupsHint')}</p>
                 )}
@@ -738,13 +742,15 @@ export default function ProductsPage() {
               {form.tax_category_id ? (
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">{t('products.taxBehaviorLabel')}</label>
-                  <select value={form.tax_behavior} onChange={(e) => setForm({ ...form, tax_behavior: e.target.value })}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-brand outline-none">
-                    <option value="country_default">{t('products.taxCountryDefault')}</option>
-                    <option value="inclusive">{t('products.taxInclusive')}</option>
-                    <option value="exclusive">{t('products.taxExclusive')}</option>
-                    <option value="exempt">{t('products.taxExempt')}</option>
-                  </select>
+                  <Select value={form.tax_behavior} onValueChange={(v) => setForm({ ...form, tax_behavior: v })}>
+                    <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="country_default">{t('products.taxCountryDefault')}</SelectItem>
+                      <SelectItem value="inclusive">{t('products.taxInclusive')}</SelectItem>
+                      <SelectItem value="exclusive">{t('products.taxExclusive')}</SelectItem>
+                      <SelectItem value="exempt">{t('products.taxExempt')}</SelectItem>
+                    </SelectContent>
+                  </Select>
                   <p className="text-xs text-gray-400 mt-1">{t('products.taxRateHint')}</p>
                 </div>
               ) : (
@@ -1100,11 +1106,14 @@ export default function ProductsPage() {
                   {t('products.taxBulkBody', { count: legacyProducts.length })}
                 </p>
                 <label className="block text-sm font-medium text-gray-700 mb-1">{t('products.taxRateGroupLabel')}</label>
-                <select value={bulkTaxCategoryId} onChange={(e) => setBulkTaxCategoryId(e.target.value)}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-brand outline-none mb-5">
-                  <option value="">{t('products.selectPlaceholder')}</option>
-                  {taxCategories.map((tc) => <option key={tc.id} value={tc.id}>{taxCategoryOptionLabel(tc)}</option>)}
-                </select>
+                <div className="mb-5">
+                  <Select value={bulkTaxCategoryId || undefined} onValueChange={(v) => setBulkTaxCategoryId(v)}>
+                    <SelectTrigger className="w-full"><SelectValue placeholder={t('products.selectPlaceholder')} /></SelectTrigger>
+                    <SelectContent>
+                      {taxCategories.map((tc) => <SelectItem key={tc.id} value={String(tc.id)}>{taxCategoryOptionLabel(tc)}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                </div>
                 <div className="flex justify-end gap-2">
                   <Button variant="outline" onClick={() => setShowBulkTaxModal(false)}>{t('common.cancel')}</Button>
                   <Button onClick={handleBulkTaxAssign} disabled={!bulkTaxCategoryId || bulkTaxApplying}>
@@ -1243,19 +1252,17 @@ export default function ProductsPage() {
             <div className="space-y-4">
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">{t('products.moveProductsTo')}</label>
-                <select
-                  value={catReassignTo}
-                  onChange={(e) => setCatReassignTo(e.target.value)}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-brand outline-none"
-                >
-                  <option value="">{t('products.selectCategoryPlaceholder')}</option>
-                  {categories
-                    .filter((c) => c.name.toLowerCase() === 'uncategorized' && c.id !== catDeleteModal.id)
-                    .map((c) => <option key={c.id} value={String(c.id)}>{t('products.defaultCategoryTag', { name: c.name })}</option>)}
-                  {categories
-                    .filter((c) => c.name.toLowerCase() !== 'uncategorized' && c.id !== catDeleteModal.id)
-                    .map((c) => <option key={c.id} value={String(c.id)}>{c.name}</option>)}
-                </select>
+                <Select value={catReassignTo || undefined} onValueChange={(v) => setCatReassignTo(v)}>
+                  <SelectTrigger className="w-full"><SelectValue placeholder={t('products.selectCategoryPlaceholder')} /></SelectTrigger>
+                  <SelectContent>
+                    {categories
+                      .filter((c) => c.name.toLowerCase() === 'uncategorized' && c.id !== catDeleteModal.id)
+                      .map((c) => <SelectItem key={c.id} value={String(c.id)}>{t('products.defaultCategoryTag', { name: c.name })}</SelectItem>)}
+                    {categories
+                      .filter((c) => c.name.toLowerCase() !== 'uncategorized' && c.id !== catDeleteModal.id)
+                      .map((c) => <SelectItem key={c.id} value={String(c.id)}>{c.name}</SelectItem>)}
+                  </SelectContent>
+                </Select>
               </div>
               <Button onClick={handleCategoryReassignDelete} disabled={!catReassignTo} className="w-full">
                 {t('products.moveAndDelete')}
