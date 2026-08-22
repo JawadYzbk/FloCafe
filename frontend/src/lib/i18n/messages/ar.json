@@ -2202,6 +2202,10 @@
     "closeFailed": "فشل إغلاق الوردية",
     "printZReport": "طباعة تقرير Z",
     "printing": "جارٍ الطباعة…",
-    "printFailed": "فشل طباعة تقرير Z"
+    "printFailed": "فشل طباعة تقرير Z",
+    "pastShifts": "الورديات السابقة",
+    "reprint": "إعادة الطباعة",
+    "balanced": "متوازن",
+    "hasVariance": "تباين"
   }
 }

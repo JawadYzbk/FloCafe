@@ -99,6 +99,16 @@ async function main() {
     assertEqual(closed.data.shift.variance.USD, -1, `USD variance = -1 (got ${closed.data.shift.variance.USD})`);
     assertEqual(closed.data.shift.variance.LBP, 0, `LBP variance = 0 (got ${closed.data.shift.variance.LBP})`);
 
+    // The closed shift appears in the list with the full report the Z-report
+    // reprint needs (expected + variance per currency).
+    const list = await api(baseUrl, '/api/shifts', { headers: authHeader });
+    assertEqual(list.status, 200, 'shift list loaded');
+    assert(Array.isArray(list.data.shifts) && list.data.shifts.length >= 1, 'list has the closed shift');
+    const listed = list.data.shifts.find((s: any) => s.id === closed.data.shift.id);
+    assert(!!listed, 'closed shift is in the list');
+    assertEqual(listed.variance.USD, -1, 'listed shift carries its variance for reprint');
+    assert(Array.isArray(listed.currencies) && listed.movements !== undefined, 'listed shift carries currencies + movements');
+
     // After close, current is null again and a new shift can open.
     const afterClose = await api(baseUrl, '/api/shifts/current', { headers: authHeader });
     assertEqual(afterClose.data.shift, null, 'no open shift after close');

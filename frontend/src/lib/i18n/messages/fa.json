@@ -2202,6 +2202,10 @@
     "closeFailed": "بستن شیفت انجام نشد",
     "printZReport": "چاپ گزارش Z",
     "printing": "در حال چاپ…",
-    "printFailed": "چاپ گزارش Z انجام نشد"
+    "printFailed": "چاپ گزارش Z انجام نشد",
+    "pastShifts": "شیفت‌های گذشته",
+    "reprint": "چاپ مجدد",
+    "balanced": "تراز",
+    "hasVariance": "مغایرت"
   }
 }

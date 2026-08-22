@@ -2202,6 +2202,10 @@
     "closeFailed": "Failed to close shift",
     "printZReport": "Print Z-report",
     "printing": "Printing…",
-    "printFailed": "Failed to print Z-report"
+    "printFailed": "Failed to print Z-report",
+    "pastShifts": "Past shifts",
+    "reprint": "Reprint",
+    "balanced": "Balanced",
+    "hasVariance": "Variance"
   }
 }

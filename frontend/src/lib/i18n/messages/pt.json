@@ -2202,6 +2202,10 @@
     "closeFailed": "Falha ao fechar o turno",
     "printZReport": "Imprimir Z",
     "printing": "Imprimindo…",
-    "printFailed": "Falha ao imprimir o Z"
+    "printFailed": "Falha ao imprimir o Z",
+    "pastShifts": "Turnos anteriores",
+    "reprint": "Reimprimir",
+    "balanced": "Conferido",
+    "hasVariance": "Diferença"
   }
 }

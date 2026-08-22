@@ -39,6 +39,7 @@ export default function ShiftPage() {
 
   const [shift, setShift] = useState<Shift | null>(null);
   const [closedReport, setClosedReport] = useState<Shift | null>(null);
+  const [pastRefresh, setPastRefresh] = useState(0);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
 
@@ -82,8 +83,70 @@ export default function ShiftPage() {
       {closedReport
         ? <ClosedReportView shift={closedReport} currencies={closedReport.currencies} onDone={() => setClosedReport(null)} t={t} />
         : shift
-          ? <OpenShiftView shift={shift} currencies={currencies} busy={busy} setBusy={setBusy} onChanged={setShift} onClosed={(report) => { setShift(null); setClosedReport(report); }} t={t} />
+          ? <OpenShiftView shift={shift} currencies={currencies} busy={busy} setBusy={setBusy} onChanged={setShift} onClosed={(report) => { setShift(null); setClosedReport(report); setPastRefresh((n) => n + 1); }} t={t} />
           : <OpenShiftForm currencies={currencies} busy={busy} setBusy={setBusy} onOpened={setShift} t={t} />}
+
+      <PastShifts refreshKey={pastRefresh} t={t} />
+    </div>
+  );
+}
+
+// ── Past (closed) shifts → reprint ────────────────────────────────────────────
+function PastShifts({ refreshKey, t }: { refreshKey: number; t: ReturnType<typeof useI18n>['t'] }) {
+  const printZReport = usePrinterStore((s) => s.printZReport);
+  const businessName = useAuthStore((s) => s.currentTenant?.business_name) || '';
+  const [shifts, setShifts] = useState<Shift[]>([]);
+  const [loaded, setLoaded] = useState(false);
+  const [printingId, setPrintingId] = useState<number | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    api.get('/shifts', { params: { limit: 20 } })
+      .then((res) => { if (alive) setShifts(Array.isArray(res.data.shifts) ? res.data.shifts : []); })
+      .catch(() => { if (alive) setShifts([]); })
+      .finally(() => { if (alive) setLoaded(true); });
+    return () => { alive = false; };
+  }, [refreshKey]);
+
+  const reprint = async (shift: Shift) => {
+    setPrintingId(shift.id);
+    try {
+      // The list already carries the full report the encoder needs.
+      await printZReport(shift, businessName);
+    } catch (e: unknown) {
+      toast.error((e as Error)?.message || t('shift.printFailed', { defaultValue: 'Failed to print Z-report' }));
+    } finally { setPrintingId(null); }
+  };
+
+  if (!loaded || shifts.length === 0) return null;
+
+  const closedLabel = (iso: string | null) => {
+    if (!iso) return '';
+    try { return new Date(iso.replace(' ', 'T') + 'Z').toLocaleString(); } catch { return iso; }
+  };
+
+  return (
+    <div className="rounded-xl border border-gray-100 bg-white p-5 shadow-sm">
+      <p className="mb-3 font-semibold text-gray-900">{t('shift.pastShifts', { defaultValue: 'Past shifts' })}</p>
+      <ul className="divide-y divide-gray-50">
+        {shifts.map((s) => {
+          const balanced = !s.variance || s.currencies.every((c) => (s.variance?.[c] || 0) === 0);
+          return (
+            <li key={s.id} className="flex flex-wrap items-center justify-between gap-2 py-2.5">
+              <div className="min-w-0">
+                <span className="text-sm font-semibold text-gray-900">{t('shift.title', { defaultValue: 'Cash Shift' })} #{s.id}</span>
+                <span className="ms-2 text-xs text-gray-400">{closedLabel(s.closed_at)}</span>
+                <span className={`ms-2 inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold ${balanced ? 'bg-emerald-50 text-emerald-700' : 'bg-red-50 text-red-600'}`}>
+                  {balanced ? t('shift.balanced', { defaultValue: 'Balanced' }) : t('shift.hasVariance', { defaultValue: 'Variance' })}
+                </span>
+              </div>
+              <Button size="sm" variant="outline" disabled={printingId === s.id} onClick={() => reprint(s)}>
+                <Printer size={14} className="me-1" />{printingId === s.id ? t('shift.printing', { defaultValue: 'Printing…' }) : t('shift.reprint', { defaultValue: 'Reprint' })}
+              </Button>
+            </li>
+          );
+        })}
+      </ul>
     </div>
   );
 }
