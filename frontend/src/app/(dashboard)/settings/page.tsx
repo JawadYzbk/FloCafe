@@ -11,6 +11,7 @@ import { Settings, Building2, CreditCard, Monitor, Users, Gift, Printer, Share2,
 import { Tabs, TabsContent } from '@/components/ui/tabs';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import api from '@/lib/api';
 import toast from 'react-hot-toast';
 import { COUNTRIES, countryName, getCountryByCode, type CurrencyDisplay, type DigitMode, type CalendarMode } from '@/lib/countries';
@@ -2182,25 +2183,25 @@ export default function SettingsPage() {
                   {/* Input fields */}
                   {isAdmin ? (
                     <div className="grid grid-cols-3 gap-2">
-                      <select
-                        value={form.countryCode}
-                        onChange={(e) => {
-                          const country = COUNTRIES.find(c => c.code === e.target.value);
+                      <Select
+                        value={form.countryCode || undefined}
+                        onValueChange={(code) => {
+                          const country = COUNTRIES.find(c => c.code === code);
                           setForm((p) => ({
                             ...p,
-                            countryCode: e.target.value,
+                            countryCode: code,
                             currency: country?.currency || p.currency,
                             timezone: country?.timezone || p.timezone,
                           }));
                         }}
-                        aria-label={t('common.search')}
-                        className="px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand bg-white"
                       >
-                        <option value="">{t('settings.selectCountry')}</option>
-                        {COUNTRIES.map((c) => (
-                          <option key={c.code} value={c.code}>{countryName(c.code)}</option>
-                        ))}
-                      </select>
+                        <SelectTrigger aria-label={t('settings.selectCountry')} className="w-full"><SelectValue placeholder={t('settings.selectCountry')} /></SelectTrigger>
+                        <SelectContent>
+                          {COUNTRIES.map((c) => (
+                            <SelectItem key={c.code} value={c.code}>{countryName(c.code)}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
                       <input 
                         type="text" 
                         value={form.timezone} 
@@ -2250,12 +2251,13 @@ export default function SettingsPage() {
                 <div>
                   <label className="block text-sm text-gray-500 mb-1">{t('settings.billingType')}</label>
                   {isAdmin ? (
-                    <select value={form.billingType}
-                      onChange={(e) => setForm((p) => ({ ...p, billingType: e.target.value as 'postpaid' | 'prepaid' }))}
-                      className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand bg-white">
-                      <option value="postpaid">{t('settings.billingTypePostpaid')}</option>
-                      <option value="prepaid">{t('settings.billingTypePrepaid')}</option>
-                    </select>
+                    <Select value={form.billingType} onValueChange={(v) => setForm((p) => ({ ...p, billingType: v as 'postpaid' | 'prepaid' }))}>
+                      <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="postpaid">{t('settings.billingTypePostpaid')}</SelectItem>
+                        <SelectItem value="prepaid">{t('settings.billingTypePrepaid')}</SelectItem>
+                      </SelectContent>
+                    </Select>
                   ) : (
                     <p className="font-medium text-gray-900 capitalize">{form.billingType}</p>
                   )}
@@ -2263,14 +2265,13 @@ export default function SettingsPage() {
                 <div>
                   <label className="block text-sm text-gray-500 mb-1">{t('settings.tablesRequired')}</label>
                   {isAdmin ? (
-                    <select
-                      value={form.tablesRequired ? 'yes' : 'no'}
-                      onChange={(e) => setForm((p) => ({ ...p, tablesRequired: e.target.value === 'yes' }))}
-                      className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand bg-white"
-                    >
-                      <option value="yes">{t('settings.tablesRequiredYes')}</option>
-                      <option value="no">{t('settings.tablesRequiredNo')}</option>
-                    </select>
+                    <Select value={form.tablesRequired ? 'yes' : 'no'} onValueChange={(v) => setForm((p) => ({ ...p, tablesRequired: v === 'yes' }))}>
+                      <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="yes">{t('settings.tablesRequiredYes')}</SelectItem>
+                        <SelectItem value="no">{t('settings.tablesRequiredNo')}</SelectItem>
+                      </SelectContent>
+                    </Select>
                   ) : (
                     <p className="font-medium text-gray-900">{form.tablesRequired ? t('settings.yes') : t('settings.no')}</p>
                   )}
@@ -2278,14 +2279,13 @@ export default function SettingsPage() {
                 <div>
                   <label className="block text-sm text-gray-500 mb-1">{t('settings.taxRegistered', { defaultValue: 'Tax Registered' })}</label>
                   {isAdmin ? (
-                    <select
-                      value={form.taxRegistered ? 'yes' : 'no'}
-                      onChange={(e) => setForm((p) => ({ ...p, taxRegistered: e.target.value === 'yes' }))}
-                      className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand bg-white"
-                    >
-                      <option value="yes">{t('settings.yes')}</option>
-                      <option value="no">{t('settings.no')}</option>
-                    </select>
+                    <Select value={form.taxRegistered ? 'yes' : 'no'} onValueChange={(v) => setForm((p) => ({ ...p, taxRegistered: v === 'yes' }))}>
+                      <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="yes">{t('settings.yes')}</SelectItem>
+                        <SelectItem value="no">{t('settings.no')}</SelectItem>
+                      </SelectContent>
+                    </Select>
                   ) : (
                     <p className="font-medium text-gray-900">{form.taxRegistered ? t('settings.yes') : t('settings.no')}</p>
                   )}
@@ -2440,16 +2440,15 @@ export default function SettingsPage() {
                   <div>
                     <label className="block text-sm text-gray-500 mb-1">{t('settings.invoiceResetPeriod', { defaultValue: 'Reset series' })}</label>
                     {isAdmin ? (
-                      <select
-                        value={orderNumberForm.invoiceResetPeriod}
-                        onChange={(e) => setOrderNumberForm((p) => ({ ...p, invoiceResetPeriod: e.target.value as InvoiceResetPeriod }))}
-                        className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand bg-white"
-                      >
-                        <option value="daily">{t('settings.invoiceResetDaily', { defaultValue: 'Daily' })}</option>
-                        <option value="monthly">{t('settings.invoiceResetMonthly', { defaultValue: 'Monthly' })}</option>
-                        <option value="financial_year">{t('settings.invoiceResetFinancialYear', { defaultValue: 'Financial year' })}</option>
-                        <option value="never">{t('settings.invoiceResetNever', { defaultValue: 'Never' })}</option>
-                      </select>
+                      <Select value={orderNumberForm.invoiceResetPeriod} onValueChange={(v) => setOrderNumberForm((p) => ({ ...p, invoiceResetPeriod: v as InvoiceResetPeriod }))}>
+                        <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="daily">{t('settings.invoiceResetDaily', { defaultValue: 'Daily' })}</SelectItem>
+                          <SelectItem value="monthly">{t('settings.invoiceResetMonthly', { defaultValue: 'Monthly' })}</SelectItem>
+                          <SelectItem value="financial_year">{t('settings.invoiceResetFinancialYear', { defaultValue: 'Financial year' })}</SelectItem>
+                          <SelectItem value="never">{t('settings.invoiceResetNever', { defaultValue: 'Never' })}</SelectItem>
+                        </SelectContent>
+                      </Select>
                     ) : (
                       <p className="font-medium text-gray-900">{orderNumberForm.invoiceResetPeriod.replace('_', ' ')}</p>
                     )}
@@ -2521,21 +2520,23 @@ export default function SettingsPage() {
                 </div>
                 <div>
                   <p className="text-sm text-gray-500 mb-1">{t('settings.languages')}</p>
-                  <select
+                  <Select
                     value={language}
-                    onChange={(e) => {
-                      const lang = e.target.value as Language;
+                    onValueChange={(v) => {
+                      const lang = v as Language;
                       setLanguage(lang);
                       api.put('/settings/business', { language: lang }).catch(() => toast.error(t('settings.saveFailed')));
                     }}
-                    className="block w-full rounded-md border-gray-200 shadow-sm focus:border-brand focus:ring-brand sm:text-sm px-3 py-2 border"
                   >
-                    <option value="en">{t('settings.languageEn')}</option>
-                    <option value="es">{t('settings.languageEs')}</option>
-                    <option value="pt">{t('settings.languagePt')}</option>
-                    <option value="fa">{t('settings.languageFa')}</option>
-                    <option value="ar">{t('settings.languageAr')}</option>
-                  </select>
+                    <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="en">{t('settings.languageEn')}</SelectItem>
+                      <SelectItem value="es">{t('settings.languageEs')}</SelectItem>
+                      <SelectItem value="pt">{t('settings.languagePt')}</SelectItem>
+                      <SelectItem value="fa">{t('settings.languageFa')}</SelectItem>
+                      <SelectItem value="ar">{t('settings.languageAr')}</SelectItem>
+                    </SelectContent>
+                  </Select>
                 </div>
               </div>
             </div>
@@ -2937,14 +2938,15 @@ export default function SettingsPage() {
 
                       <div>
                         <label className="block text-sm font-medium text-gray-700 mb-1">{t('settings.stationPrinter')}</label>
-                        <select value={stationForm.printer_id}
-                          onChange={(e) => setStationForm((f) => ({ ...f, printer_id: e.target.value }))}
-                          className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm bg-white">
-                          <option value="">{t('settings.stationUseDefaultPrinter')}</option>
-                          {hwPrinters.map((p) => (
-                            <option key={p.id} value={p.id}>{p.name}</option>
-                          ))}
-                        </select>
+                        <Select value={stationForm.printer_id || 'default'} onValueChange={(v) => setStationForm((f) => ({ ...f, printer_id: v === 'default' ? '' : v }))}>
+                          <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="default">{t('settings.stationUseDefaultPrinter')}</SelectItem>
+                            {hwPrinters.map((p) => (
+                              <SelectItem key={p.id} value={String(p.id)}>{p.name}</SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
                       </div>
 
                       <div>
@@ -3192,13 +3194,14 @@ export default function SettingsPage() {
                 <div>
                   <p className="font-medium text-gray-900">{t('settings.discountMode')}</p>
                   <p className="text-sm text-gray-500 mb-2">{t('settings.discountModeHint')}</p>
-                  <select value={discountMode}
-                    onChange={(e) => setDiscountMode(e.target.value)}
-                    className="w-48 px-3 py-1.5 text-sm border border-gray-200 rounded-lg outline-none focus:ring-1 focus:ring-brand bg-white">
-                    <option value="both">{t('settings.discountBoth')}</option>
-                    <option value="percentage">{t('settings.discountPercentageOnly')}</option>
-                    <option value="flat">{t('settings.discountFlatOnly')}</option>
-                  </select>
+                  <Select value={discountMode} onValueChange={(v) => setDiscountMode(v)}>
+                    <SelectTrigger className="w-48"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="both">{t('settings.discountBoth')}</SelectItem>
+                      <SelectItem value="percentage">{t('settings.discountPercentageOnly')}</SelectItem>
+                      <SelectItem value="flat">{t('settings.discountFlatOnly')}</SelectItem>
+                    </SelectContent>
+                  </Select>
                 </div>
 
                 {(discountMode === 'percentage' || discountMode === 'both') && (
@@ -3564,13 +3567,14 @@ export default function SettingsPage() {
                     </div>
                     <div>
                       <label className="block text-xs text-gray-500 mb-1">{t('settings.connectionType')}</label>
-                      <select value={printerForm.connection_type}
-                        onChange={(e) => setPrinterForm((p) => ({ ...p, connection_type: e.target.value as HwPrinter['connection_type'] }))}
-                        className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand">
-                        <option value="network">{t('settings.connectionNetwork')}</option>
-                        <option value="usb">{t('settings.connectionUsb')}</option>
-                        <option value="webusb">{t('settings.connectionWebusb')}</option>
-                      </select>
+                      <Select value={printerForm.connection_type} onValueChange={(v) => setPrinterForm((p) => ({ ...p, connection_type: v as HwPrinter['connection_type'] }))}>
+                        <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="network">{t('settings.connectionNetwork')}</SelectItem>
+                          <SelectItem value="usb">{t('settings.connectionUsb')}</SelectItem>
+                          <SelectItem value="webusb">{t('settings.connectionWebusb')}</SelectItem>
+                        </SelectContent>
+                      </Select>
                     </div>
 
                     {printerForm.connection_type === 'network' && (<>
@@ -3598,16 +3602,17 @@ export default function SettingsPage() {
 
                     <div>
                       <label className="block text-xs text-gray-500 mb-1">{t('settings.paperWidth')}</label>
-                      <select value={printerForm.paper_width}
-                        onChange={(e) => setPrinterForm((p) => ({ ...p, paper_width: e.target.value }))}
-                        className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand">
-                        <option value="cols-32">{t('settings.printColumns32')}</option>
-                        <option value="cols-36">{t('settings.printColumns36')}</option>
-                        <option value="cols-40">{t('settings.printColumns40')}</option>
-                        <option value="cols-42">{t('settings.printColumns42')}</option>
-                        <option value="cols-44">{t('settings.printColumns44')}</option>
-                        <option value="cols-48">{t('settings.printColumns48')}</option>
-                      </select>
+                      <Select value={printerForm.paper_width} onValueChange={(v) => setPrinterForm((p) => ({ ...p, paper_width: v }))}>
+                        <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="cols-32">{t('settings.printColumns32')}</SelectItem>
+                          <SelectItem value="cols-36">{t('settings.printColumns36')}</SelectItem>
+                          <SelectItem value="cols-40">{t('settings.printColumns40')}</SelectItem>
+                          <SelectItem value="cols-42">{t('settings.printColumns42')}</SelectItem>
+                          <SelectItem value="cols-44">{t('settings.printColumns44')}</SelectItem>
+                          <SelectItem value="cols-48">{t('settings.printColumns48')}</SelectItem>
+                        </SelectContent>
+                      </Select>
                     </div>
                   </div>
 
@@ -3649,22 +3654,24 @@ export default function SettingsPage() {
                 </div>
                 <div>
                   <p className="font-medium text-gray-900 mb-2">{t('settings.paperSize')}</p>
-                  <select value={printingForm.printerPaperSize}
-                    onChange={(e) => setPrintingForm((p) => ({ ...p, printerPaperSize: e.target.value as PaperSize }))}
-                    className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand">
-                    {paperSizeOptions.map((opt) => (
-                      <option key={opt.value} value={opt.value}>{opt.label}</option>
-                    ))}
-                  </select>
+                  <Select value={printingForm.printerPaperSize} onValueChange={(v) => setPrintingForm((p) => ({ ...p, printerPaperSize: v as PaperSize }))}>
+                    <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      {paperSizeOptions.map((opt) => (
+                        <SelectItem key={opt.value} value={opt.value}>{opt.label}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                 </div>
                 <div>
                   <p className="font-medium text-gray-900 mb-2">{t('settings.printMethod')}</p>
-                  <select value={printingForm.printMethod}
-                    onChange={(e) => setPrintingForm((p) => ({ ...p, printMethod: e.target.value as 'escpos' | 'browser' }))}
-                    className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand">
-                    <option value="escpos">{t('settings.printMethodEscpos')}</option>
-                    <option value="browser">{t('settings.printMethodBrowser')}</option>
-                  </select>
+                  <Select value={printingForm.printMethod} onValueChange={(v) => setPrintingForm((p) => ({ ...p, printMethod: v as 'escpos' | 'browser' }))}>
+                    <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="escpos">{t('settings.printMethodEscpos')}</SelectItem>
+                      <SelectItem value="browser">{t('settings.printMethodBrowser')}</SelectItem>
+                    </SelectContent>
+                  </Select>
                   <p className="text-xs text-gray-500 mt-1">
                     {printingForm.printMethod === 'escpos'
                       ? t('settings.printMethodEscposHint')
@@ -4010,15 +4017,17 @@ export default function SettingsPage() {
                       <div className="grid sm:grid-cols-2 gap-4">
                         <div>
                           <label className="block text-sm font-medium text-gray-700 mb-1">{t('settings.googleDriveFrequency')}</label>
-                          <select
+                          <Select
                             value={googleDriveStatus.frequency}
                             disabled={savingGoogleDrivePrefs}
-                            onChange={(e) => updateGoogleDrivePrefs({ frequency: e.target.value as 'daily' | 'weekly' })}
-                            className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-brand outline-none disabled:opacity-50"
+                            onValueChange={(v) => updateGoogleDrivePrefs({ frequency: v as 'daily' | 'weekly' })}
                           >
-                            <option value="daily">{t('settings.googleDriveFrequencyDaily')}</option>
-                            <option value="weekly">{t('settings.googleDriveFrequencyWeekly')}</option>
-                          </select>
+                            <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                            <SelectContent>
+                              <SelectItem value="daily">{t('settings.googleDriveFrequencyDaily')}</SelectItem>
+                              <SelectItem value="weekly">{t('settings.googleDriveFrequencyWeekly')}</SelectItem>
+                            </SelectContent>
+                          </Select>
                         </div>
                         <div>
                           <label className="block text-sm font-medium text-gray-700 mb-1">{t('settings.googleDriveRetention')}</label>
