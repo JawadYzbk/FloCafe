@@ -2199,6 +2199,9 @@
     "variance": "Variance",
     "closeShift": "Close shift",
     "closed": "Shift closed",
-    "closeFailed": "Failed to close shift"
+    "closeFailed": "Failed to close shift",
+    "printZReport": "Print Z-report",
+    "printing": "Printing…",
+    "printFailed": "Failed to print Z-report"
   }
 }

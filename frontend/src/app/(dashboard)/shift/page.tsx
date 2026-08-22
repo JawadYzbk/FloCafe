@@ -1,13 +1,15 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
-import { Banknote, Plus, Minus, ArrowLeftRight, Lock } from 'lucide-react';
+import { Banknote, Plus, Minus, ArrowLeftRight, Lock, Printer } from 'lucide-react';
 import api from '@/lib/api';
 import toast from 'react-hot-toast';
 import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useI18n } from '@/hooks/useI18n';
 import { useCurrenciesStore } from '@/store/currencies';
+import { usePrinterStore } from '@/hooks/usePrinter';
+import { useAuthStore } from '@/store/auth';
 
 type Amounts = Record<string, number>;
 
@@ -36,6 +38,7 @@ export default function ShiftPage() {
   const loadCurrencies = useCurrenciesStore((s) => s.load);
 
   const [shift, setShift] = useState<Shift | null>(null);
+  const [closedReport, setClosedReport] = useState<Shift | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
 
@@ -76,9 +79,65 @@ export default function ShiftPage() {
         </div>
       </div>
 
-      {shift
-        ? <OpenShiftView shift={shift} currencies={currencies} busy={busy} setBusy={setBusy} onChanged={setShift} t={t} />
-        : <OpenShiftForm currencies={currencies} busy={busy} setBusy={setBusy} onOpened={setShift} t={t} />}
+      {closedReport
+        ? <ClosedReportView shift={closedReport} currencies={closedReport.currencies} onDone={() => setClosedReport(null)} t={t} />
+        : shift
+          ? <OpenShiftView shift={shift} currencies={currencies} busy={busy} setBusy={setBusy} onChanged={setShift} onClosed={(report) => { setShift(null); setClosedReport(report); }} t={t} />
+          : <OpenShiftForm currencies={currencies} busy={busy} setBusy={setBusy} onOpened={setShift} t={t} />}
+    </div>
+  );
+}
+
+// ── Closed shift → Z-report + print ───────────────────────────────────────────
+function ClosedReportView({ shift, currencies, onDone, t }: {
+  shift: Shift; currencies: string[]; onDone: () => void; t: ReturnType<typeof useI18n>['t'];
+}) {
+  const printZReport = usePrinterStore((s) => s.printZReport);
+  const businessName = useAuthStore((s) => s.currentTenant?.business_name) || '';
+  const [printing, setPrinting] = useState(false);
+  const print = async () => {
+    setPrinting(true);
+    try {
+      await printZReport(shift, businessName);
+    } catch (e: unknown) {
+      toast.error((e as Error)?.message || t('shift.printFailed', { defaultValue: 'Failed to print Z-report' }));
+    } finally { setPrinting(false); }
+  };
+  return (
+    <div className="rounded-xl border border-gray-100 bg-white p-5 shadow-sm space-y-4">
+      <div className="flex items-center gap-2">
+        <span className="inline-flex items-center gap-1.5 rounded-full bg-gray-100 px-2.5 py-1 text-xs font-semibold text-gray-600">{t('shift.closed', { defaultValue: 'Shift closed' })}</span>
+        <span className="text-sm font-semibold text-gray-900">{t('shift.title', { defaultValue: 'Cash Shift' })} #{shift.id}</span>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-xs uppercase tracking-wide text-gray-400">
+              <th className="py-1 text-start">{t('shift.currency', { defaultValue: 'Currency' })}</th>
+              <th className="py-1 text-end">{t('shift.expected', { defaultValue: 'Expected' })}</th>
+              <th className="py-1 text-end">{t('shift.counted', { defaultValue: 'Counted' })}</th>
+              <th className="py-1 text-end">{t('shift.variance', { defaultValue: 'Variance' })}</th>
+            </tr>
+          </thead>
+          <tbody className="tabular-nums">
+            {currencies.map((c) => {
+              const v = shift.variance ? (shift.variance[c] || 0) : 0;
+              return (
+                <tr key={c} className="border-t border-gray-50">
+                  <td className="py-2 font-semibold text-gray-900">{c}</td>
+                  <td className="py-2 text-end text-gray-500" dir="ltr">{fmtNum(shift.expected[c] || 0)}</td>
+                  <td className="py-2 text-end text-gray-500" dir="ltr">{fmtNum(shift.counted_close?.[c] || 0)}</td>
+                  <td className={`py-2 text-end font-semibold ${v === 0 ? 'text-emerald-600' : 'text-red-600'}`} dir="ltr">{v > 0 ? '+' : ''}{fmtNum(v)}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div className="flex gap-2">
+        <Button onClick={print} disabled={printing} className="min-h-11"><Printer size={15} className="me-1" />{printing ? t('shift.printing', { defaultValue: 'Printing…' }) : t('shift.printZReport', { defaultValue: 'Print Z-report' })}</Button>
+        <Button variant="outline" onClick={onDone} className="min-h-11">{t('common.done', { defaultValue: 'Done' })}</Button>
+      </div>
     </div>
   );
 }
@@ -121,8 +180,8 @@ function OpenShiftForm({ currencies, busy, setBusy, onOpened, t }: {
 }
 
 // ── Open shift → drawer, movements, close ─────────────────────────────────────
-function OpenShiftView({ shift, currencies, busy, setBusy, onChanged, t }: {
-  shift: Shift; currencies: string[]; busy: boolean; setBusy: (b: boolean) => void; onChanged: (s: Shift | null) => void; t: ReturnType<typeof useI18n>['t'];
+function OpenShiftView({ shift, currencies, busy, setBusy, onChanged, onClosed, t }: {
+  shift: Shift; currencies: string[]; busy: boolean; setBusy: (b: boolean) => void; onChanged: (s: Shift | null) => void; onClosed: (report: Shift) => void; t: ReturnType<typeof useI18n>['t'];
 }) {
   const [form, setForm] = useState<'pay_in' | 'pay_out' | 'exchange' | null>(null);
   const [counted, setCounted] = useState<Record<string, string>>({});
@@ -146,9 +205,7 @@ function OpenShiftView({ shift, currencies, busy, setBusy, onChanged, t }: {
       for (const c of currencies) { const v = Number(counted[c]); if (v >= 0 && counted[c] !== undefined && counted[c] !== '') countedAmounts[c] = v; }
       const { data } = await api.post('/shifts/close', { counted: countedAmounts });
       toast.success(t('shift.closed', { defaultValue: 'Shift closed' }));
-      // Show the closing report briefly, then clear.
-      onChanged({ ...data.shift });
-      setTimeout(() => onChanged(null), 50);
+      onClosed(data.shift as Shift);
     } catch (e: unknown) {
       toast.error((e as { response?: { data?: { error?: string } } })?.response?.data?.error || t('shift.closeFailed', { defaultValue: 'Failed to close shift' }));
     } finally { setBusy(false); }

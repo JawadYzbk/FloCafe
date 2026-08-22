@@ -2199,6 +2199,9 @@
     "variance": "مغایرت",
     "closeShift": "بستن شیفت",
     "closed": "شیفت بسته شد",
-    "closeFailed": "بستن شیفت انجام نشد"
+    "closeFailed": "بستن شیفت انجام نشد",
+    "printZReport": "چاپ گزارش Z",
+    "printing": "در حال چاپ…",
+    "printFailed": "چاپ گزارش Z انجام نشد"
   }
 }

@@ -2199,6 +2199,9 @@
     "variance": "التباين",
     "closeShift": "إغلاق الوردية",
     "closed": "تم إغلاق الوردية",
-    "closeFailed": "فشل إغلاق الوردية"
+    "closeFailed": "فشل إغلاق الوردية",
+    "printZReport": "طباعة تقرير Z",
+    "printing": "جارٍ الطباعة…",
+    "printFailed": "فشل طباعة تقرير Z"
   }
 }

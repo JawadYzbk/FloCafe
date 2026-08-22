@@ -2199,6 +2199,9 @@
     "variance": "Variación",
     "closeShift": "Cerrar turno",
     "closed": "Turno cerrado",
-    "closeFailed": "No se pudo cerrar el turno"
+    "closeFailed": "No se pudo cerrar el turno",
+    "printZReport": "Imprimir Z",
+    "printing": "Imprimiendo…",
+    "printFailed": "No se pudo imprimir el Z"
   }
 }

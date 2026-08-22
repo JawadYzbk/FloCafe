@@ -312,6 +312,37 @@ router.post('/:id/test', requireRole('owner', 'manager'), asyncHandler(async (re
   }
 }));
 
+// POST /api/printers/print-raw — print prebuilt ESC/POS bytes to the default
+// printer. Used for documents the frontend renders itself (e.g. the shift
+// Z-report), so they reach network/USB printers the same way bills do.
+router.post('/print-raw', requireRole('owner', 'manager', 'cashier'), asyncHandler(async (req: Request, res: Response) => {
+  const { bytes } = req.body ?? {};
+  if (!Array.isArray(bytes) || bytes.length === 0 || bytes.length > 200_000) {
+    return res.status(400).json({ error: 'bytes must be a non-empty byte array' });
+  }
+  const data = Buffer.from(bytes.map((b: unknown) => Number(b) & 0xff));
+  const db = getDatabase();
+  const printer = db.prepare('SELECT * FROM printers WHERE is_default = 1').get() as any;
+  if (!printer) return res.status(400).json({ error: 'No default printer configured. Add a printer in Settings.' });
+
+  switch (printer.connection_type) {
+    case 'network': {
+      if (!printer.ip_address) return res.status(400).json({ error: 'No IP address configured' });
+      const result = await printViaNetwork(printer.ip_address, printer.port || 9100, data, getHttpRequestSignal(req));
+      return result.ok ? res.json({ success: true }) : res.status(502).json({ error: result.detail || 'Print failed', detail: result.detail });
+    }
+    case 'usb': {
+      const result = await printViaUSB(data, printer.name, getHttpRequestSignal(req));
+      return result.ok ? res.json({ success: true }) : res.status(502).json({ error: result.detail || 'Print failed', detail: result.detail });
+    }
+    case 'webusb':
+      // Browser-connected printer: hand the bytes back for the frontend to send.
+      return res.json({ success: true, webusb: true, bytes: Array.from(data) });
+    default:
+      return res.status(400).json({ error: 'Unsupported printer connection type' });
+  }
+}));
+
 // POST /api/printers/print-bill — print bill via backend (desktop app)
 router.post('/print-bill', requireRole('owner', 'manager', 'cashier'), asyncHandler(async (req: Request, res: Response) => {
   try {

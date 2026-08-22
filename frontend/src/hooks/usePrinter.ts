@@ -12,6 +12,7 @@ import {
 import { usePosSettingsStore } from '@/store/pos-settings';
 import { buildTaxBillBytes, type TaxBillOptions } from '@/lib/printer/tax-bill-encoder';
 import { buildKotBytes, type KotOptions } from '@/lib/printer/kot-encoder';
+import type { ZReportShift } from '@/lib/printer/z-report-encoder';
 import type { PrintWarning } from '@/lib/printer/warnings';
 import api from '@/lib/api';
 import type { Bill, Tenant, Order } from '@/lib/types';
@@ -52,6 +53,7 @@ interface PrinterState {
   printBill: (bill: Bill, tenant: ReceiptTenant, opts?: ReceiptOptions) => Promise<PrintWarning[]>;
   printTaxBill: (bill: Bill, tenant: ReceiptTenant, opts?: TaxBillOptions) => Promise<PrintWarning[]>;
   printKot: (order: Order, opts?: KotOptions) => Promise<PrintWarning[]>;
+  printZReport: (shift: ZReportShift, businessName: string) => Promise<void>;
   setPrintMode: (mode: PrintModeType) => void;
   setPaperWidth: (width: PaperWidth) => void;
   setPrintMethod: (method: PrintMode) => void;
@@ -283,6 +285,38 @@ export const usePrinterStore = create<PrinterState>()(
             await printerService.printViaBrowser(html, paperWidth);
           }
           return warnings;
+        } catch (err) {
+          set({ lastError: (err as Error).message });
+          throw err;
+        }
+      },
+
+      printZReport: async (shift, businessName) => {
+        set({ lastError: null });
+        try {
+          const { printerPaperSize } = usePosSettingsStore.getState();
+          const width: PaperWidth = printerPaperSize === 'thermal80' ? 80 : 58;
+
+          if (get().printMethod === 'browser') {
+            const { buildZReportHtml } = await import('@/lib/printer/z-report-encoder');
+            await printerService.printViaBrowser(buildZReportHtml(shift, businessName), width);
+            return;
+          }
+
+          const { buildZReportBytes } = await import('@/lib/printer/z-report-encoder');
+          const bytes = buildZReportBytes(shift, businessName, width);
+          set({ lastPrintedBytes: bytes });
+
+          const hw = get().hardwarePrinter;
+          if (hw && hw.connection_type !== 'webusb') {
+            // Network / USB printer configured on the backend — send the same
+            // way bills go, via the raw-print endpoint.
+            const { data } = await api.post<{ webusb?: boolean; bytes?: number[] }>('/printers/print-raw', { bytes: Array.from(bytes) });
+            if (data?.webusb && Array.isArray(data.bytes)) await printerService.print(Uint8Array.from(data.bytes));
+            return;
+          }
+          // WebUSB / browser-connected thermal printer.
+          await printerService.print(bytes);
         } catch (err) {
           set({ lastError: (err as Error).message });
           throw err;
