@@ -2,6 +2,7 @@
 
 import PrinterStatus from './PrinterStatus';
 import CustomerSearch from './CustomerSearch';
+import RateChip from './RateChip';
 import { useCartStore } from '@/store/cart';
 import { useAuthStore } from '@/store/auth';
 import { usePosSettingsStore } from '@/store/pos-settings';
@@ -44,6 +45,8 @@ export default function PosTopbar({ tables, onShowTablePicker }: Props) {
             : t('selectTable')}
         </button>
       )}
+
+      <RateChip />
 
       <div className="shrink-0">
         <PrinterStatus />
