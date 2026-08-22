@@ -66,6 +66,10 @@ export default function CustomerSearch({ onSelected, variant = 'default' }: Prop
   const [phone, setPhone] = useState('');
   const [name, setName] = useState('');
   const [matched, setMatched] = useState<Customer | null>(null);
+  // All customers returned by the last search — surfaced as a selectable list
+  // so the cashier can pick among several matches, not just the best one.
+  const [matches, setMatches] = useState<Customer[]>([]);
+  const [activeMatch, setActiveMatch] = useState(0);
   const [searched, setSearched] = useState(false);
   const [creating, setCreating] = useState(false);
   const [editingCustomer, setEditingCustomer] = useState(false);
@@ -121,21 +125,24 @@ export default function CustomerSearch({ onSelected, variant = 'default' }: Prop
   const searchByPhone = (p: string) => {
     clearTimeout(debounceRef.current);
     requestAbortRef.current?.abort();
-    if (p.length < 3) { setMatched(null); setName(''); setSearched(false); return; }
+    if (p.length < 3) { setMatched(null); setMatches([]); setName(''); setSearched(false); return; }
     debounceRef.current = setTimeout(async () => {
       const controller = new AbortController();
       requestAbortRef.current = controller;
       try {
         const { data } = await api.get(`/customers-search?q=${encodeURIComponent(p)}`, { signal: controller.signal });
-        const results = Array.isArray(data) ? data : (data.customers || []);
+        const results: Customer[] = Array.isArray(data) ? data : (data.customers || []);
         const exactMatch = results.find((result: Customer) => phoneMatchesInput(result.phone_digits, p)) || null;
         const found: Customer | null = exactMatch || results[0] || null;
+        setMatches(results);
+        setActiveMatch(found ? Math.max(0, results.indexOf(found)) : 0);
         setMatched(found);
         setName(found ? found.name : '');
         setSearched(true);
       } catch {
         if (controller.signal.aborted) return;
         setMatched(null);
+        setMatches([]);
         setName('');
         setSearched(true);
       }
@@ -146,6 +153,7 @@ export default function CustomerSearch({ onSelected, variant = 'default' }: Prop
     const val = e.target.value;
     setPhone(val);
     if (matched !== null) setMatched(null);
+    if (matches.length) setMatches([]);
     if (name !== '') setName('');
     if (searched) setSearched(false);
     if (val.trim() === '') autoAdvancedRef.current = false;
@@ -157,16 +165,27 @@ export default function CustomerSearch({ onSelected, variant = 'default' }: Prop
     }
   };
 
-  const handleSelectMatched = () => {
-    if (!matched) return;
-    cart.setCustomer(matched);
-    setPhone(''); setName(''); setMatched(null); setSearched(false);
+  const selectCustomer = (chosen: Customer) => {
+    cart.setCustomer(chosen);
+    setPhone(''); setName(''); setMatched(null); setMatches([]); setSearched(false);
     onSelected?.();
   };
 
+  const handleSelectMatched = () => {
+    if (matched) selectCustomer(matched);
+  };
+
   const handlePhoneKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter' && matched) {
-      handleSelectMatched();
+    if (matches.length > 0 && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+      e.preventDefault();
+      setActiveMatch((a) => e.key === 'ArrowDown'
+        ? Math.min(a + 1, matches.length - 1)
+        : Math.max(a - 1, 0));
+      return;
+    }
+    if (e.key === 'Enter') {
+      if (matches[activeMatch]) selectCustomer(matches[activeMatch]);
+      else if (matched) handleSelectMatched();
     }
   };
 
@@ -181,7 +200,7 @@ export default function CustomerSearch({ onSelected, variant = 'default' }: Prop
     try {
       const { data } = await api.post('/customers', { name: name.trim(), phone: parsed.e164, country_code: parsed.countryCode });
       cart.setCustomer(data.customer);
-      setPhone(''); setName(''); setMatched(null); setSearched(false);
+      setPhone(''); setName(''); setMatched(null); setMatches([]); setSearched(false);
       toast.success(t('customerCreated'));
       onSelected?.();
     } catch {
@@ -201,6 +220,27 @@ export default function CustomerSearch({ onSelected, variant = 'default' }: Prop
   };
 
   const handleClear = () => cart.setCustomer(null);
+
+  // Selectable list of every customer the search matched — the combobox
+  // listbox. Shared by both variants; keyboard-driven via handlePhoneKeyDown.
+  const matchesListEl = matches.length > 0 ? (
+    <ul role="listbox" aria-label={t('selectCustomer')} className="max-h-56 overflow-y-auto overflow-hidden rounded-lg border border-gray-100 bg-white shadow-sm">
+      {matches.map((c, i) => (
+        <li key={c.id} role="option" aria-selected={i === activeMatch}>
+          <button
+            type="button"
+            onMouseEnter={() => setActiveMatch(i)}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => selectCustomer(c)}
+            className={`flex w-full items-center justify-between gap-2 px-3 py-2 text-start text-sm ${i === activeMatch ? 'bg-brand-light' : 'hover:bg-gray-50'}`}
+          >
+            <span className="truncate font-medium text-gray-900">{c.name}</span>
+            {c.phone && <span className="shrink-0 text-xs text-gray-500"><Ltr>{c.phone}</Ltr></span>}
+          </button>
+        </li>
+      ))}
+    </ul>
+  ) : null;
 
   // ── Shared input classes ───────────────────────────────────────────────────
   const baseInput = 'px-3 border border-gray-200 rounded-lg focus:ring-2 focus:ring-brand focus:border-brand outline-none text-sm';
@@ -329,11 +369,11 @@ export default function CustomerSearch({ onSelected, variant = 'default' }: Prop
         </div>
 
         {searched && (
-          <div className="absolute start-0 top-full mt-1 z-20 rounded-md border border-gray-100 bg-white px-2 py-1 shadow-sm">
-            {matched ? (
-              <span className="text-xs text-green-600 font-medium">{t('customerFound')}</span>
-            ) : (
-              <span className="text-xs text-red-500 font-medium">{t('newCustomerEnterName')}</span>
+          <div className="absolute start-0 top-full mt-1 z-20 w-72 min-w-full">
+            {matchesListEl || (
+              <div className="rounded-md border border-gray-100 bg-white px-2 py-1 shadow-sm">
+                <span className="text-xs text-red-500 font-medium">{t('newCustomerEnterName')}</span>
+              </div>
             )}
           </div>
         )}
@@ -377,16 +417,10 @@ export default function CustomerSearch({ onSelected, variant = 'default' }: Prop
 
       {searched && (
         <div className="space-y-1.5">
-          {matched ? (
+          {matchesListEl ? (
             <>
               <p className="text-xs text-green-600 font-medium">{t('customerFoundClick')}</p>
-              {matched.tag_counts && <TagBadges counts={matched.tag_counts} />}
-              <button
-                onClick={handleSelectMatched}
-                className="w-full py-1.5 bg-brand text-white text-sm rounded-lg hover:bg-brand-hover"
-              >
-                {t('selectName', { name: matched.name })}
-              </button>
+              {matchesListEl}
             </>
           ) : (
             <>
