@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
+import { Dialog as DialogPrimitive } from 'radix-ui';
 import { X, Wallet, ArrowLeftRight, CheckCircle2, Sparkles, User, Percent, Send, ChevronDown } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import api from '@/lib/api';
@@ -433,21 +434,31 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
   };
 
   return (
-    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-end sm:items-center justify-center z-50 p-0 sm:p-4">
+    <DialogPrimitive.Root open onOpenChange={(next) => { if (!next) onClose(); }}>
+      <DialogPrimitive.Portal>
+        <DialogPrimitive.Overlay className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=open]:fade-in-0 data-[state=closed]:fade-out-0" />
+        <DialogPrimitive.Content
+          aria-describedby={undefined}
+          className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 outline-none"
+        >
       <div className="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-2xl overflow-hidden">
 
         {/* Header */}
         <div className="flex items-center justify-between px-5 pt-5 pb-4 border-b border-gray-100">
           <div>
-            <h2 className="text-lg font-bold text-gray-900">{t('payment')}</h2>
+            <DialogPrimitive.Title asChild>
+              <h2 className="text-lg font-bold text-gray-900">{t('payment')}</h2>
+            </DialogPrimitive.Title>
             <p className="text-xs text-gray-400 mt-0.5">{t('billNumber', { number: bill.bill_number })}</p>
           </div>
-          <button
-            onClick={onClose}
-            className="w-8 h-8 flex items-center justify-center rounded-full bg-gray-100 hover:bg-gray-200 text-gray-500 transition-colors"
-          >
-            <X size={16} />
-          </button>
+          <DialogPrimitive.Close asChild>
+            <button
+              aria-label={tCommon('close')}
+              className="w-8 h-8 flex items-center justify-center rounded-full bg-gray-100 hover:bg-gray-200 text-gray-500 transition-colors"
+            >
+              <X size={16} />
+            </button>
+          </DialogPrimitive.Close>
         </div>
 
         <div className="px-5 py-4 space-y-4 max-h-[75vh] overflow-y-auto">
@@ -458,6 +469,13 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
               <div>
                 <p className="text-xs font-medium text-slate-400 uppercase tracking-widest">{t('totalDue')}</p>
                 <p className="text-4xl font-bold mt-1 tracking-tight">{currencyFmt(remaining)}</p>
+                {secondaryCurrencies.length > 0 && (
+                  <p className="text-sm font-semibold text-slate-300 mt-1 ltr-island" dir="ltr">
+                    {secondaryCurrencies
+                      .map((c) => `${fmtNum(convertBaseToTender(remaining, c).rounded)} ${c.symbol || c.code}`)
+                      .join('  ·  ')}
+                  </p>
+                )}
               </div>
               {cartCustomer && (
                 <div className="text-end ms-4 shrink-0">
@@ -760,13 +778,15 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
               </Button>
             </>
           ) : (
-            <Button onClick={handlePay} disabled={processing || totalPayment < remaining - 0.01} className="w-full" size="lg">
+            <Button onClick={handlePay} disabled={processing || totalPayment < remaining - 0.01} className="w-full min-h-12 text-base" size="lg">
               {processing ? t('processingPayment') : `${t('pay')} ${currencyFmt(totalPayment)}`}
             </Button>
           )}
         </div>
       </div>
+        </DialogPrimitive.Content>
+      </DialogPrimitive.Portal>
       {ConfirmDialog}
-    </div>
+    </DialogPrimitive.Root>
   );
 }

@@ -396,8 +396,23 @@ export default function POSPage() {
   }, [isRestaurant, setBillingType, setTablesRequired, setKotPrintingEnabled]);
 
   const handleProductClick = (product: Product) => {
-    // Always open modal so user can add notes and adjust quantity
+    // Tapping the card opens the modal so the user can add notes and adjust
+    // quantity; the card's + button (handleQuickAdd) is the one-tap path.
     setAddonProduct(product);
+  };
+
+  // A product can only be quick-added when it has no required choices;
+  // otherwise the + button falls back to the modal so required add-ons
+  // (e.g. a mandatory size) can't be skipped.
+  const productNeedsChoices = (product: Product) =>
+    (product.addon_groups || []).some((g) => Boolean(g.is_required) || (g.min_selection || 0) > 0);
+
+  const handleQuickAdd = (product: Product) => {
+    if (productNeedsChoices(product)) {
+      setAddonProduct(product);
+      return;
+    }
+    cart.addItem(product, 1, [], '');
   };
 
   const handleAddonAdd = (product: Product, quantity: number, addons: Addon[], instructions: string) => {
@@ -967,6 +982,7 @@ export default function POSPage() {
             setSearch={setSearch}
             currency={currency}
             onProductClick={handleProductClick}
+            onQuickAdd={handleQuickAdd}
             sidebarOpen={leftSidebarOpen}
           />
         </div>

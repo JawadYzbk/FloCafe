@@ -1,7 +1,7 @@
 'use client';
 
 import { useMemo } from 'react';
-import { Search, SlidersHorizontal } from 'lucide-react';
+import { Search, SlidersHorizontal, Plus } from 'lucide-react';
 import type { Category, Product } from '@/lib/types';
 import { useCartStore } from '@/store/cart';
 import { usePosSettingsStore } from '@/store/pos-settings';
@@ -50,12 +50,14 @@ interface Props {
   setSearch: (s: string) => void;
   currency: string;
   onProductClick: (product: Product) => void;
+  /** One-tap add to cart. Falls back to onProductClick for items needing choices. */
+  onQuickAdd?: (product: Product) => void;
   sidebarOpen?: boolean;
 }
 
 export default function ProductGrid({
   categories, products, selectedCategory, setSelectedCategory,
-  search, setSearch, onProductClick, sidebarOpen = true,
+  search, setSearch, onProductClick, onQuickAdd, sidebarOpen = true,
 }: Props) {
   const cart = useCartStore();
   const { showProductImages } = usePosSettingsStore();
@@ -103,7 +105,7 @@ export default function ProductGrid({
         <div className="flex flex-wrap gap-2 pb-1">
           <button
             onClick={() => setSelectedCategory(null)}
-            className={`px-4 py-2 rounded-lg text-sm font-medium whitespace-nowrap transition-colors ${
+            className={`min-h-11 px-4 py-2 rounded-lg text-sm font-medium whitespace-nowrap transition-colors ${
               !selectedCategory ? 'bg-brand text-white' : 'bg-white text-gray-700 border border-gray-200 hover:bg-gray-50'
             }`}
           >
@@ -116,7 +118,7 @@ export default function ProductGrid({
               <button
                 key={cat.id}
                 onClick={() => setSelectedCategory(cat.id)}
-                className={`px-4 py-2 rounded-lg text-sm font-medium whitespace-nowrap transition-colors ${
+                className={`min-h-11 px-4 py-2 rounded-lg text-sm font-medium whitespace-nowrap transition-colors ${
                   isSelected
                     ? colorClasses
                       ? `${colorClasses.activeBg} ${colorClasses.activeText}`
@@ -202,8 +204,8 @@ export default function ProductGrid({
                 )}
 
                 <h3 className="font-medium text-gray-900 text-sm line-clamp-2 leading-snug">{product.name}</h3>
-                <div className="flex items-center justify-between mt-1">
-                  <p className="text-brand font-bold">
+                <div className="flex items-center justify-between gap-1 mt-1">
+                  <p className="text-brand font-bold min-w-0 truncate">
                     {fmt(Number(product.price))}
                   </p>
                   <div className="flex items-center gap-1 shrink-0">
@@ -211,15 +213,23 @@ export default function ProductGrid({
                       <TagBadge tag={product.tags[0]} />
                     )}
                     {product.addon_groups && product.addon_groups.length > 0 && (
+                      <span className="text-gray-300" title={t('customisable')} aria-hidden="true">
+                        <SlidersHorizontal size={12} />
+                      </span>
+                    )}
+                    {onQuickAdd && (
                       <button
+                        type="button"
                         onClick={(e) => {
                           e.stopPropagation();
-                          onProductClick(product);
+                          onQuickAdd(product);
                         }}
-                        className="text-gray-400 hover:text-gray-600 transition-colors"
-                        title={t('customisable')}
+                        disabled={!!product.track_inventory && product.stock_quantity <= 0}
+                        aria-label={t('addToOrder', { count: 1 })}
+                        title={t('addToOrder', { count: 1 })}
+                        className="w-11 h-11 -my-1 shrink-0 flex items-center justify-center rounded-lg bg-brand text-white hover:bg-brand-hover active:scale-95 transition-all disabled:opacity-40 disabled:pointer-events-none"
                       >
-                        <SlidersHorizontal size={12} />
+                        <Plus size={18} strokeWidth={2.5} />
                       </button>
                     )}
                   </div>

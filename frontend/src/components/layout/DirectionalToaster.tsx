@@ -20,5 +20,17 @@ export function DirectionalToaster() {
   const locale = useLocale();
   const language = getLanguageFromLocale(locale) ?? 'en';
   const rtl = getLanguageDirection(language) === 'rtl';
-  return <Toaster position={rtl ? 'top-left' : 'top-right'} />;
+  return (
+    <Toaster
+      position={rtl ? 'top-left' : 'top-right'}
+      // Announce toasts to assistive tech: successes/info politely, errors
+      // assertively (role="alert") so a failed payment or validation isn't
+      // silently missed mid-service. react-hot-toast applies these ariaProps
+      // to each toast's live region.
+      toastOptions={{
+        ariaProps: { role: 'status', 'aria-live': 'polite' },
+        error: { ariaProps: { role: 'alert', 'aria-live': 'assertive' } },
+      }}
+    />
+  );
 }
