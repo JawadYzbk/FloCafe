@@ -1577,6 +1577,10 @@ interface TenderContext {
   rate?: number;
 }
 
+// How far a client-supplied exchange rate may drift from the configured
+// (server-authoritative) rate before settlement is rejected as stale (0.5%).
+const RATE_DRIFT_TOLERANCE = 0.005;
+
 /**
  * Resolves a payment line's tender currency against the tenant's base +
  * accepted secondary currencies. Base-currency lines (or lines with no
@@ -1599,11 +1603,25 @@ function resolveTenderContext(
   if (!secondary) {
     throw Object.assign(new Error(`Currency ${code} at line ${lineIndex + 1} is not an accepted tender`), { statusCode: 400 });
   }
-  const rate = payment.exchange_rate === undefined ? secondary.rate : Number(payment.exchange_rate);
-  if (!Number.isFinite(rate) || rate <= 0) {
-    throw Object.assign(new Error(`A positive exchange rate is required for ${code} at line ${lineIndex + 1}`), { statusCode: 400 });
+  // The exchange rate is server-authoritative (invariant #5): settlement always
+  // uses the configured rate, never a value the client supplies. A client rate
+  // that has drifted beyond tolerance means the cashier's screen is stale — the
+  // customer was shown a wrong total — so reject and force a refresh rather than
+  // silently crediting a different amount than displayed.
+  const serverRate = Number(secondary.rate);
+  if (!Number.isFinite(serverRate) || serverRate <= 0) {
+    throw Object.assign(new Error(`No exchange rate is configured for ${code}`), { statusCode: 400 });
   }
-  return { isSecondary: true, currency: code, rate };
+  if (payment.exchange_rate !== undefined) {
+    const clientRate = Number(payment.exchange_rate);
+    if (!Number.isFinite(clientRate) || clientRate <= 0) {
+      throw Object.assign(new Error(`A positive exchange rate is required for ${code} at line ${lineIndex + 1}`), { statusCode: 400 });
+    }
+    if (Math.abs(clientRate - serverRate) / serverRate > RATE_DRIFT_TOLERANCE) {
+      throw Object.assign(new Error(`Exchange rate for ${code} changed — refresh and retry`), { statusCode: 409 });
+    }
+  }
+  return { isSecondary: true, currency: code, rate: serverRate };
 }
 
 // A payment request is prepared and fully validated before any ledger or bill

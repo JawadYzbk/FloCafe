@@ -7,6 +7,7 @@ import toast from 'react-hot-toast';
 import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useI18n } from '@/hooks/useI18n';
+import { useCurrenciesStore } from '@/store/currencies';
 import { convertBaseToTender, type SecondaryCurrency, type RoundingMode } from '@/lib/countries';
 
 // Full ISO 4217 currency list for the base-currency picker, from the platform
@@ -71,6 +72,9 @@ export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
     setBaseCurrency(String(data.base_currency || ''));
     setSupported(Array.isArray(data.frankfurter_currencies) ? data.frankfurter_currencies : []);
     setRows((Array.isArray(data.secondary_currencies) ? data.secondary_currencies : []).map(toRow));
+    // Keep the shared store in sync so the POS rate chip, cart dual total, and
+    // payment modal reflect edits immediately instead of only after a reload.
+    useCurrenciesStore.getState().setFromResponse(data);
   };
 
   useEffect(() => {

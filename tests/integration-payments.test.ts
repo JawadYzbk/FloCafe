@@ -406,6 +406,24 @@ async function main() {
     });
     assertEqual(payReject.status, 400, 'unaccepted tender currency rejected');
 
+    // A stale client exchange rate (drifted > 0.5% from the configured rate) is
+    // rejected so settlement never credits a different amount than displayed.
+    const payStaleRate = await api(baseUrl, `/api/bills/${billH2.data.bill.id}/payments`, {
+      method: 'POST',
+      body: { payments: [{ method: 'cash', amount: 100000, tender_currency: 'LBP', exchange_rate: 80000 }] },
+      headers: authHeader,
+    });
+    assertEqual(payStaleRate.status, 409, 'stale/drifted exchange rate rejected');
+
+    // The bill is still fully payable at the configured (server) rate.
+    const payAtServerRate = await api(baseUrl, `/api/bills/${billH2.data.bill.id}/payments`, {
+      method: 'POST',
+      body: { payments: [{ method: 'cash', amount: billH2.data.bill.total * 89000, tender_currency: 'LBP', exchange_rate: 89000 }] },
+      headers: authHeader,
+    });
+    assertEqual(payAtServerRate.status, 200, 'LBP tender at the configured rate settles');
+    assertEqual(payAtServerRate.data.bill.payment_status, 'paid', 'bill paid at server rate');
+
     db.prepare("DELETE FROM settings WHERE key IN ('base_currency', 'secondary_currencies')").run();
 
   } finally {
