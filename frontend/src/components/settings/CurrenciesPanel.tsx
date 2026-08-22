@@ -8,6 +8,17 @@ import { Button } from '@/components/ui/button';
 import { useI18n } from '@/hooks/useI18n';
 import { convertBaseToTender, type SecondaryCurrency, type RoundingMode } from '@/lib/countries';
 
+// Full ISO 4217 currency list for the base-currency picker, from the platform
+// when available (falls back to a common set for older runtimes).
+const CURRENCY_CODES: string[] = (() => {
+  try {
+    const list = (Intl as unknown as { supportedValuesOf?: (k: string) => string[] })
+      .supportedValuesOf?.('currency');
+    if (list && list.length) return list;
+  } catch { /* fall through */ }
+  return ['USD', 'EUR', 'GBP', 'LBP', 'AED', 'SAR', 'EGP', 'JOD', 'TRY', 'INR', 'JPY'];
+})();
+
 // Editable row model — mirrors SecondaryCurrency but keeps rate as a string so
 // the input can be cleared while typing.
 interface Row {
@@ -79,7 +90,7 @@ export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
       toast.error(t('settings.currencyDuplicate', { defaultValue: 'That currency is already in the list' }));
       return;
     }
-    const canAuto = supported.includes(code);
+    const canAuto = supported.includes(code) && supported.includes(baseCurrency.toUpperCase());
     setRows((old) => [...old, {
       code, symbol: '', rate: '', rate_source: canAuto ? 'frankfurter' : 'manual', increment: '1', mode: 'half_up',
     }]);
@@ -88,20 +99,22 @@ export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
 
   const removeRow = (idx: number) => setRows((old) => old.filter((_, i) => i !== idx));
 
+  const baseSupportsLive = supported.includes(baseCurrency.toUpperCase());
+
   const save = async () => {
     for (const r of rows) {
       if (!(Number(r.rate) > 0)) {
         toast.error(t('settings.currencyRateInvalid', { defaultValue: `Enter a positive rate for ${r.code}` }));
         return;
       }
-      if (r.rate_source === 'frankfurter' && !supported.includes(r.code.toUpperCase())) {
+      if (r.rate_source === 'frankfurter' && (!supported.includes(r.code.toUpperCase()) || !baseSupportsLive)) {
         toast.error(t('settings.currencyNotAuto', { defaultValue: `${r.code} has no live rate — set it manually` }));
         return;
       }
     }
     setSaving(true);
     try {
-      await api.put('/settings/currencies', { secondary_currencies: rows.map(toPayload) });
+      await api.put('/settings/currencies', { base_currency: baseCurrency, secondary_currencies: rows.map(toPayload) });
       await load();
       toast.success(t('settings.saved', { defaultValue: 'Saved' }));
     } catch (e: unknown) {
@@ -117,7 +130,13 @@ export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
     try {
       const { data } = await api.post('/settings/currencies/refresh');
       setRows((Array.isArray(data.secondary_currencies) ? data.secondary_currencies : []).map(toRow));
-      toast.success(t('settings.ratesRefreshed', { defaultValue: `Updated ${data.updated ?? 0} rate(s)` }));
+      const updated = Number(data.updated) || 0;
+      if (updated > 0) {
+        toast.success(t('settings.ratesRefreshed', { defaultValue: `Updated ${updated} rate(s)` }));
+      } else {
+        // No live rates changed — usually offline, or the pair isn't quotable.
+        toast(t('settings.ratesUnchanged', { defaultValue: 'No live rates updated — check your connection, or the currency has no live rate' }));
+      }
     } catch {
       toast.error(t('settings.saveFailed'));
     } finally {
@@ -140,10 +159,27 @@ export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
           })}
         </p>
 
-        <div className="rounded-lg border border-gray-100 px-3 py-2 flex justify-between text-sm mb-5">
-          <span className="text-gray-600">{t('settings.baseCurrency', { defaultValue: 'Base currency' })}</span>
-          <span className="font-semibold text-gray-900">{baseCurrency || '—'}</span>
+        <div className="rounded-lg border border-gray-100 px-3 py-2 flex items-center justify-between gap-3 text-sm mb-1.5">
+          <label htmlFor="base-currency" className="text-gray-600">{t('settings.baseCurrency', { defaultValue: 'Base currency' })}</label>
+          <select
+            id="base-currency"
+            disabled={!isAdmin}
+            value={baseCurrency}
+            onChange={(e) => setBaseCurrency(e.target.value.toUpperCase())}
+            className="px-2 py-1.5 text-sm font-semibold border rounded-lg bg-white text-gray-900 disabled:bg-gray-50"
+          >
+            {baseCurrency && !CURRENCY_CODES.includes(baseCurrency) && <option value={baseCurrency}>{baseCurrency}</option>}
+            {CURRENCY_CODES.map((c) => <option key={c} value={c}>{c}</option>)}
+          </select>
         </div>
+        <p className="text-xs text-gray-400 mb-3">
+          {t('settings.baseCurrencyHint', { defaultValue: 'Prices, taxes, and reports are kept in this currency. Changing it does not reconvert existing amounts.' })}
+        </p>
+        {baseCurrency && !supported.includes(baseCurrency) && (
+          <p className="text-xs text-amber-600 mb-4">
+            {t('settings.baseNoLiveRates', { defaultValue: `Live rates aren't available for a ${baseCurrency} base — secondary rates must be set manually.` })}
+          </p>
+        )}
 
         <div className="space-y-4">
           {rows.map((row, idx) => {
@@ -168,7 +204,7 @@ export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
                       className="w-full px-2 py-2 text-sm border rounded-lg bg-white text-gray-900"
                     >
                       <option value="manual">{t('settings.rateManual', { defaultValue: 'Manual' })}</option>
-                      <option value="frankfurter" disabled={!canAuto}>{t('settings.rateAuto', { defaultValue: 'Live (Frankfurter)' })}</option>
+                      <option value="frankfurter" disabled={!canAuto || !baseSupportsLive}>{t('settings.rateAuto', { defaultValue: 'Live (Frankfurter)' })}</option>
                     </select>
                   </label>
                   <label className="text-xs text-gray-500 space-y-1">

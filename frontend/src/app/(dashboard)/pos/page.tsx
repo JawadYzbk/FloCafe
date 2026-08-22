@@ -251,7 +251,10 @@ export default function POSPage() {
   const currency = getCurrencySymbol(currentTenant?.currency || 'INR', getCountryByCode(currentTenant?.country ?? 'IN')?.locale);
   const { printBill, printKot } = usePrinterStore();
   const billingIsPrepaid = billingType === 'prepaid';
-  const shouldTakePaymentNow = billingIsPrepaid;
+  // Takeaway is settled at the counter there and then, so it's always instant
+  // pay — even in a postpaid (dine-in) store. Dine-in still follows the store's
+  // billing mode (postpaid = seat, serve, pay later).
+  const shouldTakePaymentNow = billingIsPrepaid || cart.orderType === 'takeaway';
 
   const printKotIfEnabled = async (order: Order) => {
     // kot_printing_enabled is coarser than auto_print_kot: when it's off, no
@@ -1057,6 +1060,7 @@ export default function POSPage() {
           onAddItems={handleAddItemsToOrder}
           onPayment={(bill) => { setCheckoutTable(null); setPaymentBill(bill); }}
           onAddCartToOrder={handleAddCartToOrder}
+          onPrintBill={async (bill) => { await printBillForTenant(bill, true); }}
         />
       )}
 

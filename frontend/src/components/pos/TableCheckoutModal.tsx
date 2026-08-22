@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { X, ShoppingCart, Users } from 'lucide-react';
+import { X, ShoppingCart, Users, Printer } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import TaxBreakdown from '@/components/pos/TaxBreakdown';
 import api from '@/lib/api';
@@ -19,6 +19,8 @@ interface Props {
   onAddItems: (table: Table, order: Order) => void;
   onPayment: (bill: Bill) => void;
   onAddCartToOrder?: (table: Table, order: Order) => void;
+  /** Print the table's bill without taking payment (pay later). */
+  onPrintBill?: (bill: Bill) => Promise<void> | void;
 }
 
 export default function TableCheckoutModal({
@@ -28,9 +30,11 @@ export default function TableCheckoutModal({
   onClose,
   onAddItems,
   onPayment,
-  onAddCartToOrder
+  onAddCartToOrder,
+  onPrintBill,
 }: Props) {
   const t = useTranslations('pos');
+  const tReceipt = useTranslations('receipt');
   const fmt = useFormatCurrency();
   const formatItemTotal = (value: unknown, fallback: unknown) => {
     const total = Number(value);
@@ -85,6 +89,23 @@ export default function TableCheckoutModal({
       toast.error(t('generateBillFailed'));
     } finally {
       setGenerating(false);
+    }
+  };
+
+  // Print the customer's bill now and settle later — the usual dine-in flow:
+  // the guest reviews the printed bill, then pays whenever they're ready.
+  const [printing, setPrinting] = useState(false);
+  const handlePrintBill = async () => {
+    if (!order || !onPrintBill) return;
+    setPrinting(true);
+    try {
+      const bill = order.bill || (await api.post('/bills/generate', { order_id: order.id })).data.bill as Bill;
+      if (!order.bill) setOrder({ ...order, bill });
+      await onPrintBill(bill);
+    } catch {
+      toast.error(t('generateBillFailed'));
+    } finally {
+      setPrinting(false);
     }
   };
 
@@ -208,6 +229,11 @@ export default function TableCheckoutModal({
           {splitBills.length > 0 && <div className="space-y-2">{splitBills.map((bill) => <div key={bill.id} className="flex items-center justify-between rounded-lg border p-2"><div><p className="text-sm font-medium">{bill.split_label}</p><p className="text-xs text-gray-500">{fmt(Number(bill.total))} · {bill.payment_status}</p></div>{bill.payment_status !== 'paid' && <Button size="sm" onClick={() => onPayment(bill)}>{t('pay', { defaultValue: 'Pay' })}</Button>}</div>)}</div>}
 
           {/* Show different buttons based on cart state */}
+          {onPrintBill && splitBills.length === 0 && order.bill?.payment_status !== 'paid' && (
+            <Button variant="outline" onClick={handlePrintBill} disabled={printing || generating} className="w-full">
+              <Printer size={15} className="me-2" />{printing ? t('generating') : tReceipt('printBill')}
+            </Button>
+          )}
           {splitBills.length === 0 && splitChecksEnabled && order.type === 'dine_in' && order.bill?.payment_status !== 'paid' && <Button variant="outline" onClick={handleSplitCheck} disabled={generating} className="w-full"><Users size={15} className="me-2" />{t('splitCheck', { defaultValue: 'Split check' })}</Button>}
           {cartItemCount > 0 ? (
             // Cart has items - show "Add items to order" option

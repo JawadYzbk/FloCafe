@@ -294,6 +294,11 @@ router.put('/currencies', requireRole('owner', 'manager'), (req: Request, res: R
         if (parsed.rate_source === 'frankfurter' && !isFrankfurterSupported(parsed.code)) {
           return res.status(400).json({ error: `${parsed.code} is not supported by Frankfurter — set its rate manually` });
         }
+        // A live rate also needs the base currency to be quotable; otherwise the
+        // pair can never refresh (e.g. an LBP base, which Frankfurter/ECB lacks).
+        if (parsed.rate_source === 'frankfurter' && !isFrankfurterSupported(effectiveBase)) {
+          return res.status(400).json({ error: `Live rates need a base currency Frankfurter supports; ${effectiveBase} is not — set ${parsed.code} manually` });
+        }
         if (seen.has(parsed.code)) {
           return res.status(400).json({ error: `Duplicate secondary currency ${parsed.code}` });
         }
