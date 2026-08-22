@@ -1,9 +1,10 @@
 'use client';
 
 import { useState } from 'react';
-import { X, Plus, Minus } from 'lucide-react';
+import { Plus, Minus } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { Button } from '@/components/ui/button';
+import { Modal } from '@/components/ui/modal';
 import { useTranslations } from 'use-intl';
 import { useFormatCurrency } from '@/hooks/useFormatCurrency';
 import type { Product, Addon, AddonGroup } from '@/lib/types';
@@ -110,18 +111,7 @@ export default function AddonModal({
   };
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-      <div className="bg-white rounded-2xl w-full max-w-md max-h-[85vh] flex flex-col">
-        <div className="flex justify-between items-center p-5 border-b border-gray-100">
-          <div>
-            <h2 className="text-lg font-bold text-gray-900">{product.name}</h2>
-            <p className="text-brand font-semibold">{fmt(Number(product.price))}</p>
-          </div>
-          <button onClick={onClose} className="text-gray-400 hover:text-gray-600">
-            <X size={20} />
-          </button>
-        </div>
-
+    <Modal title={product.name} subtitle={fmt(Number(product.price))} onClose={onClose} size="md">
         <div className="flex-1 overflow-y-auto p-5 space-y-5">
           {groups.map((group) => {
             const count = getGroupTotalQuantity(group.id);
@@ -303,7 +293,6 @@ export default function AddonModal({
               : t('addToCart', { total: fmt(itemTotal) })}
           </Button>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

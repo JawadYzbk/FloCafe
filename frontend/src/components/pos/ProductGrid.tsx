@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import { Search, SlidersHorizontal, Plus } from 'lucide-react';
 import type { Category, Product } from '@/lib/types';
 import { useCartStore } from '@/store/cart';
@@ -63,6 +63,22 @@ export default function ProductGrid({
   const { showProductImages } = usePosSettingsStore();
   const t = useTranslations('pos');
   const fmt = useFormatCurrency();
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  // "/" jumps to the product search from anywhere on the POS, unless the
+  // cashier is already typing in a field — the fastest way to start a lookup.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return;
+      const el = document.activeElement as HTMLElement | null;
+      const typing = el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
+      if (typing) return;
+      e.preventDefault();
+      searchRef.current?.focus();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
   const cartQuantities = useMemo(() => {
     const quantities = new Map<Product['id'], number>();
     for (const item of cart.items) {
@@ -83,6 +99,7 @@ export default function ProductGrid({
         <div className="relative mb-2">
           <Search size={16} className="absolute start-3 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none" />
           <input
+            ref={searchRef}
             type="text"
             value={search}
             onChange={(e) => setSearch(e.target.value)}

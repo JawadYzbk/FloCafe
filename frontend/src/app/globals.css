@@ -200,3 +200,18 @@ body {
 [dir="rtl"] .rtl-flip {
   transform: scaleX(-1);
 }
+
+/* ── Arabic typography (ar-LB) ────────────────────────────────────────────────
+ * Arabic glyphs are taller and wider than Latin and their letters join, so:
+ *   - use a real Arabic face (Cairo, self-hosted via next/font),
+ *   - give text more line-height for the ascenders/descenders,
+ *   - never letter-space Arabic — tracking breaks the joins (several labels
+ *     use tracking-widest, which must be neutralised under Arabic).
+ * Numbers stay LTR via the existing .ltr-island pattern. */
+:lang(ar) {
+  font-family: var(--font-arabic), "Segoe UI", Tahoma, sans-serif;
+  line-height: 1.7;
+}
+:lang(ar) * {
+  letter-spacing: normal !important;
+}
