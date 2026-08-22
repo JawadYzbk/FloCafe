@@ -5,6 +5,7 @@ import { Coins, Plus, RefreshCw, Trash2, Save } from 'lucide-react';
 import api from '@/lib/api';
 import toast from 'react-hot-toast';
 import { Button } from '@/components/ui/button';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useI18n } from '@/hooks/useI18n';
 import { convertBaseToTender, type SecondaryCurrency, type RoundingMode } from '@/lib/countries';
 
@@ -160,17 +161,14 @@ export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
         </p>
 
         <div className="rounded-lg border border-gray-100 px-3 py-2 flex items-center justify-between gap-3 text-sm mb-1.5">
-          <label htmlFor="base-currency" className="text-gray-600">{t('settings.baseCurrency', { defaultValue: 'Base currency' })}</label>
-          <select
-            id="base-currency"
-            disabled={!isAdmin}
-            value={baseCurrency}
-            onChange={(e) => setBaseCurrency(e.target.value.toUpperCase())}
-            className="px-2 py-1.5 text-sm font-semibold border rounded-lg bg-white text-gray-900 disabled:bg-gray-50"
-          >
-            {baseCurrency && !CURRENCY_CODES.includes(baseCurrency) && <option value={baseCurrency}>{baseCurrency}</option>}
-            {CURRENCY_CODES.map((c) => <option key={c} value={c}>{c}</option>)}
-          </select>
+          <span className="text-gray-600">{t('settings.baseCurrency', { defaultValue: 'Base currency' })}</span>
+          <Select value={baseCurrency} onValueChange={(v) => setBaseCurrency(v.toUpperCase())} disabled={!isAdmin}>
+            <SelectTrigger id="base-currency" size="sm" className="w-32 font-semibold"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {baseCurrency && !CURRENCY_CODES.includes(baseCurrency) && <SelectItem value={baseCurrency}>{baseCurrency}</SelectItem>}
+              {CURRENCY_CODES.map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}
+            </SelectContent>
+          </Select>
         </div>
         <p className="text-xs text-gray-400 mb-3">
           {t('settings.baseCurrencyHint', { defaultValue: 'Prices, taxes, and reports are kept in this currency. Changing it does not reconvert existing amounts.' })}
@@ -195,18 +193,16 @@ export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
                 </div>
 
                 <div className="grid grid-cols-2 gap-3">
-                  <label className="text-xs text-gray-500 space-y-1">
+                  <div className="text-xs text-gray-500 space-y-1">
                     <span>{t('settings.rateSource', { defaultValue: 'Rate source' })}</span>
-                    <select
-                      disabled={!isAdmin}
-                      value={row.rate_source}
-                      onChange={(e) => setRow(idx, { rate_source: e.target.value as 'frankfurter' | 'manual' })}
-                      className="w-full px-2 py-2 text-sm border rounded-lg bg-white text-gray-900"
-                    >
-                      <option value="manual">{t('settings.rateManual', { defaultValue: 'Manual' })}</option>
-                      <option value="frankfurter" disabled={!canAuto || !baseSupportsLive}>{t('settings.rateAuto', { defaultValue: 'Live (Frankfurter)' })}</option>
-                    </select>
-                  </label>
+                    <Select value={row.rate_source} onValueChange={(v) => setRow(idx, { rate_source: v as 'frankfurter' | 'manual' })} disabled={!isAdmin}>
+                      <SelectTrigger size="sm" className="w-full"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="manual">{t('settings.rateManual', { defaultValue: 'Manual' })}</SelectItem>
+                        <SelectItem value="frankfurter" disabled={!canAuto || !baseSupportsLive}>{t('settings.rateAuto', { defaultValue: 'Live (Frankfurter)' })}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
                   <label className="text-xs text-gray-500 space-y-1">
                     <span>{t('settings.rate', { defaultValue: 'Rate (per 1 base)' })}</span>
                     <input
@@ -232,19 +228,17 @@ export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
                     />
                     <datalist id={`inc-${row.code}`}>{INCREMENT_PRESETS.map((p) => <option key={p} value={p} />)}</datalist>
                   </label>
-                  <label className="text-xs text-gray-500 space-y-1">
+                  <div className="text-xs text-gray-500 space-y-1">
                     <span>{t('settings.roundingMode', { defaultValue: 'Rounding' })}</span>
-                    <select
-                      disabled={!isAdmin}
-                      value={row.mode}
-                      onChange={(e) => setRow(idx, { mode: e.target.value as RoundingMode })}
-                      className="w-full px-2 py-2 text-sm border rounded-lg bg-white text-gray-900"
-                    >
-                      <option value="half_up">{t('settings.roundingModeHalfUp', { defaultValue: 'Nearest (half up)' })}</option>
-                      <option value="floor">{t('settings.roundingModeFloor', { defaultValue: 'Down' })}</option>
-                      <option value="ceil">{t('settings.roundingModeCeil', { defaultValue: 'Up' })}</option>
-                    </select>
-                  </label>
+                    <Select value={row.mode} onValueChange={(v) => setRow(idx, { mode: v as RoundingMode })} disabled={!isAdmin}>
+                      <SelectTrigger size="sm" className="w-full"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="half_up">{t('settings.roundingModeHalfUp', { defaultValue: 'Nearest (half up)' })}</SelectItem>
+                        <SelectItem value="floor">{t('settings.roundingModeFloor', { defaultValue: 'Down' })}</SelectItem>
+                        <SelectItem value="ceil">{t('settings.roundingModeCeil', { defaultValue: 'Up' })}</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
                 </div>
 
                 {preview && (

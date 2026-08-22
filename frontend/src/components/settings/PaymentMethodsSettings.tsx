@@ -5,6 +5,7 @@ import { CreditCard, Plus, Save, Trash2, Merge } from 'lucide-react';
 import api from '@/lib/api';
 import toast from 'react-hot-toast';
 import { Button } from '@/components/ui/button';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useI18n } from '@/hooks/useI18n';
 import { useFormatDate } from '@/hooks/useFormatDate';
 import type { CustomPaymentMethod } from '@/lib/payment-methods';
@@ -108,10 +109,13 @@ export function PaymentMethodsSettings({ isAdmin }: { isAdmin: boolean }) {
                 <Button variant="outline" size="sm" disabled={!isAdmin || Boolean(method.usage_count)} onClick={() => remove(method)}><Trash2 size={14} /></Button>
               </div>
               {Boolean(method.usage_count) && isAdmin && <div className="flex gap-2 items-center">
-                <select value={mergeTargets[method.id] || ''} onChange={(e) => setMergeTargets((old) => ({ ...old, [method.id]: e.target.value }))} className="flex-1 px-2 py-1.5 text-xs border rounded-md bg-white">
-                  <option value="">{t('settings.mergeInto', { defaultValue: 'Merge into…' })}</option><option value="card">Card</option>
-                  {methods.filter((target) => target.id !== method.id).map((target) => <option key={target.id} value={target.id}>{target.name}</option>)}
-                </select>
+                <Select value={mergeTargets[method.id] || undefined} onValueChange={(v) => setMergeTargets((old) => ({ ...old, [method.id]: v }))}>
+                  <SelectTrigger size="sm" className="flex-1"><SelectValue placeholder={t('settings.mergeInto', { defaultValue: 'Merge into…' })} /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="card">Card</SelectItem>
+                    {methods.filter((target) => target.id !== method.id).map((target) => <SelectItem key={target.id} value={String(target.id)}>{target.name}</SelectItem>)}
+                  </SelectContent>
+                </Select>
                 <Button variant="outline" size="sm" disabled={!mergeTargets[method.id]} onClick={() => merge(method)}><Merge size={14} className="me-1" />{t('settings.merge', { defaultValue: 'Merge' })}</Button>
               </div>}
             </div>

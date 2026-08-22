@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useI18n } from '@/hooks/useI18n';
 import { useFormatNumber } from '@/hooks/useFormatNumber';
 import { useSupportTicketStatus } from '@/hooks/useSupportTicketStatus';
@@ -119,23 +120,29 @@ export default function SupportPage() {
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-2">
                 <Label htmlFor="support-category">{t('support.category')}</Label>
-                <select id="support-category" value={category} onChange={(e) => setCategory(e.target.value)} className="h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm shadow-xs">
-                  <option value="general">{t('support.categoryGeneral')}</option>
-                  <option value="bug">{t('support.categoryBug')}</option>
-                  <option value="printer">{t('support.categoryPrinter')}</option>
-                  <option value="account">{t('support.categoryAccount')}</option>
-                  <option value="tax">{t('support.categoryTax')}</option>
-                  <option value="feature">{t('support.categoryFeature')}</option>
-                </select>
+                <Select value={category} onValueChange={setCategory}>
+                  <SelectTrigger id="support-category" className="w-full"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="general">{t('support.categoryGeneral')}</SelectItem>
+                    <SelectItem value="bug">{t('support.categoryBug')}</SelectItem>
+                    <SelectItem value="printer">{t('support.categoryPrinter')}</SelectItem>
+                    <SelectItem value="account">{t('support.categoryAccount')}</SelectItem>
+                    <SelectItem value="tax">{t('support.categoryTax')}</SelectItem>
+                    <SelectItem value="feature">{t('support.categoryFeature')}</SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
               <div className="space-y-2">
                 <Label htmlFor="support-severity">{t('support.urgency')}</Label>
-                <select id="support-severity" value={severity} onChange={(e) => setSeverity(e.target.value)} className="h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm shadow-xs">
-                  <option value="low">{t('support.urgencyLow')}</option>
-                  <option value="normal">{t('support.urgencyNormal')}</option>
-                  <option value="high">{t('support.urgencyHigh')}</option>
-                  <option value="urgent">{t('support.urgencyUrgent')}</option>
-                </select>
+                <Select value={severity} onValueChange={setSeverity}>
+                  <SelectTrigger id="support-severity" className="w-full"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="low">{t('support.urgencyLow')}</SelectItem>
+                    <SelectItem value="normal">{t('support.urgencyNormal')}</SelectItem>
+                    <SelectItem value="high">{t('support.urgencyHigh')}</SelectItem>
+                    <SelectItem value="urgent">{t('support.urgencyUrgent')}</SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
             </div>
             <div className="space-y-2">

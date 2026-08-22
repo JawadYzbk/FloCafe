@@ -3,6 +3,7 @@
 import { useState, useEffect } from 'react';
 import api from '@/lib/api';
 import { Button } from '@/components/ui/button';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import toast from 'react-hot-toast';
 import { Plus, X, Edit, RotateCcw, Eye, EyeOff } from 'lucide-react';
 import type { Staff } from '@/lib/types';
@@ -244,17 +245,17 @@ export default function StaffPage() {
                 className="w-full px-3 py-2 border rounded-lg outline-none focus:ring-2 focus:ring-brand"
                 required={!editingStaff || Boolean(form.password)}
               />
-              <select
-                value={form.role} onChange={(e) => {
-                  const role = e.target.value;
-                  setForm({ ...form, role, pin: ['owner', 'manager'].includes(role) ? form.pin : '' });
-                }}
-                className="w-full px-3 py-2 border rounded-lg outline-none focus:ring-2 focus:ring-brand"
+              <Select
+                value={form.role}
+                onValueChange={(role) => setForm({ ...form, role, pin: ['owner', 'manager'].includes(role) ? form.pin : '' })}
               >
-                {VALID_ROLES.map((r) => (
-                  <option key={r} value={r} disabled={editingLastActiveOwner && r !== 'owner'}>{roleColorKey[r] ? t(roleColorKey[r]) : r}</option>
-                ))}
-              </select>
+                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {VALID_ROLES.map((r) => (
+                    <SelectItem key={r} value={r} disabled={editingLastActiveOwner && r !== 'owner'}>{roleColorKey[r] ? t(roleColorKey[r]) : r}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
               {['owner', 'manager'].includes(form.role) && (
                 <div>
                   <div className="relative">

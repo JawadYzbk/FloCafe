@@ -1,6 +1,7 @@
 'use client';
 
 import { useI18n } from '@/hooks/useI18n';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import type { CountryLocaleOptions, CurrencyDisplay, DigitMode, CalendarMode } from '@/lib/countries';
 
 interface Props {
@@ -49,15 +50,14 @@ export function LocalePreferencesPanel({ options, currencyDisplay, digits, calen
           <div>
             <label className="block text-sm text-gray-500 mb-1">{t('settings.iranCurrencyDisplay')}</label>
             {isAdmin ? (
-              <select
-                value={currencyDisplay}
-                onChange={(e) => onChange({ currencyDisplay: e.target.value as CurrencyDisplay })}
-                className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand bg-white"
-              >
-                {options!.currencyDisplay!.map((mode) => (
-                  <option key={mode} value={mode}>{t(CURRENCY_DISPLAY_LABELS[mode])}</option>
-                ))}
-              </select>
+              <Select value={currencyDisplay} onValueChange={(v) => onChange({ currencyDisplay: v as CurrencyDisplay })}>
+                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {options!.currencyDisplay!.map((mode) => (
+                    <SelectItem key={mode} value={mode}>{t(CURRENCY_DISPLAY_LABELS[mode])}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             ) : (
               <p className="font-medium text-gray-900">{t(CURRENCY_DISPLAY_LABELS[currencyDisplay])}</p>
             )}
@@ -68,15 +68,14 @@ export function LocalePreferencesPanel({ options, currencyDisplay, digits, calen
           <div>
             <label className="block text-sm text-gray-500 mb-1">{t('settings.iranNumberDigits')}</label>
             {isAdmin ? (
-              <select
-                value={digits}
-                onChange={(e) => onChange({ digits: e.target.value as DigitMode })}
-                className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand bg-white"
-              >
-                {options!.digits!.map((mode) => (
-                  <option key={mode} value={mode}>{t(DIGIT_LABELS[mode])}</option>
-                ))}
-              </select>
+              <Select value={digits} onValueChange={(v) => onChange({ digits: v as DigitMode })}>
+                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {options!.digits!.map((mode) => (
+                    <SelectItem key={mode} value={mode}>{t(DIGIT_LABELS[mode])}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             ) : (
               <p className="font-medium text-gray-900">{t(DIGIT_LABELS[digits])}</p>
             )}
@@ -87,15 +86,14 @@ export function LocalePreferencesPanel({ options, currencyDisplay, digits, calen
           <div>
             <label className="block text-sm text-gray-500 mb-1">{t('settings.iranCalendar')}</label>
             {isAdmin ? (
-              <select
-                value={calendar}
-                onChange={(e) => onChange({ calendar: e.target.value as CalendarMode })}
-                className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand bg-white"
-              >
-                {options!.calendar!.map((mode) => (
-                  <option key={mode} value={mode}>{t(CALENDAR_LABELS[mode])}</option>
-                ))}
-              </select>
+              <Select value={calendar} onValueChange={(v) => onChange({ calendar: v as CalendarMode })}>
+                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {options!.calendar!.map((mode) => (
+                    <SelectItem key={mode} value={mode}>{t(CALENDAR_LABELS[mode])}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             ) : (
               <p className="font-medium text-gray-900">{t(CALENDAR_LABELS[calendar])}</p>
             )}

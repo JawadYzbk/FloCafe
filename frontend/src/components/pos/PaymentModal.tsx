@@ -4,6 +4,7 @@ import { useState, useEffect, useRef } from 'react';
 import { Dialog as DialogPrimitive } from 'radix-ui';
 import { X, Wallet, ArrowLeftRight, CheckCircle2, Sparkles, User, Percent, Send, ChevronDown } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import api from '@/lib/api';
 import toast from 'react-hot-toast';
 import type { Bill } from '@/lib/types';
@@ -654,15 +655,15 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
                     <span className="truncate">{label}</span>
                   </button>
                   {secondaryCurrencies.length > 0 && (
-                    <select
-                      value={payment.currency ?? baseCurrency}
-                      onChange={(e) => setPaymentCurrency(idx, e.target.value)}
-                      aria-label={t('tenderCurrency')}
-                      className="shrink-0 border border-s-0 border-gray-200 bg-gray-50 text-xs font-semibold text-gray-600 px-1.5 outline-none focus:ring-2 focus:ring-brand"
-                    >
-                      <option value={baseCurrency}>{baseCurrency}</option>
-                      {secondaryCurrencies.map((c) => <option key={c.code} value={c.code}>{c.code}</option>)}
-                    </select>
+                    <Select value={payment.currency ?? baseCurrency} onValueChange={(v) => setPaymentCurrency(idx, v)}>
+                      <SelectTrigger size="sm" aria-label={t('tenderCurrency')} className="h-11 shrink-0 rounded-none border-s-0 bg-gray-50 text-xs font-semibold text-gray-600">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value={baseCurrency}>{baseCurrency}</SelectItem>
+                        {secondaryCurrencies.map((c) => <SelectItem key={c.code} value={c.code}>{c.code}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
                   )}
                   <div className="flex flex-1 items-center border border-s-0 border-gray-200 rounded-e-xl bg-white focus-within:ring-2 focus-within:ring-brand focus-within:border-transparent">
                     <span className="ps-3 text-gray-400 text-xs">{lineLabel}</span>
