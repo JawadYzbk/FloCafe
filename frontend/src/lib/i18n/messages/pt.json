@@ -628,7 +628,8 @@
     "tenderCurrency": "Moeda de pagamento",
     "unpaid": "Não Pago",
     "updateDiscount": "Atualizar Desconto",
-    "walletMaxAmount": "O valor da carteira excede o saldo disponível. Máx.: {max}"
+    "walletMaxAmount": "O valor da carteira excede o saldo disponível. Máx.: {max}",
+    "noProductsFound": "Nenhum produto encontrado"
   },
   "printTest": {
     "amt": "Total",

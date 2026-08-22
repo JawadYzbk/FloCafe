@@ -1,7 +1,8 @@
 'use client';
 
 import { useEffect, useMemo, useRef } from 'react';
-import { Search, SlidersHorizontal, Plus } from 'lucide-react';
+import { Search, SlidersHorizontal, Plus, SearchX } from 'lucide-react';
+import { EmptyState } from '@/components/ui/empty-state';
 import type { Category, Product } from '@/lib/types';
 import { useCartStore } from '@/store/cart';
 import { usePosSettingsStore } from '@/store/pos-settings';
@@ -153,9 +154,12 @@ export default function ProductGrid({
       </div>
 
       <div className="flex-1 overflow-y-auto pb-20 md:pb-0">
+        {filtered.length === 0 ? (
+          <EmptyState icon={SearchX} title={t('noProductsFound')} />
+        ) : (
         <div className={`grid gap-3 ${
-          sidebarOpen 
-            ? 'grid-cols-4' 
+          sidebarOpen
+            ? 'grid-cols-4'
             : 'grid-cols-5'
         }`}>
           {filtered.map((product) => {
@@ -256,6 +260,7 @@ export default function ProductGrid({
             );
           })}
         </div>
+        )}
       </div>
     </div>
   );

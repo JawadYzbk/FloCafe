@@ -628,7 +628,8 @@
     "tenderCurrency": "Moneda de pago",
     "unpaid": "No pagado",
     "updateDiscount": "Actualizar descuento",
-    "walletMaxAmount": "El saldo de la billetera supera el disponible. Máximo: {max}"
+    "walletMaxAmount": "El saldo de la billetera supera el disponible. Máximo: {max}",
+    "noProductsFound": "No se encontraron productos"
   },
   "printTest": {
     "amt": "Total",

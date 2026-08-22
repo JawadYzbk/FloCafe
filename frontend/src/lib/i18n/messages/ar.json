@@ -628,7 +628,8 @@
     "tenderCurrency": "عملة الدفع",
     "unpaid": "غير مدفوع",
     "updateDiscount": "تحديث الخصم",
-    "walletMaxAmount": "مبلغ المحفظة يتجاوز الرصيد المتاح. الحد الأقصى: {max}"
+    "walletMaxAmount": "مبلغ المحفظة يتجاوز الرصيد المتاح. الحد الأقصى: {max}",
+    "noProductsFound": "لم يُعثر على منتجات"
   },
   "printTest": {
     "amt": "المبلغ",

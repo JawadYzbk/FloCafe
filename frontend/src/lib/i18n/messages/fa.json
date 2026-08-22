@@ -628,7 +628,8 @@
     "tenderCurrency": "ارز پرداخت",
     "unpaid": "پرداخت‌نشده",
     "updateDiscount": "به‌روزرسانی تخفیف",
-    "walletMaxAmount": "مبلغ کیف از مانده در دسترس بیشتر است. بیشینه: {max}"
+    "walletMaxAmount": "مبلغ کیف از مانده در دسترس بیشتر است. بیشینه: {max}",
+    "noProductsFound": "محصولی یافت نشد"
   },
   "printTest": {
     "amt": "مبلغ",
