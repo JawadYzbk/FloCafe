@@ -1662,7 +1662,8 @@
     "languageAr": "العربية (AR)",
     "baseCurrencyHint": "Preços, impostos e relatórios permanecem nesta moeda. Alterá-la não reconverte os valores existentes.",
     "baseNoLiveRates": "Taxas ao vivo não estão disponíveis para esta moeda base — as taxas secundárias devem ser definidas manualmente.",
-    "ratesUnchanged": "Nenhuma taxa ao vivo atualizada — verifique sua conexão, ou a moeda não tem taxa ao vivo"
+    "ratesUnchanged": "Nenhuma taxa ao vivo atualizada — verifique sua conexão, ou a moeda não tem taxa ao vivo",
+    "rateAutoFailed": "Não foi possível obter uma taxa ao vivo — insira manualmente"
   },
   "setup": {
     "alreadyCompleted": "A configuração já foi concluída nesta instalação. Redirecionando para o login…",

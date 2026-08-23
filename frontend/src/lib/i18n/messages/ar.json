@@ -1617,7 +1617,8 @@
     "secondLanguageNone": "بدون",
     "secondReceiptLanguage": "لغة الإيصال الثانية",
     "selectTimezone": "اختر المنطقة الزمنية…",
-    "taxIdFormatWarning": "لا يطابق تنسيق الرقم الضريبي المتوقع لـ {country}: {format}"
+    "taxIdFormatWarning": "لا يطابق تنسيق الرقم الضريبي المتوقع لـ {country}: {format}",
+    "rateAutoFailed": "تعذّر جلب سعر صرف مباشر — أدخله يدويًا"
   },
   "setup": {
     "alreadyCompleted": "تم إكمال الإعداد بالفعل على هذا التثبيت. جارٍ التحويل إلى تسجيل الدخول…",

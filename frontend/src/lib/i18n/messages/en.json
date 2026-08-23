@@ -1662,7 +1662,8 @@
     "languageAr": "العربية (AR)",
     "baseCurrencyHint": "Prices, taxes, and reports are kept in this currency. Changing it does not reconvert existing amounts.",
     "baseNoLiveRates": "Live rates aren't available for this base currency — secondary rates must be set manually.",
-    "ratesUnchanged": "No live rates updated — check your connection, or the currency has no live rate"
+    "ratesUnchanged": "No live rates updated — check your connection, or the currency has no live rate",
+    "rateAutoFailed": "Could not fetch a live rate — enter it manually"
   },
   "setup": {
     "alreadyCompleted": "Setup has already been completed on this install. Redirecting to login…",

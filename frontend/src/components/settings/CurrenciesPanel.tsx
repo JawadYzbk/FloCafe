@@ -88,6 +88,26 @@ export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
   const setRow = (idx: number, changes: Partial<Row>) =>
     setRows((old) => old.map((r, i) => (i === idx ? { ...r, ...changes } : r)));
 
+  // When a currency is switched to the live (Frankfurter) source, fetch and
+  // fill the current base -> code rate immediately so the owner sees the real
+  // rate instead of an empty field. Non-fatal: a failure just leaves the field
+  // for manual entry.
+  const [fetchingRate, setFetchingRate] = useState<string | null>(null);
+  const fillLiveRate = async (idx: number, code: string) => {
+    setFetchingRate(code);
+    try {
+      const { data } = await api.get('/settings/currencies/live-rate', { params: { code } });
+      if (Number(data?.rate) > 0) {
+        setRow(idx, { rate: String(data.rate), rate_source: 'frankfurter', rate_updated_at: new Date().toISOString() });
+      }
+    } catch {
+      setRow(idx, { rate_source: 'manual' });
+      toast.error(t('settings.rateAutoFailed', { defaultValue: 'Could not fetch a live rate — enter it manually' }));
+    } finally {
+      setFetchingRate((c) => (c === code ? null : c));
+    }
+  };
+
   const addCurrency = () => {
     const code = newCode.trim().toUpperCase();
     if (!/^[A-Z]{3}$/.test(code)) {
@@ -202,7 +222,10 @@ export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
                 <div className="grid grid-cols-2 gap-3">
                   <div className="text-xs text-gray-500 space-y-1">
                     <span>{t('settings.rateSource', { defaultValue: 'Rate source' })}</span>
-                    <Select value={row.rate_source} onValueChange={(v) => setRow(idx, { rate_source: v as 'frankfurter' | 'manual' })} disabled={!isAdmin}>
+                    <Select value={row.rate_source} onValueChange={(v) => {
+                      if (v === 'frankfurter') { void fillLiveRate(idx, row.code); }
+                      else { setRow(idx, { rate_source: 'manual' }); }
+                    }} disabled={!isAdmin}>
                       <SelectTrigger size="sm" className="w-full"><SelectValue /></SelectTrigger>
                       <SelectContent>
                         <SelectItem value="manual">{t('settings.rateManual', { defaultValue: 'Manual' })}</SelectItem>
@@ -211,10 +234,13 @@ export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
                     </Select>
                   </div>
                   <label className="text-xs text-gray-500 space-y-1">
-                    <span>{t('settings.rate', { defaultValue: 'Rate (per 1 base)' })}</span>
+                    <span className="flex items-center gap-1.5">
+                      {t('settings.rate', { defaultValue: 'Rate (per 1 base)' })}
+                      {fetchingRate === row.code && <RefreshCw size={11} className="animate-spin text-gray-400" />}
+                    </span>
                     <input
                       type="number" min="0" step="any"
-                      disabled={!isAdmin || row.rate_source === 'frankfurter'}
+                      disabled={!isAdmin || row.rate_source === 'frankfurter' || fetchingRate === row.code}
                       value={row.rate}
                       onChange={(e) => setRow(idx, { rate: e.target.value })}
                       placeholder="0"

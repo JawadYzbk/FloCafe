@@ -16,7 +16,7 @@ import {
   serializeSecondaryCurrencies,
   FRANKFURTER_CURRENCIES,
 } from '../currency-config';
-import { refreshRates } from '../services/fx-rate';
+import { refreshRates, fetchFrankfurterRates } from '../services/fx-rate';
 import { getHttpRequestSignal, trackHttpRequestWork } from '../shutdown';
 import { asyncHandler } from '../middleware/async-handler';
 import { normalizeOptionalPhone } from '../lib/phone';
@@ -394,6 +394,31 @@ router.put('/currencies', requireRole('owner', 'manager'), (req: Request, res: R
 router.post('/currencies/refresh', requireRole('owner', 'manager'), asyncHandler(async (req: Request, res: Response) => {
   const updated = await refreshRates();
   res.json({ updated, ...currenciesShape(getAllSettings(getDatabase())) });
+}));
+
+// Preview the live Frankfurter rate for the base -> ?code pair without saving,
+// so the Currencies UI can auto-fill the rate the moment the owner switches a
+// currency's source to "Live (Frankfurter)". Returns { base, code, rate } or a
+// 4xx/502 when the pair isn't quotable (e.g. an LBP base) or the fetch fails.
+router.get('/currencies/live-rate', requireRole('owner', 'manager'), asyncHandler(async (req: Request, res: Response) => {
+  const s = getAllSettings(getDatabase());
+  const base = (isValidCurrencyCode(s.base_currency) ? s.base_currency : (s.currency || 'INR')).toUpperCase();
+  const code = String(req.query.code || '').toUpperCase();
+  if (!isValidCurrencyCode(code)) {
+    return res.status(400).json({ error: 'Invalid currency code' });
+  }
+  if (code === base) {
+    return res.status(400).json({ error: 'Base currency cannot be a secondary currency' });
+  }
+  if (!isFrankfurterSupported(base) || !isFrankfurterSupported(code)) {
+    return res.status(422).json({ error: `Live rates are not available for ${base}/${code}` });
+  }
+  const rates = await fetchFrankfurterRates(base, [code]);
+  const rate = rates?.[code];
+  if (!(typeof rate === 'number' && rate > 0)) {
+    return res.status(502).json({ error: 'Could not fetch a live rate right now' });
+  }
+  res.json({ base, code, rate });
 }));
 
 router.get('/tax', requireRole('owner', 'manager', 'cashier', 'server', 'chef'), (req: Request, res: Response) => {

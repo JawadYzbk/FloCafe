@@ -1662,7 +1662,8 @@
     "languageAr": "العربية (AR)",
     "baseCurrencyHint": "Los precios, impuestos e informes se mantienen en esta moneda. Cambiarla no reconvierte los montos existentes.",
     "baseNoLiveRates": "Los tipos en vivo no están disponibles para esta moneda base — los tipos secundarios deben configurarse manualmente.",
-    "ratesUnchanged": "No se actualizaron tipos en vivo — revisá tu conexión, o la moneda no tiene tipo en vivo"
+    "ratesUnchanged": "No se actualizaron tipos en vivo — revisá tu conexión, o la moneda no tiene tipo en vivo",
+    "rateAutoFailed": "No se pudo obtener una tasa en vivo — ingrésela manualmente"
   },
   "setup": {
     "alreadyCompleted": "La configuración ya se completó en esta instalación. Redirigiendo al inicio de sesión…",
