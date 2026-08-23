@@ -1,182 +1,45 @@
-import {
-  LANGUAGES,
-  getLanguageDirection,
-  getLanguageFromLocale,
-  getLanguageLocale,
-  type Language,
-  type LanguageDirection,
-} from './i18n/languages';
+/**
+ * Root i18n barrel re-exporting the modular i18n subsystem.
+ *
+ * Legacy custom translation engine and compatibility bridge have been
+ * completely removed (#381).
+ */
 
-// Backward-compatible re-exports: existing callers (HtmlLangSync, KdsHtmlLang,
-// DirectionalToaster, useI18n, the pos-settings/auth stores, etc.) keep
-// importing `Language`, `LanguageDirection`, and the direction helper from this
-// module while the single source of truth now lives in ./i18n/languages.
 export {
   LANGUAGES,
   getLanguageDirection,
   getLanguageFromLocale,
   getLanguageLocale,
+  isLanguage,
   type Language,
+  type LanguageConfig,
   type LanguageDirection,
-};
-export { loadLocaleMessages, getCachedMessages, isLocaleLoaded } from './i18n/loader';
+  type Locale,
+} from './i18n/languages';
 
-import { getCachedMessages } from './i18n/loader';
+export {
+  loadLocaleMessages,
+  getCachedMessages,
+  isLocaleLoaded,
+} from './i18n/loader';
 
-type NestedMessages = Record<string, unknown>;
+export {
+  getBrowserLanguage,
+} from './i18n/browser-language';
 
-/**
- * Resolve a legacy dotted key (e.g. "auth.signIn") against the nested message
- * tree by traversing each segment. Returns the leaf string, or undefined when
- * the path does not resolve to a string leaf. This preserves the pre-nesting
- * fallback semantics of {@link t} (target language → English → raw key).
- */
-function resolveMessage(messages: NestedMessages, key: string): string | undefined {
-  let node: unknown = messages;
-  for (const part of key.split('.')) {
-    if (node === null || typeof node !== 'object' || Array.isArray(node)) {
-      return undefined;
-    }
-    node = (node as NestedMessages)[part];
-  }
-  return typeof node === 'string' ? node : undefined;
-}
+export {
+  fetchServerInfo,
+  useSyncServerLanguage,
+  type ServerInfo,
+} from './i18n/server-language';
 
-const PLURAL_RE = /\{(\w+),\s*plural,\s*((?:\s*(?:zero|one|two|few|many|other)\s*\{[^}]*\})+)\s*\}/g;
-const pluralRulesCache = new Map<string, Intl.PluralRules>();
-
-function getPluralRules(locale: string): Intl.PluralRules {
-  let pr = pluralRulesCache.get(locale);
-  if (!pr) {
-    pr = new Intl.PluralRules(locale);
-    pluralRulesCache.set(locale, pr);
-  }
-  return pr;
-}
-
-function formatIcuPlural(template: string, params: Record<string, string | number>, lang: Language): string {
-  return template.replace(PLURAL_RE, (_match, name: string, cases: string) => {
-    const raw = Number(params[name] ?? 0);
-    const locale = lang === 'es' ? 'es-AR' : lang === 'pt' ? 'pt-BR' : lang === 'fa' ? 'fa-IR' : 'en';
-    const pr = getPluralRules(locale).select(raw);
-    const ordered = ['zero', 'one', 'two', 'few', 'many', 'other'];
-    const seen: Record<string, string> = {};
-    const caseRe = /(zero|one|two|few|many|other)\s*\{([^}]*)\}/g;
-    let m: RegExpExecArray | null;
-    while ((m = caseRe.exec(cases)) !== null) seen[m[1]] = m[2];
-    let body = seen[pr];
-    if (body === undefined) {
-      const fallbackIdx = ordered.indexOf(pr) + 1;
-      for (let i = fallbackIdx; i < ordered.length; i++) {
-        if (seen[ordered[i]] !== undefined) { body = seen[ordered[i]]; break; }
-      }
-      if (body === undefined) body = seen.other ?? '';
-    }
-    return body.replace(/#/g, String(raw));
-  });
-}
-
-export function t(key: string, lang: Language, params?: Record<string, string | number>): string {
-  // #375: messages live in the shared loader cache. The active locale's
-  // bundle is loaded on demand; until it resolves, packaged English is
-  // rendered (never raw keys). Fallback chain is unchanged:
-  // target language → English → raw key.
-  const target = getCachedMessages(lang);
-  const english = getCachedMessages('en');
-  let value =
-    (target ? resolveMessage(target, key) : undefined) ??
-    (english ? resolveMessage(english, key) : undefined) ??
-    key;
-  if (params) {
-    value = formatIcuPlural(value, params, lang);
-    for (const [k, v] of Object.entries(params)) {
-      value = value.replace(new RegExp(`\\{${k}\\}`, 'g'), String(v));
-    }
-  }
-  return value;
-}
-
-export function getBrowserLanguage(): Language {
-  if (typeof navigator !== 'undefined' && navigator.language) {
-    try {
-      // #376: parse the tag with Intl.Locale so only the BCP-47 language
-      // subtag participates in matching (a raw string-prefix match could
-      // mis-handle tags like `falc` or region-first forms).
-      const parsed = new Intl.Locale(navigator.language);
-      const lang = parsed.language?.toLowerCase();
-      if (lang && lang in LANGUAGES) return lang as Language;
-    } catch {
-      // Malformed language tag — fall through to the packaged fallback.
-    }
-  }
-  return 'en';
-}
-
-/**
- * On mount, fetches the tenant's preferred language from a public info
- * endpoint and pushes it into the global `usePosSettingsStore`. Cross-origin
- * tabs (KDS standalone, Server App standalone) inherit the language set on
- * the dashboard.
- *
- * `infoPath` defaults to `/api/kds/info` and can be pointed at the Server
- * App's `/api/server-app/info`, which exposes the same `language` field.
- *
- * Idempotent: only sets language if the server actually returned one.
- * Best-effort: never throws, never blocks the UI.
- */
-import { useEffect } from 'react';
-import { usePosSettingsStore } from '@/store/pos-settings';
-
-export function useSyncServerLanguage(infoPath = '/api/kds/info'): void {
-  const setLanguage = usePosSettingsStore((s) => s.setLanguage);
-  useEffect(() => {
-    let cancelled = false;
-    fetchServerInfo('', 1500, infoPath).then((info) => {
-      if (cancelled) return;
-      // Keep the existing tenant language when metadata is unavailable.
-      if (info.language) setLanguage(info.language);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [setLanguage, infoPath]);
-}
-
-export type ServerInfo = {
-  language: Language | null;
-  country: string | null;
-  kdsDefaultView: 'tabs' | 'kanban' | null;
-};
-
-/**
- * Fetch the tenant's preferred language + KDS defaults from a public info
- * endpoint (default `/api/kds/info`; the Server App uses
- * `/api/server-app/info`, which exposes the same `language`/`country`
- * fields). Never throws: on timeout/error returns empty info, so callers
- * fall back to local heuristics. 1500ms is generous for a LAN; this must
- * not block first paint of the login screen.
- */
-export async function fetchServerInfo(baseUrl = '', timeoutMs = 1500, infoPath = '/api/kds/info'): Promise<ServerInfo> {
-  const empty: ServerInfo = { language: null, country: null, kdsDefaultView: null };
-  if (typeof window === 'undefined') return empty;
-  try {
-    const res = await fetch(`${baseUrl}${infoPath}`, {
-      signal: AbortSignal.timeout(timeoutMs),
-      cache: 'no-store',
-    });
-    if (!res.ok) return empty;
-    const data = (await res.json()) as {
-      language?: string | null;
-      country?: string | null;
-      kds_default_view?: string | null;
-    };
-    return {
-      language: data.language === 'fa' ? 'fa' : data.language === 'es' ? 'es' : data.language === 'pt' ? 'pt' : data.language === 'en' ? 'en' : null,
-      country: data.country || null,
-      kdsDefaultView:
-        data.kds_default_view === 'kanban' ? 'kanban' : data.kds_default_view === 'tabs' ? 'tabs' : null,
-    };
-  } catch {
-    return empty;
-  }
-}
+export {
+  ORDER_TYPE_LABEL_KEYS,
+  ROLE_LABEL_KEYS,
+  ORDER_STATUS_LABEL_KEYS,
+  ITEM_STATUS_LABEL_KEYS,
+  TABLE_STATUS_LABEL_KEYS,
+  TENANT_STATUS_LABEL_KEYS,
+  BUSINESS_TYPE_LABEL_KEYS,
+  PAYMENT_STATUS_LABEL_KEYS,
+} from './i18n/enums';

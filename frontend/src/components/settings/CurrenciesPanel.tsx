@@ -6,7 +6,7 @@ import api from '@/lib/api';
 import toast from 'react-hot-toast';
 import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { useI18n } from '@/hooks/useI18n';
+import { useTranslations } from 'use-intl';
 import { useCurrenciesStore } from '@/store/currencies';
 import { convertBaseToTender, type SecondaryCurrency, type RoundingMode } from '@/lib/countries';
 
@@ -59,7 +59,10 @@ function toPayload(r: Row): SecondaryCurrency {
 }
 
 export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
-  const { t } = useI18n();
+  // Root translator with full dot-path message keys (the settings.* and
+  // common.* namespaces). use-intl resolves these at runtime; its typed key
+  // union is per-namespace, so widen the signature to the string keys used here.
+  const t = useTranslations() as unknown as (key: string, values?: Record<string, unknown>) => string;
   const [baseCurrency, setBaseCurrency] = useState('');
   const [supported, setSupported] = useState<string[]>([]);
   const [rows, setRows] = useState<Row[]>([]);

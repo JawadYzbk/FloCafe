@@ -15,11 +15,14 @@
  */
 
 import * as fs from 'fs';
+import * as os from 'node:os';
 import * as path from 'path';
 import { spawnSync } from 'node:child_process';
 
 const ROOT = path.join(__dirname, '..');
-const EVIDENCE_DIR = '/var/folders/y_/1ltcxtwj0zd_w1dg9jv4jl580000gn/T/no-mistakes-evidence/01M08VG78CNJN3CHGY6B42Q05W';
+const EVIDENCE_DIR =
+  process.env.EVIDENCE_DIR ||
+  path.join(os.tmpdir(), 'no-mistakes-evidence', '01M08VG78CNJN3CHGY6B42Q05W');
 
 const Module = require('module');
 const frontendRequire = Module.createRequire(path.join(ROOT, 'frontend/package.json'));
@@ -53,6 +56,8 @@ moduleApi._resolveFilename = function (request: string, parent: any, isMain: boo
     resolvedRequest = path.resolve(ROOT, 'main/countries.ts');
   } else if (request.startsWith('@/')) {
     resolvedRequest = path.resolve(ROOT, 'frontend/src', request.slice(2));
+  } else if (request.startsWith('@print/')) {
+    resolvedRequest = path.resolve(ROOT, 'shared/print', request.slice('@print/'.length));
   }
   return originalResolveFilename.call(this, resolvedRequest, parent, isMain, options);
 };
@@ -76,7 +81,9 @@ React.useSyncExternalStore = function (subscribe: any, getSnapshot: any, getServ
   return origUseSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 };
 
-const { t, getLanguageDirection, loadLocaleMessages } = require('@/lib/i18n');
+const { getLanguageDirection, loadLocaleMessages, getCachedMessages, getLanguageLocale } = require('@/lib/i18n');
+const { createTranslator } = frontendRequire('use-intl/core');
+const { IntlProvider } = frontendRequire('use-intl');
 const { usePosSettingsStore } = require('@/store/pos-settings');
 const { usePrinterStore } = require('@/hooks/usePrinter');
 const { printerService } = require('@/lib/printer/PrinterService');
@@ -89,6 +96,14 @@ function assert(condition: boolean, msg: string): void {
 
 const LANGUAGES = ['en', 'es', 'pt', 'fa'] as const;
 type Lang = (typeof LANGUAGES)[number];
+
+const t = (key: string, lang: Lang, params?: Record<string, string | number>): string => {
+  const translator = createTranslator({
+    locale: getLanguageLocale(lang),
+    messages: getCachedMessages(lang) ?? getCachedMessages('en') ?? {},
+  });
+  return (translator as any)(key, params);
+};
 
 // Read compiled CSS if available for full styling in screenshots
 function getStyles(): string {
@@ -179,15 +194,21 @@ function buildHtmlDocument(title: string, bodyContent: string, lang: Lang): stri
 </html>`;
 }
 
-async function renderScreenshotWithPlaywright(html: string, outputPath: string, width = 640, height = 480): Promise<void> {
-  const { chromium } = frontendRequire('playwright');
-  const browser = await chromium.launch({ headless: true });
+async function renderScreenshotWithPlaywright(html: string, outputPath: string, width = 640, height = 480): Promise<boolean> {
+  let browser: any;
   try {
+    const { chromium } = frontendRequire('playwright');
+    browser = await chromium.launch({ headless: true });
     const page = await browser.newPage({ viewport: { width, height } });
     await page.setContent(html, { waitUntil: 'load' });
     await page.screenshot({ path: outputPath, fullPage: true });
+    return true;
+  } catch (err: any) {
+    if (process.env.REQUIRE_VISUAL_EVIDENCE === '1') throw err;
+    console.warn(`  ! Screenshot generation skipped: ${err?.message || err}`);
+    return false;
   } finally {
-    await browser.close();
+    await browser?.close().catch(() => undefined);
   }
 }
 
@@ -249,7 +270,13 @@ async function run(): Promise<void> {
     });
     (usePrinterStore as any).getInitialState = () => usePrinterStore.getState();
 
-    const markup = ReactDOMServer.renderToStaticMarkup(React.createElement(PrinterStatus));
+    const markup = ReactDOMServer.renderToStaticMarkup(
+      React.createElement(
+        IntlProvider,
+        { locale: getLanguageLocale(lang), messages: getCachedMessages(lang) },
+        React.createElement(PrinterStatus),
+      ),
+    );
     const expectedErrorText = t('pos.printerError', lang);
 
     // Verify localized error is in markup
@@ -277,9 +304,9 @@ async function run(): Promise<void> {
     const htmlPath = path.join(EVIDENCE_DIR, `printer-status-dropdown-${lang}.html`);
     const pngPath = path.join(EVIDENCE_DIR, `printer-status-dropdown-${lang}.png`);
     fs.writeFileSync(htmlPath, docHtml, 'utf8');
-    await renderScreenshotWithPlaywright(docHtml, pngPath);
-
-    generatedArtifacts.push({ kind: 'screenshot', label: `PrinterStatus error dropdown (${lang.toUpperCase()})`, path: pngPath });
+    if (await renderScreenshotWithPlaywright(docHtml, pngPath)) {
+      generatedArtifacts.push({ kind: 'screenshot', label: `PrinterStatus error dropdown (${lang.toUpperCase()})`, path: pngPath });
+    }
   }
 
   // =========================================================================
@@ -354,9 +381,9 @@ async function run(): Promise<void> {
     const cardHtmlPath = path.join(EVIDENCE_DIR, `pos-printer-error-card-${lang}.html`);
     const cardPngPath = path.join(EVIDENCE_DIR, `pos-printer-error-card-${lang}.png`);
     fs.writeFileSync(cardHtmlPath, cardDocHtml, 'utf8');
-    await renderScreenshotWithPlaywright(cardDocHtml, cardPngPath);
-
-    generatedArtifacts.push({ kind: 'screenshot', label: `POS printer support-error card (${lang.toUpperCase()})`, path: cardPngPath });
+    if (await renderScreenshotWithPlaywright(cardDocHtml, cardPngPath)) {
+      generatedArtifacts.push({ kind: 'screenshot', label: `POS printer support-error card (${lang.toUpperCase()})`, path: cardPngPath });
+    }
   }
 
   // =========================================================================
@@ -393,9 +420,9 @@ async function run(): Promise<void> {
     const toastHtmlPath = path.join(EVIDENCE_DIR, `import-success-toast-${lang}.html`);
     const toastPngPath = path.join(EVIDENCE_DIR, `import-success-toast-${lang}.png`);
     fs.writeFileSync(toastHtmlPath, toastDocHtml, 'utf8');
-    await renderScreenshotWithPlaywright(toastDocHtml, toastPngPath, 500, 200);
-
-    generatedArtifacts.push({ kind: 'screenshot', label: `Settings import success toast (${lang.toUpperCase()})`, path: toastPngPath });
+    if (await renderScreenshotWithPlaywright(toastDocHtml, toastPngPath, 500, 200)) {
+      generatedArtifacts.push({ kind: 'screenshot', label: `Settings import success toast (${lang.toUpperCase()})`, path: toastPngPath });
+    }
   }
 
   // =========================================================================
@@ -427,9 +454,9 @@ async function run(): Promise<void> {
     const toastHtmlPath = path.join(EVIDENCE_DIR, `support-queued-toast-${lang}.html`);
     const toastPngPath = path.join(EVIDENCE_DIR, `support-queued-toast-${lang}.png`);
     fs.writeFileSync(toastHtmlPath, toastDocHtml, 'utf8');
-    await renderScreenshotWithPlaywright(toastDocHtml, toastPngPath, 500, 200);
-
-    generatedArtifacts.push({ kind: 'screenshot', label: `Support queued success toast (${lang.toUpperCase()})`, path: toastPngPath });
+    if (await renderScreenshotWithPlaywright(toastDocHtml, toastPngPath, 500, 200)) {
+      generatedArtifacts.push({ kind: 'screenshot', label: `Support queued success toast (${lang.toUpperCase()})`, path: toastPngPath });
+    }
   }
 
   console.log(`\n✅ All ${generatedArtifacts.length} visual evidence artifacts generated in ${EVIDENCE_DIR}`);

@@ -6,10 +6,17 @@ import api from '@/lib/api';
 import toast from 'react-hot-toast';
 import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { useI18n } from '@/hooks/useI18n';
+import { useTranslations } from 'use-intl';
 import { useCurrenciesStore } from '@/store/currencies';
 import { usePrinterStore } from '@/hooks/usePrinter';
 import { useAuthStore } from '@/store/auth';
+
+// The fork's shift UI was written against a root translator with full dot-path
+// message keys (the shift.* and common.* namespaces). use-intl's root
+// useTranslations() resolves those paths at runtime, but its typed key union
+// only covers per-namespace leaves, so we type the translator explicitly and
+// thread that type through props.
+type T = (key: string, values?: Record<string, unknown>) => string;
 
 type Amounts = Record<string, number>;
 
@@ -32,7 +39,7 @@ interface Shift {
 const fmtNum = (n: number) => (Number(n) || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
 
 export default function ShiftPage() {
-  const { t } = useI18n();
+  const t = useTranslations() as unknown as T;
   const baseCurrency = useCurrenciesStore((s) => s.baseCurrency);
   const secondary = useCurrenciesStore((s) => s.secondaryCurrencies);
   const loadCurrencies = useCurrenciesStore((s) => s.load);
@@ -92,7 +99,7 @@ export default function ShiftPage() {
 }
 
 // ── Past (closed) shifts → reprint ────────────────────────────────────────────
-function PastShifts({ refreshKey, t }: { refreshKey: number; t: ReturnType<typeof useI18n>['t'] }) {
+function PastShifts({ refreshKey, t }: { refreshKey: number; t: T }) {
   const printZReport = usePrinterStore((s) => s.printZReport);
   const businessName = useAuthStore((s) => s.currentTenant?.business_name) || '';
   const [shifts, setShifts] = useState<Shift[]>([]);
@@ -153,7 +160,7 @@ function PastShifts({ refreshKey, t }: { refreshKey: number; t: ReturnType<typeo
 
 // ── Closed shift → Z-report + print ───────────────────────────────────────────
 function ClosedReportView({ shift, currencies, onDone, t }: {
-  shift: Shift; currencies: string[]; onDone: () => void; t: ReturnType<typeof useI18n>['t'];
+  shift: Shift; currencies: string[]; onDone: () => void; t: T;
 }) {
   const printZReport = usePrinterStore((s) => s.printZReport);
   const businessName = useAuthStore((s) => s.currentTenant?.business_name) || '';
@@ -207,7 +214,7 @@ function ClosedReportView({ shift, currencies, onDone, t }: {
 
 // ── No open shift → opening form ──────────────────────────────────────────────
 function OpenShiftForm({ currencies, busy, setBusy, onOpened, t }: {
-  currencies: string[]; busy: boolean; setBusy: (b: boolean) => void; onOpened: (s: Shift) => void; t: ReturnType<typeof useI18n>['t'];
+  currencies: string[]; busy: boolean; setBusy: (b: boolean) => void; onOpened: (s: Shift) => void; t: T;
 }) {
   const [floats, setFloats] = useState<Record<string, string>>({});
   const open = async () => {
@@ -244,7 +251,7 @@ function OpenShiftForm({ currencies, busy, setBusy, onOpened, t }: {
 
 // ── Open shift → drawer, movements, close ─────────────────────────────────────
 function OpenShiftView({ shift, currencies, busy, setBusy, onChanged, onClosed, t }: {
-  shift: Shift; currencies: string[]; busy: boolean; setBusy: (b: boolean) => void; onChanged: (s: Shift | null) => void; onClosed: (report: Shift) => void; t: ReturnType<typeof useI18n>['t'];
+  shift: Shift; currencies: string[]; busy: boolean; setBusy: (b: boolean) => void; onChanged: (s: Shift | null) => void; onClosed: (report: Shift) => void; t: T;
 }) {
   const [form, setForm] = useState<'pay_in' | 'pay_out' | 'exchange' | null>(null);
   const [counted, setCounted] = useState<Record<string, string>>({});
@@ -389,7 +396,7 @@ function OpenShiftView({ shift, currencies, busy, setBusy, onChanged, onClosed, 
 }
 
 function PayForm({ type, currencies, busy, onSubmit, t }: {
-  type: 'pay_in' | 'pay_out'; currencies: string[]; busy: boolean; onSubmit: (b: Record<string, unknown>) => void; t: ReturnType<typeof useI18n>['t'];
+  type: 'pay_in' | 'pay_out'; currencies: string[]; busy: boolean; onSubmit: (b: Record<string, unknown>) => void; t: T;
 }) {
   const [currency, setCurrency] = useState(currencies[0] || '');
   const [amount, setAmount] = useState('');
@@ -408,7 +415,7 @@ function PayForm({ type, currencies, busy, onSubmit, t }: {
 }
 
 function ExchangeForm({ currencies, busy, onSubmit, t }: {
-  currencies: string[]; busy: boolean; onSubmit: (b: Record<string, unknown>) => void; t: ReturnType<typeof useI18n>['t'];
+  currencies: string[]; busy: boolean; onSubmit: (b: Record<string, unknown>) => void; t: T;
 }) {
   const [fromCur, setFromCur] = useState(currencies[0] || '');
   const [toCur, setToCur] = useState(currencies[1] || currencies[0] || '');

@@ -10,11 +10,16 @@ import {
   type ReceiptOptions,
 } from '@/lib/printer/receipt-encoder';
 import { usePosSettingsStore } from '@/store/pos-settings';
+import {
+  ensurePrintLanguagesLoaded,
+  resolveBillPrintLanguages,
+} from '@/lib/printer/print-document';
 import { buildTaxBillBytes, type TaxBillOptions } from '@/lib/printer/tax-bill-encoder';
 import { buildKotBytes, type KotOptions } from '@/lib/printer/kot-encoder';
 import type { ZReportShift } from '@/lib/printer/z-report-encoder';
-import type { PrintWarning } from '@/lib/printer/warnings';
+import { makeBillTemplateFallbackWarning, type PrintWarning } from '@/lib/printer/warnings';
 import api from '@/lib/api';
+import toast from 'react-hot-toast';
 import type { Bill, Tenant, Order } from '@/lib/types';
 
 export type { PrintWarning } from '@/lib/printer/warnings';
@@ -47,7 +52,7 @@ interface PrinterState {
   paperWidth: PaperWidth;
   printMethod: PrintMode;
   hardwarePrinter: HardwarePrinter | null;
-
+  refreshHardwarePrinter: () => Promise<void>;
   connect: () => Promise<void>;
   disconnect: () => Promise<void>;
   printBill: (bill: Bill, tenant: ReceiptTenant, opts?: ReceiptOptions) => Promise<PrintWarning[]>;
@@ -60,7 +65,6 @@ interface PrinterState {
   clearError: () => void;
   downloadLastReceipt: () => void;
   copyLastReceiptHex: () => Promise<void>;
-  refreshHardwarePrinter: () => Promise<void>;
 }
 
 export const usePrinterStore = create<PrinterState>()(
@@ -79,7 +83,10 @@ export const usePrinterStore = create<PrinterState>()(
         try {
           const res = await api.get('/printers');
           const list: HardwarePrinter[] = res.data.printers || [];
-          const defaultPrinter = list.find((p) => p.is_default === 1 && p.connection_type !== 'webusb') || null;
+          const defaultPrinter =
+            list.find((p) => p.is_default === 1 && p.connection_type !== 'webusb') ||
+            list.find((p) => p.connection_type !== 'webusb') ||
+            null;
           set({ hardwarePrinter: defaultPrinter });
         } catch {
           set({ hardwarePrinter: null });
@@ -109,26 +116,16 @@ export const usePrinterStore = create<PrinterState>()(
             billShowTaxBreakdown, billShowCustomerName, billShowCustomerPhone, billShowTableNumber,
             printerPaperSize,
             printerUseUnicode,
+            printerArabicShaping,
             printerTrimDecimals,
           } = usePosSettingsStore.getState();
 
           const isReprint = opts?.isReprint ?? false;
+          const billTemplateWarning = makeBillTemplateFallbackWarning(billTemplate);
 
-          const hw = get().hardwarePrinter;
-          if (hw && get().printMethod === 'escpos') {
-            try {
-              const response = await api.post<{ warnings?: PrintWarning[] }>('/printers/print-bill', { billId: bill.id, useUnicode: printerUseUnicode, isReprint });
-              return response.data.warnings || [];
-            } catch (err: unknown) {
-              const e = err as { response?: { data?: { error?: string } }; message?: string };
-              throw new Error(e.response?.data?.error || e.message || 'Print failed');
-            }
-          }
-
-          if (get().printMethod === 'browser') {
-            // Browser / A4 print path
+          const executeBrowserPrint = async () => {
             const { printWebBill } = await import('@/lib/printer/web-print');
-            printWebBill(bill, tenant, {
+            await printWebBill(bill, tenant, {
               paperSize: printerPaperSize,
               includeTaxId: billShowTaxId,
               taxRegistrationNumber: billShowTaxId && billTaxRegistrationNumber ? billTaxRegistrationNumber : undefined,
@@ -145,11 +142,46 @@ export const usePrinterStore = create<PrinterState>()(
               isReprint,
               trimDecimals: printerTrimDecimals,
             });
-            return [];
+            return billTemplateWarning ? [billTemplateWarning] : [];
+          };
+
+          const hw = get().hardwarePrinter;
+          if (hw && get().printMethod === 'escpos') {
+            try {
+              const response = await api.post<{ warnings?: PrintWarning[] }>('/printers/print-bill', { billId: bill.id, useUnicode: printerUseUnicode, arabicShaping: printerArabicShaping, isReprint });
+              return response.data.warnings || [];
+            } catch (err: unknown) {
+              const e = err as { response?: { data?: { error?: string } }; message?: string };
+              const errorMsg = e.response?.data?.error || e.message || 'Print failed';
+              if (errorMsg.includes('No default printer configured')) {
+                toast('No thermal printer configured — printing via system print', { icon: 'ℹ️' });
+                return await executeBrowserPrint();
+              }
+              throw new Error(errorMsg);
+            }
           }
 
-          // ESC/POS thermal path
+          if (get().printMethod === 'browser' || (!hw && !printerService.isConnected && get().printMethod === 'escpos')) {
+            if (!hw && !printerService.isConnected && get().printMethod === 'escpos') {
+              toast('No thermal printer configured — printing via system print', { icon: 'ℹ️' });
+            }
+            return await executeBrowserPrint();
+          }
+
+          // ESC/POS thermal path — labels are resolved from the receipt
+          // language policy through the shared PrintDocument (#444), so the
+          // requested language bundles must be in memory first.
           const configuredPaperWidth: PaperWidth = printerPaperSize === 'thermal80' ? 80 : 58;
+          const languages = opts?.languages ?? resolveBillPrintLanguages();
+          const failedLanguages = await ensurePrintLanguagesLoaded(languages);
+          // A locale bundle that failed to load degrades to English labels;
+          // surface that through the established warning path (Greptile P1).
+          const warnings: PrintWarning[] = failedLanguages.map((language) => ({
+            field: 'receipt language',
+            text: language,
+            message: `Receipt language "${language}" could not be loaded, so English labels were used.`,
+          }));
+          if (billTemplateWarning) warnings.push(billTemplateWarning);
           const builderOpts: ReceiptOptions = {
             ...opts,
             paperWidth: opts?.paperWidth ?? configuredPaperWidth,
@@ -163,11 +195,12 @@ export const usePrinterStore = create<PrinterState>()(
             showCustomerPhone: billShowCustomerPhone,
             showTableNumber: billShowTableNumber,
             useUnicode: printerUseUnicode,
+            arabicShaping: printerArabicShaping,
             isReprint,
             trimDecimals: printerTrimDecimals,
+            languages,
           };
 
-          const warnings: PrintWarning[] = [];
           let bytes: Uint8Array;
           if (billTemplate === 'compact') {
             bytes = buildCompactReceiptBytes(bill, tenant, builderOpts, warnings);
@@ -188,7 +221,7 @@ export const usePrinterStore = create<PrinterState>()(
         set({ lastError: null });
         try {
           const {
-            printerUseUnicode, printerTrimDecimals, printerPaperSize,
+            printerUseUnicode, printerArabicShaping, printerTrimDecimals, printerPaperSize,
             billTaxRegistrationNumber, billAddress, billPhone, billFooterMessage,
             billShowName, billShowAddress, billShowPhone, billShowTaxId,
             billShowTaxBreakdown, billShowCustomerName, billShowCustomerPhone, billShowTableNumber,
@@ -200,7 +233,7 @@ export const usePrinterStore = create<PrinterState>()(
             // raw ESC/POS bytes (which would strip Persian digits/ریال to
             // printer ASCII). Mirrors the printBill browser path.
             const { printWebBill } = await import('@/lib/printer/web-print');
-            printWebBill(bill, tenant, {
+            await printWebBill(bill, tenant, {
               paperSize: printerPaperSize,
               includeTaxId: billShowTaxId,
               taxRegistrationNumber: billShowTaxId
@@ -236,6 +269,7 @@ export const usePrinterStore = create<PrinterState>()(
             showCustomerPhone: billShowCustomerPhone,
             showTableNumber: billShowTableNumber,
             useUnicode: printerUseUnicode,
+            arabicShaping: printerArabicShaping,
             trimDecimals: printerTrimDecimals,
             rawEscPos: true,
           }, warnings);
@@ -254,7 +288,7 @@ export const usePrinterStore = create<PrinterState>()(
         // kot_printing_enabled is off, no KOT print command may ever go out
         // (issue #133) — coarser than auto_print_kot, which only gates
         // automatic printing on order placement.
-        const { kotPrintingEnabled, printerUseUnicode } = usePosSettingsStore.getState();
+        const { kotPrintingEnabled, printerUseUnicode, printerArabicShaping } = usePosSettingsStore.getState();
         if (!kotPrintingEnabled) {
           const err = new Error('KOT printing is disabled for this business');
           set({ lastError: err.message });
@@ -264,7 +298,7 @@ export const usePrinterStore = create<PrinterState>()(
           const hw = get().hardwarePrinter;
           if (hw && get().printMethod === 'escpos') {
             try {
-              const response = await api.post<{ warnings?: PrintWarning[] }>('/printers/print-kot', { orderId: order.id, useUnicode: printerUseUnicode });
+              const response = await api.post<{ warnings?: PrintWarning[] }>('/printers/print-kot', { orderId: order.id, useUnicode: printerUseUnicode, arabicShaping: printerArabicShaping });
               return response.data.warnings || [];
             } catch (err: unknown) {
               const e = err as { response?: { data?: { error?: string } }; message?: string };
@@ -272,19 +306,36 @@ export const usePrinterStore = create<PrinterState>()(
             }
           }
 
-          const { paperWidth } = get();
-          const warnings: PrintWarning[] = [];
-          const bytes = buildKotBytes(order, { ...opts, paperWidth }, warnings);
-          set({ lastPrintedBytes: bytes });
-
           if (get().printMethod === 'escpos') {
+            const { paperWidth } = get();
+            const warnings: PrintWarning[] = [];
+            const bytes = buildKotBytes(order, { ...opts, paperWidth, arabicShaping: printerArabicShaping }, warnings);
+            set({ lastPrintedBytes: bytes });
             await printerService.print(bytes);
-          } else {
-            const paperWidth = get().paperWidth || 80;
-            const html = `<html><body style="font-family:monospace;white-space:pre;padding:10px;">${new TextDecoder().decode(bytes)}</body></html>`;
-            await printerService.printViaBrowser(html, paperWidth);
+            return warnings;
           }
-          return warnings;
+
+          // Browser fallback: render semantic KOT HTML instead of decoding
+          // raw ESC/POS bytes (#444). The ticket is built from the order's
+          // fields with resolved labels and kernel direction annotations.
+          // Greptile P1 (PR #474): when a fixed KOT language differs from the
+          // active UI language after a cold start, its message bundle is not
+          // in the loader cache yet - load it before generating so labels
+          // don't silently fall back to English.
+          const paperWidth = (get().paperWidth || 80) === 80 ? 80 : 58;
+          const { generateKotHtml, resolveKotTicketLanguage } = await import('@/lib/printer/kot-web-print');
+          const kotLanguage = resolveKotTicketLanguage();
+          const failedLanguages = await ensurePrintLanguagesLoaded([kotLanguage]);
+          const html = generateKotHtml(order, { paperWidth });
+          await printerService.printViaBrowser(html, paperWidth);
+          // A failed locale load degrades to English labels; surface it
+          // through the established warning path instead of staying silent
+          // (Greptile P1, PR #474).
+          return failedLanguages.map((language) => ({
+            field: 'kot language',
+            text: language,
+            message: `KOT language "${language}" could not be loaded, so English labels were used.`,
+          })) as PrintWarning[];
         } catch (err) {
           set({ lastError: (err as Error).message });
           throw err;

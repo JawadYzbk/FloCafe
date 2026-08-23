@@ -226,7 +226,7 @@ export default function TableCheckoutModal({
             </div>
           )}
 
-          {splitBills.length > 0 && <div className="space-y-2">{splitBills.map((bill) => <div key={bill.id} className="flex items-center justify-between rounded-lg border p-2"><div><p className="text-sm font-medium">{bill.split_label}</p><p className="text-xs text-gray-500">{fmt(Number(bill.total))} · {bill.payment_status}</p></div>{bill.payment_status !== 'paid' && <Button size="sm" onClick={() => onPayment(bill)}>{t('pay', { defaultValue: 'Pay' })}</Button>}</div>)}</div>}
+          {splitBills.length > 0 && <div className="space-y-2">{splitBills.map((bill) => <div key={bill.id} className="flex items-center justify-between rounded-lg border p-2"><div><p className="text-sm font-medium">{bill.split_label}</p><p className="text-xs text-gray-500">{fmt(Number(bill.total))} · {bill.payment_status}</p></div>{bill.payment_status !== 'paid' && <Button size="sm" onClick={() => onPayment(bill)}>{t('pay')}</Button>}</div>)}</div>}
 
           {/* Show different buttons based on cart state */}
           {onPrintBill && splitBills.length === 0 && order.bill?.payment_status !== 'paid' && (
@@ -234,7 +234,7 @@ export default function TableCheckoutModal({
               <Printer size={15} className="me-2" />{printing ? t('generating') : tReceipt('printBill')}
             </Button>
           )}
-          {splitBills.length === 0 && splitChecksEnabled && order.type === 'dine_in' && order.bill?.payment_status !== 'paid' && <Button variant="outline" onClick={handleSplitCheck} disabled={generating} className="w-full"><Users size={15} className="me-2" />{t('splitCheck', { defaultValue: 'Split check' })}</Button>}
+          {splitBills.length === 0 && splitChecksEnabled && order.type === 'dine_in' && order.bill?.payment_status !== 'paid' && <Button variant="outline" onClick={handleSplitCheck} disabled={generating} className="w-full"><Users size={15} className="me-2" />{t('splitCheck')}</Button>}
           {cartItemCount > 0 ? (
             // Cart has items - show "Add items to order" option
             <div className="space-y-2">

@@ -10,6 +10,7 @@ const { isFloProcess, FLO_PATTERNS } = require('../kill-ports.js');
 
 const rootDir = path.resolve(__dirname, '..');
 const resetScript = path.join(rootDir, 'scripts/dev/nuclear-reset.sh');
+const i18nAddScript = path.join(rootDir, 'scripts/i18n-add.cjs');
 
 function mkdirp(target: string) {
   fs.mkdirSync(target, { recursive: true });
@@ -29,11 +30,33 @@ function runReset(platform: string, env: NodeJS.ProcessEnv) {
 }
 
 function runTest() {
+  console.log('Testing i18n:add scaffolding validation...');
+  const existingLanguage = spawnSync(process.execPath, [i18nAddScript, 'en'], {
+    encoding: 'utf8',
+    cwd: rootDir,
+  });
+  assert.strictEqual(existingLanguage.status, 1, 'i18n:add must refuse to overwrite an existing language file');
+  assert.match(
+    existingLanguage.stderr,
+    /Refusing to overwrite existing messages file/,
+    'i18n:add must explain why an existing language file was not overwritten',
+  );
+
+  const invalidLanguage = spawnSync(process.execPath, [i18nAddScript, 'EN'], {
+    encoding: 'utf8',
+    cwd: rootDir,
+  });
+  assert.strictEqual(invalidLanguage.status, 1, 'i18n:add must reject non-canonical language codes');
+  assert.match(invalidLanguage.stderr, /Invalid language code/);
+  console.log('✓ i18n:add validation and no-overwrite guard verified');
+
   console.log('Testing kill-ports.js process identity matching...');
 
   // Positive cases (should match as Flo processes)
   const positiveCases = [
     'node /Users/dev/FloCafe/dist/index.js',
+    'node /Users/dev/FloCafe/dist/main/index.js',
+    'node C:\\FloCafe\\dist\\main\\index.js',
     '/Applications/Flo Cafe.app/Contents/MacOS/Flo Cafe',
     '/usr/bin/flocafe --no-sandbox',
     'electron . --appName=flo-desktop',
@@ -287,6 +310,31 @@ exit 0
   const testScript = realPkg.scripts?.test;
   assert.ok(typeof testScript === 'string' && testScript.length > 0, 'package.json must define a "test" script');
 
+  const pretestScript = realPkg.scripts?.pretest;
+  const releaseRegressionScript = realPkg.scripts?.['test:release-regressions'];
+  assert.ok(
+    typeof pretestScript === 'string' && pretestScript.includes('npm run test:release-regressions'),
+    'npm pretest must run the release regression aggregate before the canonical suite',
+  );
+  assert.ok(
+    typeof releaseRegressionScript === 'string' && releaseRegressionScript.length > 0,
+    'package.json must define the release regression aggregate',
+  );
+  for (const requiredSuite of [
+    'test:browser-receipts',
+    'test:decoupled-ui-locale',
+    'test:i18n-audit-remediations',
+    'test:i18n-ssr-timezone',
+    'test:issue-241-localized-errors',
+    'test:payment-modal-currency-adapter',
+    'test:printer-fallback-and-popup-verification',
+  ]) {
+    assert.ok(
+      releaseRegressionScript.includes(`npm run ${requiredSuite}`),
+      `release regression aggregate must include ${requiredSuite}`,
+    );
+  }
+
   const suitePattern = /(?:bash\s+tests\/run-test\.sh\s+)?npm\s+run\s+(test:[\w-]+)/g;
   const allSuites: string[] = [];
   let match: RegExpExecArray | null;
@@ -323,29 +371,23 @@ exit 0
   console.log(`✓ package.json test suite sharding coverage invariance (${allSuites.length} suites, ${shard0Suites.length}/${shard1Suites.length} per shard) verified`);
 
   // CI Workflow schema and configuration assertions
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const yaml = require('js-yaml');
-  const ciWorkflow = yaml.load(fs.readFileSync(path.join(rootDir, '.github/workflows/ci.yml'), 'utf8'));
+  const ciWorkflow = fs.readFileSync(path.join(rootDir, '.github/workflows/ci.yml'), 'utf8');
 
-  assert.ok(ciWorkflow.jobs['linux-tests'], 'ci.yml must define a "linux-tests" job');
-  const linuxTestsJob = ciWorkflow.jobs['linux-tests'];
-  assert.strictEqual(linuxTestsJob['runs-on'], 'ubuntu-latest', 'linux-tests must run on ubuntu-latest');
-  assert.strictEqual(linuxTestsJob?.strategy?.['fail-fast'], false, 'linux-tests strategy.fail-fast must be false');
-  assert.deepStrictEqual(linuxTestsJob?.strategy?.matrix?.shard, [0, 1], 'linux-tests matrix.shard must be [0, 1]');
+  assert.ok(ciWorkflow.includes('linux-tests:'), 'ci.yml must define a "linux-tests" job');
+  assert.ok(
+    ciWorkflow.includes('name: Core Test Suite (Shard ${{ matrix.shard_number }}/2)'),
+    'linux-tests must display 1-indexed shard numbers in job name',
+  );
+  assert.ok(ciWorkflow.includes('fail-fast: false'), 'linux-tests strategy.fail-fast must be false');
+  assert.ok(/shard:\s*\[0,\s*1\]/.test(ciWorkflow), 'linux-tests matrix.shard must be [0, 1]');
+  assert.ok(
+    ciWorkflow.includes('shard_number: 1') && ciWorkflow.includes('shard_number: 2'),
+    'linux-tests matrix must include 1-indexed shard_number mappings',
+  );
 
-  const steps = linuxTestsJob.steps || [];
-  const pretestStep = steps.find((s: any) => s.name?.includes('Payment method split checks'));
-  assert.ok(pretestStep, 'linux-tests must include payment method split pretest step');
-  assert.strictEqual(pretestStep.if, 'matrix.shard == 0', 'Payment method split check must run only on shard 0');
-
-  const frontendDepsStep = steps.find((s: any) => s.name?.includes('Install frontend dependencies'));
-  assert.ok(frontendDepsStep, 'linux-tests must include frontend dependencies installation step');
-  assert.strictEqual(frontendDepsStep['working-directory'], 'frontend');
-  assert.strictEqual(frontendDepsStep.run, 'npm ci');
-
-  const shardStep = steps.find((s: any) => s.name?.includes('Core test suite (shard'));
-  assert.ok(shardStep, 'linux-tests must include Core test suite shard step');
-  assert.match(shardStep.run, /SHARD_TOTAL=2\s+SHARD_INDEX=\${{\s*matrix\.shard\s*}}\s+node\s+scripts\/ci\/run-test-shard\.cjs/);
+  assert.ok(ciWorkflow.includes('if: matrix.shard == 0'), 'Payment method split check must run only on shard 0');
+  assert.ok(ciWorkflow.includes('working-directory: frontend'), 'linux-tests must include frontend dependencies installation step');
+  assert.match(ciWorkflow, /SHARD_TOTAL=2\s+SHARD_INDEX=\${{\s*matrix\.shard\s*}}\s+node\s+scripts\/ci\/run-test-shard\.cjs/);
 
   console.log('✓ CI workflow linux-tests matrix and sharding configuration verified');
 

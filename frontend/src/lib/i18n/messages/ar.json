@@ -1551,7 +1551,6 @@
     "testPrintSent": "تم إرسال الطباعة الاختبارية!",
     "testing": "جارٍ الاختبار…",
     "timezone": "المنطقة الزمنية",
-    "timezoneAutoFilled": "المنطقة الزمنية (مُعبّأة تلقائيًا)",
     "title": "الإعدادات",
     "trimDecimals": "حذف الكسور العشرية",
     "trimDecimalsHint": "إخفاء ‎.00‎ اللاحقة على الإيصالات المطبوعة. تبقى القيم ذات الكسور تطبع العشرية.",
@@ -1602,7 +1601,22 @@
     "languageAr": "العربية (AR)",
     "baseCurrencyHint": "تبقى الأسعار والضرائب والتقارير بهذه العملة. تغييرها لا يعيد تحويل المبالغ الحالية.",
     "baseNoLiveRates": "الأسعار المباشرة غير متوفّرة لهذه العملة الأساسية — يجب تعيين الأسعار الثانوية يدويًا.",
-    "ratesUnchanged": "لم يتم تحديث أي أسعار مباشرة — تحقّق من اتصالك، أو أن العملة ليس لها سعر مباشر"
+    "ratesUnchanged": "لم يتم تحديث أي أسعار مباشرة — تحقّق من اتصالك، أو أن العملة ليس لها سعر مباشر",
+    "billTemplateMerchantCloned": "منسوخ من قالب الامتثال",
+    "billTemplateMerchantCreated": "منشأ",
+    "billTemplateMerchantDesc": "تخطيط الإيصال المخصص الخاص بك.",
+    "billTemplateMerchantImported": "مستورد",
+    "kotPrintLanguage": "لغة تذكرة المطبخ",
+    "kotPrintLanguageHint": "تتبع تذاكر المطبخ لغة المتجر ما لم يتم اختيار لغة ثابتة.",
+    "printerArabicShaping": "دعم الطابعة لتشكيل العربية/الفارسية",
+    "printerArabicShapingHint": "عند التفعيل، تُرسل أسطر الإيصال التي تحتوي على نص عربي/فارسي إلى الطابعة كما هي — فعّل هذا فقط إذا كانت طابعتك تطبع العربية بشكل صحيح. عند الإيقاف، تُتخطى هذه الأسطر.",
+    "receiptLanguage": "لغة الإيصال",
+    "receiptLanguageHint": "اختر لغة المتجر للإيصالات أو حدد لغة معينة.",
+    "sameAsStore": "نفس لغة المتجر",
+    "secondLanguageNone": "بدون",
+    "secondReceiptLanguage": "لغة الإيصال الثانية",
+    "selectTimezone": "اختر المنطقة الزمنية…",
+    "taxIdFormatWarning": "لا يطابق تنسيق الرقم الضريبي المتوقع لـ {country}: {format}"
   },
   "setup": {
     "alreadyCompleted": "تم إكمال الإعداد بالفعل على هذا التثبيت. جارٍ التحويل إلى تسجيل الدخول…",
@@ -1688,9 +1702,18 @@
     "setupDataTitle": "اختر بيانات الإعداد",
     "tagline": "أنشئ حساب المالك واختر إعداد المطعم.",
     "terms": "الشروط والأحكام",
+    "termsAnd": "و",
     "termsIntro": "أوافق على FloPOS",
+    "timezoneHint": "تم ملؤها مسبقًا من بلدك. يمكن للمتاجر في البلدان متعددة المناطق الزمنية اختيار منطقتها الزمنية الفعلية.",
+    "timezoneLabel": "المنطقة الزمنية",
     "welcome": "مرحبًا بك في FloCafe",
-    "languageArabic": "العربية"
+    "languageArabic": "العربية",
+    "cloudManagedAutomaticallyDescription": "يتصل FloCafe تلقائيًا حتى تعمل مزامنة RevFlo والدعم دون خطوة موافقة يدوية.",
+    "cloudManagedAutomaticallyTitle": "يتم تفعيل الخدمات السحابية تلقائيًا",
+    "emailCommunicationDescription": "سنرسل رسالة ترحيب فورًا لتتمكن من التحقق من هذا العنوان. إشعارات الحساب والخدمة والأمان الأساسية ليست ترويجية ولا يمكن تعطيلها هنا.",
+    "emailCommunicationTitle": "التواصل عبر البريد الإلكتروني",
+    "marketingOptional": "استلام الرسائل التسويقية والعروض والاستبيانات (اختياري)",
+    "productUpdatesOptional": "استلام تحديثات المنتج وملاحظات الإصدار (اختياري)"
   },
   "staff": {
     "addButton": "إضافة موظّف",
@@ -2207,5 +2230,50 @@
     "reprint": "إعادة الطباعة",
     "balanced": "متوازن",
     "hasVariance": "تباين"
+  },
+  "printWarnings": {
+    "title": "{count, plural, one {لم تتم طباعة سطر واحد} other {لم تتم طباعة # سطر}}",
+    "arabicShapingHint": "تعذّر على طابعتك طباعة النص العربي/الفارسي. فعّل ”دعم الطابعة لتشكيل العربية/الفارسية“ من الإعدادات ← الطباعة، أو اطبع عبر المتصفح.",
+    "genericHint": "تحتوي الأسطر أدناه على أحرف لا يمكن لهذه الطابعة الحرارية عرضها.",
+    "moreLines": "…و{count} أخرى",
+    "templateFallback": "قالب الفاتورة المحدد غير مدعوم في مسار الطباعة هذا، لذا تم استخدام تخطيط الإيصال المدمج."
+  },
+  "print": {
+    "taxInvoiceTitle": "فاتورة ضريبية",
+    "invoiceTitle": "فاتورة",
+    "invoiceNumber": "رقم الفاتورة:",
+    "time": "الوقت",
+    "customerShort": "العميل",
+    "numberShort": "رقم العميل",
+    "address": "العنوان",
+    "call": "اتصل",
+    "note": "ملاحظة",
+    "phoneLong": "الهاتف",
+    "subtotalExclTax": "المجموع الفرعي (بدون ضريبة)",
+    "serviceChargeShort": "رسوم الخدمة",
+    "grandTotal": "الإجمالي",
+    "thankYouShort": "شكرًا لك!",
+    "thankYouVisitAgain": "شكرًا لزيارتك!",
+    "pleaseComeAgain": "نتمنى لك العودة قريبًا!",
+    "ratesInclusiveNote": "الأسعار شاملة الضرائب",
+    "pointsEarned": "النقاط المكتسبة",
+    "pointsBalance": "رصيد النقاط",
+    "pointsRedeemed": "النقاط المستبدلة",
+    "kot": {
+      "title": "تذكرة طلب المطبخ",
+      "banner": "تذكرة طلب المطبخ",
+      "station": "المحطة",
+      "type": "النوع",
+      "noPendingItems": "لا توجد أصناف معلّقة",
+      "end": "انتهى"
+    },
+    "hsn": "HSN",
+    "test": {
+      "title": "اختبار طابعة Flo",
+      "networkUsb": "طباعة اختبار عبر الشبكة / USB",
+      "columns": "الأعمدة",
+      "wrapHint": "إذا التفّ السطر التالي، اختر قيمة أعمدة أصغر.",
+      "success": "إذا كنت تستطيع قراءة هذا، فطابعتك تعمل!"
+    }
   }
 }

@@ -5,9 +5,9 @@ import { cloudSync, DEFAULT_CLOUD_SERVER_URL, normalizeCloudServerUrl } from '..
 import { googleDrive } from '../services/google-drive';
 import { requireRole } from '../middleware/security';
 import { requireMasterPin } from '../middleware/master-pin';
-import { validateTaxRegistrationNumber } from '../services/tax';
+import { resolveTaxIdFormat, validateTaxRegistrationNumber } from '../services/tax';
 import { sendEvent } from '../services/telemetry';
-import { getCountryByCode, getCurrencySymbol } from '../countries';
+import { getCountryByCode, getCurrencySymbol, isValidTimeZone, type CountryLocaleOptions } from '../countries';
 import {
   isValidCurrencyCode,
   isFrankfurterSupported,
@@ -20,11 +20,27 @@ import { refreshRates } from '../services/fx-rate';
 import { getHttpRequestSignal, trackHttpRequestWork } from '../shutdown';
 import { asyncHandler } from '../middleware/async-handler';
 import { normalizeOptionalPhone } from '../lib/phone';
-import { CORE_BILL_TEMPLATES, isAvailableBillTemplate, listInstalledPrintTemplates } from '../services/print-templates';
+import { CORE_BILL_TEMPLATES, isAvailableBillTemplate, listInstalledPrintTemplates, upgradeBillTemplateValue } from '../services/print-templates';
+import { listMerchantPrintTemplates } from '../services/merchant-print-templates';
+import {
+  BILL_LANGUAGE_POLICY_KEY,
+  KOT_LANGUAGE_POLICY_KEY,
+  LANGUAGE_POLICY_SETTING_KEYS,
+  defaultLanguagePolicySettingJson,
+  validateLanguagePolicySetting,
+} from '../lib/print-language-settings';
 
 const router = Router();
 const settingsReadRateLimit = expressRateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: true, legacyHeaders: false });
-const settingsWriteRateLimit = expressRateLimit({ windowMs: 60 * 1000, limit: 60, standardHeaders: true, legacyHeaders: false });
+const configuredSettingsWriteLimit = Number.parseInt(process.env.FLO_SETTINGS_WRITE_RATE_LIMIT_MAX || '', 10);
+const settingsWriteRateLimit = expressRateLimit({
+  windowMs: 60 * 1000,
+  limit: Number.isFinite(configuredSettingsWriteLimit) && configuredSettingsWriteLimit > 0
+    ? configuredSettingsWriteLimit
+    : 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -48,10 +64,7 @@ function upsertSettings(db: ReturnType<typeof getDatabase>, entries: Record<stri
 }
 
 function validBusinessLocation(timezone: unknown, currency: unknown, country: unknown): boolean {
-  if (timezone !== undefined) {
-    if (typeof timezone !== 'string' || timezone.length > 100) return false;
-    try { new Intl.DateTimeFormat('en-US', { timeZone: timezone }).format(); } catch { return false; }
-  }
+  if (timezone !== undefined && !isValidTimeZone(timezone)) return false;
   if (currency !== undefined && (typeof currency !== 'string' || !/^[A-Z]{3}$/.test(currency))) return false;
   if (country !== undefined && (typeof country !== 'string' || !/^[A-Z]{2}$/.test(country))) return false;
   return true;
@@ -70,6 +83,10 @@ const OPTIONAL_SETTING_DEFAULTS: Record<string, string> = {
   bill_footer_message: '',
   printer_trim_decimals: 'false',
   split_checks_enabled: 'false',
+  // Print language policies (#441) — inherit store language, no second
+  // language. Defaults preserve pre-policy behavior for existing tenants.
+  [BILL_LANGUAGE_POLICY_KEY]: defaultLanguagePolicySettingJson(),
+  [KOT_LANGUAGE_POLICY_KEY]: defaultLanguagePolicySettingJson(),
   // Iran locale display preferences (Batch G, Refs #241) — display-only.
   currency_display: 'rial',
   number_digits: 'locale',
@@ -98,16 +115,36 @@ function boolFlag(value: unknown): string | undefined {
   return value ? 'true' : 'false';
 }
 
-const LOCALE_PREFERENCE_VALUES: Record<string, Set<string>> = {
-  currency_display: new Set(['rial', 'toman', 'toman_short']),
-  number_digits: new Set(['locale', 'latin']),
-  calendar: new Set(['locale', 'persian', 'gregorian']),
+// Country-scoped locale display preferences (#390). A region without declared
+// localeOptions supports only the neutral default for each group: canonical
+// currency unit (rial), locale digits, and locale calendar.
+const NEUTRAL_LOCALE_PREFERENCES = {
+  currency_display: 'rial',
+  number_digits: 'locale',
+  calendar: 'locale',
+} as const;
+
+type LocalePreferenceKey = keyof typeof NEUTRAL_LOCALE_PREFERENCES;
+
+const LOCALE_OPTION_FIELDS: Record<LocalePreferenceKey, keyof CountryLocaleOptions> = {
+  currency_display: 'currencyDisplay',
+  number_digits: 'digits',
+  calendar: 'calendar',
 };
 
-function validLocalePreference(key: string, value: unknown): boolean {
-  const allowed = LOCALE_PREFERENCE_VALUES[key];
-  if (!allowed) return true;
-  return typeof value === 'string' && allowed.has(value);
+function isLocalePreferenceKey(key: string): key is LocalePreferenceKey {
+  return key === 'currency_display' || key === 'number_digits' || key === 'calendar';
+}
+
+function isLocalePreferenceSupported(key: LocalePreferenceKey, value: string, countryCode: string): boolean {
+  if (value === NEUTRAL_LOCALE_PREFERENCES[key]) return true;
+  const options = getCountryByCode(countryCode)?.localeOptions?.[LOCALE_OPTION_FIELDS[key]];
+  return Array.isArray(options) && (options as readonly string[]).includes(value);
+}
+
+function resolveStoredLocalePreference(key: LocalePreferenceKey, stored: string | undefined, countryCode: string): string {
+  if (stored && isLocalePreferenceSupported(key, stored, countryCode)) return stored;
+  return NEUTRAL_LOCALE_PREFERENCES[key];
 }
 
 // cloud_sync_enabled/cloud_orders_enabled/cloud_reports_enabled/cloud_command_polling_enabled
@@ -149,9 +186,13 @@ function businessShape(s: Record<string, string>) {
     bill_show_customer_name: s.bill_show_customer_name !== 'false',
     bill_show_customer_phone: s.bill_show_customer_phone !== 'false',
     bill_show_table_number: s.bill_show_table_number !== 'false',
-    currency_display: s.currency_display || 'rial',
-    number_digits: s.number_digits || 'locale',
-    calendar: s.calendar || 'locale',
+    currency_display: resolveStoredLocalePreference('currency_display', s.currency_display, s.country || 'IN'),
+    number_digits: resolveStoredLocalePreference('number_digits', s.number_digits, s.country || 'IN'),
+    calendar: resolveStoredLocalePreference('calendar', s.calendar, s.country || 'IN'),
+    // Informational only — the active country pack's format if it declares
+    // one, else the static main/countries.ts fallback, else null. Never
+    // blocks the save; the UI uses this to show a non-blocking warning.
+    tax_id_format: resolveTaxIdFormat(s.country || 'IN'),
   };
 }
 
@@ -162,6 +203,7 @@ function taxShape(s: Record<string, string>) {
     state_code: s.state_code || '',
     tax_scheme: s.tax_scheme || 'regular',
     country: s.country || 'IN',
+    tax_id_format: resolveTaxIdFormat(s.country || 'IN'),
   };
 }
 
@@ -189,16 +231,32 @@ router.put('/business', requireRole('owner', 'manager'), (req: Request, res: Res
     if (!validBusinessLocation(timezone, currency, country)) {
       return res.status(400).json({ error: 'Invalid timezone, currency, or country' });
     }
-    for (const [key, value] of [['currency_display', currency_display], ['number_digits', number_digits], ['calendar', calendar]] as const) {
-      if (value !== undefined && !validLocalePreference(key, value)) {
-        return res.status(400).json({ error: `Invalid ${key} value` });
-      }
-    }
 
     const db = getDatabase();
     const currentSettings = getAllSettings(db);
+    const effectiveCountry = country || currentSettings.country || 'IN';
+    const effectiveCurrency = currency || currentSettings.currency || 'INR';
+
+    // Validate explicitly supplied locale preferences against the effective
+    // country's declared options, and normalize stale legacy values (e.g. a
+    // Toman/Persian preference left behind by an IR -> US transition).
+    const localeUpdates: Record<string, string> = {};
+    for (const { key, submitted } of [
+      { key: 'currency_display', submitted: currency_display },
+      { key: 'number_digits', submitted: number_digits },
+      { key: 'calendar', submitted: calendar },
+    ] as Array<{ key: LocalePreferenceKey; submitted: unknown }>) {
+      if (submitted !== undefined) {
+        if (typeof submitted !== 'string' || !isLocalePreferenceSupported(key, submitted, effectiveCountry)) {
+          return res.status(400).json({ error: `Invalid ${key} for country ${effectiveCountry}` });
+        }
+        localeUpdates[key] = submitted;
+      } else {
+        localeUpdates[key] = resolveStoredLocalePreference(key, currentSettings[key], effectiveCountry);
+      }
+    }
+
     if (tax_registration_number) {
-      const effectiveCountry = country || currentSettings.country || 'IN';
       const { valid, format } = validateTaxRegistrationNumber(effectiveCountry, tax_registration_number);
       if (!valid && format) {
         return res.status(400).json({
@@ -207,8 +265,6 @@ router.put('/business', requireRole('owner', 'manager'), (req: Request, res: Res
         });
       }
     }
-    const effectiveCountry = country || currentSettings.country || 'IN';
-    const effectiveCurrency = currency || currentSettings.currency || 'INR';
 
     let normalizedPhone: string | undefined = undefined;
     if (business_phone !== undefined) {
@@ -230,7 +286,7 @@ router.put('/business', requireRole('owner', 'manager'), (req: Request, res: Res
       billing_type, tables_required, tax_registered,
       bill_show_name, bill_show_address, bill_show_phone, bill_show_tax_id,
       bill_show_tax_breakdown, bill_show_customer_name, bill_show_customer_phone, bill_show_table_number,
-      currency_display, number_digits, calendar,
+      ...localeUpdates,
     });
     cloudSync.refreshRegistrationProfile();
 
@@ -351,8 +407,8 @@ router.put('/tax', requireRole('owner', 'manager'), (req: Request, res: Response
 
     const db = getDatabase();
     const currentSettings = getAllSettings(db);
+    const effectiveCountry = country || currentSettings.country || 'IN';
     if (tax_registration_number) {
-      const effectiveCountry = country || currentSettings.country || 'IN';
       const { valid, format } = validateTaxRegistrationNumber(effectiveCountry, tax_registration_number);
       if (!valid && format) {
         return res.status(400).json({
@@ -907,6 +963,7 @@ const ALLOWED_WILDCARD_KEYS = new Set([
   'diagnostics_consent',
   'kds_enabled', 'server_app_enabled', 'kot_printing_enabled',
   'split_checks_enabled',
+  BILL_LANGUAGE_POLICY_KEY, KOT_LANGUAGE_POLICY_KEY,
   'currency_display', 'number_digits', 'calendar',
 ]);
 
@@ -947,7 +1004,20 @@ router.get('/bill-templates', requireRole('owner', 'manager'), (_req: Request, r
         packVersionId: template.pack_version_id,
       };
     });
-    res.json({ core: [...CORE_BILL_TEMPLATES], plugins });
+    // Merchant templates (#447): provenance is informational only — a cloned
+    // origin references a compliance-pack template id WITHOUT transferring
+    // any compliance trust. Only active rows are selectable.
+    const merchant = listMerchantPrintTemplates().map((template) => ({
+      id: template.id,
+      displayName: template.name,
+      origin: template.origin,
+      derivedFrom: template.derived_from ? JSON.parse(template.derived_from) : null,
+      documentType: template.document_type,
+      schemaVersion: template.schema_version,
+      status: template.status,
+      updatedAt: template.updated_at,
+    }));
+    res.json({ core: [...CORE_BILL_TEMPLATES], plugins, merchant });
   } catch (error: any) {
     console.error("[API] Internal error:", error);
     res.status(500).json({ error: "Internal server error" });
@@ -985,13 +1055,41 @@ router.put('/:key', settingsWriteRateLimit, requireRole('owner', 'manager'), (re
     if (value === undefined) {
       return res.status(400).json({ error: 'Value is required' });
     }
-    if (req.params.key === 'bill_template' && !isAvailableBillTemplate(String(value))) {
+    // bill_template accepts every legacy bare value AND the structured
+    // { source, id } form; whichever the client sends, the canonical
+    // structured JSON is persisted — legacy strings upgrade transparently on
+    // their next save (#447).
+    if (req.params.key === 'bill_template' && !isAvailableBillTemplate(value)) {
       return res.status(400).json({ error: 'Unsupported bill template' });
     }
-    if (!validLocalePreference(String(req.params.key), value)) {
-      return res.status(400).json({ error: `Invalid ${req.params.key} value` });
+    let valueToPersist: unknown = value;
+    if (req.params.key === 'bill_template') {
+      valueToPersist = upgradeBillTemplateValue(value);
+    }
+    if (typeof req.params.key === 'string' && LANGUAGE_POLICY_SETTING_KEYS.has(req.params.key)) {
+      const validation = validateLanguagePolicySetting(req.params.key, value);
+      if (!validation.ok) {
+        return res.status(400).json({ error: validation.error });
+      }
+      valueToPersist = validation.stored;
     }
     const db = getDatabase();
+    const wildcardKey = String(req.params.key);
+    if (isLocalePreferenceKey(wildcardKey)) {
+      const countryCode = getAllSettings(db).country || 'IN';
+      if (typeof value !== 'string' || !isLocalePreferenceSupported(wildcardKey, value, countryCode)) {
+        return res.status(400).json({ error: `Invalid ${wildcardKey} for country ${countryCode}` });
+      }
+    }
+
+    if (req.params.key === 'business_phone') {
+      const effectiveCountry = getAllSettings(db).country || 'IN';
+      const phoneRes = normalizeOptionalPhone(value, effectiveCountry);
+      if (!phoneRes.valid) {
+        return res.status(400).json({ error: phoneRes.error || 'Invalid business phone number' });
+      }
+      valueToPersist = phoneRes.e164 || '';
+    }
 
     // KDS turning off → invalidate any outstanding pairing tokens. Without
     // this, a token minted while KDS was on would still let a device pair
@@ -1004,20 +1102,10 @@ router.put('/:key', settingsWriteRateLimit, requireRole('owner', 'manager'), (re
       }
     }
 
-    let valueToPersist = value;
-    if (req.params.key === 'business_phone') {
-      const effectiveCountry = getAllSettings(db).country || 'IN';
-      const phoneRes = normalizeOptionalPhone(value, effectiveCountry);
-      if (!phoneRes.valid) {
-        return res.status(400).json({ error: phoneRes.error || 'Invalid business phone number' });
-      }
-      valueToPersist = phoneRes.e164 || '';
-    }
-
     db.prepare(`
       INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-    `).run(req.params.key, valueToPersist, now());
+    `).run(req.params.key, valueToPersist as string, now());
 
     // Keep the legacy setting as a compatibility mirror. The canonical runtime
     // switch is telemetry_enabled; this route is the only user-facing writer,

@@ -6,11 +6,10 @@ import Link from 'next/link';
 import { useAuthStore } from '@/store/auth';
 import api from '@/lib/api';
 import { Banknote, ChefHat, Clock, LayoutGrid, TrendingUp, ClipboardList, ArrowRight, Timer, Trophy, Tags, BarChart3, Wallet } from 'lucide-react';
-import { useTranslations, type AppConfig } from 'use-intl';
+import { useTranslations, useLocale, type AppConfig } from 'use-intl';
 import { Ltr } from '@/components/layout/Ltr';
 import toast from 'react-hot-toast';
 import { useFormatCurrency } from '@/hooks/useFormatCurrency';
-import { getCountryByCode } from '@/lib/countries';
 import { PAYMENT_METHODS } from '@/lib/payment-methods';
 import { ORDER_STATUS_LABEL_KEYS } from '@/lib/i18n-enums';
 
@@ -125,8 +124,7 @@ const orderStatusColor: Record<string, string> = {
 type OrdersKey = keyof AppConfig['Messages']['orders'];
 type PosKey = keyof AppConfig['Messages']['pos'];
 
-// Built-in payment method label keys (PAYMENT_METHODS keeps dotted keys for the
-// not-yet-migrated files, so the dashboard maps them to typed `pos` leaf keys).
+// Built-in payment method label keys mapped to typed `pos` leaf keys.
 const BUILT_IN_PAYMENT_KEYS = {
   cash: 'methodCash',
   card: 'methodCard',
@@ -148,7 +146,7 @@ export default function DashboardPage() {
 
   const isOwner = currentTenant?.role === 'owner';
   const fmt = useFormatCurrency();
-  const locale = currentTenant?.country ? (getCountryByCode(currentTenant.country)?.locale ?? 'en-US') : 'en-US';
+  const locale = useLocale();
   const timeZone = currentTenant?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
   const todayLocal = getLocalDateString(new Date(), timeZone);
   const [selectedDate, setSelectedDate] = useState(todayLocal);

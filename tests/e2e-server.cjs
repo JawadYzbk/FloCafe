@@ -6,6 +6,9 @@ const Module = require('module');
 
 const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flo-e2e-'));
 process.env.JWT_SECRET = 'e2e-test-secret';
+process.env.FLO_AUTH_RATE_LIMIT_MAX = '1000';
+process.env.FLO_SETTINGS_WRITE_RATE_LIMIT_MAX = '1000';
+process.env.NODE_ENV = 'test';
 
 const originalLoad = Module._load;
 Module._load = function (request, parent, isMain) {
@@ -17,11 +20,12 @@ Module._load = function (request, parent, isMain) {
 
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
-const { initDatabase, getDatabase, closeDatabase, beginDatabaseShutdown, waitForDatabaseRequests, now } = require('../dist/db');
-const { createExitCodeAwareShutdown, waitForHttpShutdownWork, isShutdownTimeout } = require('../dist/shutdown');
-const { startServer, stopServer } = require('../dist/server');
-const { shutdown: shutdownWhatsApp, requestShutdown: requestWhatsAppShutdown } = require('../dist/services/whatsapp');
-const { startStandaloneServers } = require('../dist/standalone-startup');
+const { initDatabase, getDatabase, closeDatabase, beginDatabaseShutdown, waitForDatabaseRequests, now } = require('../dist/main/db');
+const { createExitCodeAwareShutdown, waitForHttpShutdownWork, isShutdownTimeout } = require('../dist/main/shutdown');
+const { startServer, stopServer } = require('../dist/main/server');
+const { startServerApp, stopServerApp } = require('../dist/main/server-app');
+const { shutdown: shutdownWhatsApp, requestShutdown: requestWhatsAppShutdown } = require('../dist/main/services/whatsapp');
+const { startStandaloneServers } = require('../dist/main/standalone-startup');
 const flatRatePackData = require('./fixtures/synthetic-flat-rate-pack.json');
 // Country/currency stay TH/THB (this fixture's configured business country)
 // so getActiveCountryPack('TH') actually resolves this pack.
@@ -97,7 +101,7 @@ function installAndActivateTaxPack(db, pack) {
     );
   }
 }
-const { startKdsServer, stopKdsServer } = require('../dist/kds-server');
+const { startKdsServer, stopKdsServer } = require('../dist/main/kds-server');
 
 function seedUser(id, email, role) {
   getDatabase().prepare(
@@ -144,6 +148,12 @@ let shutdownRequested = false;
 const requestStop = createExitCodeAwareShutdown(async () => {
   let cleanupFailed = false;
   let databaseBlocked = false;
+  try { await stopServerApp(); } catch (error) {
+    cleanupFailed = true;
+    databaseBlocked = true;
+    console.error('[E2E] Server App cleanup failed:', error);
+    if (isShutdownTimeout(error)) throw error;
+  }
   try { await stopServer(); } catch (error) {
     cleanupFailed = true;
     databaseBlocked = true;
@@ -206,13 +216,15 @@ async function stop(exitCode = 0) {
     prepare: () => {
       seedUser('e2e-owner', 'owner@flo.local', 'owner');
       seedUser('e2e-manager', 'manager@flo.local', 'manager');
+      seedUser('e2e-server', 'server@flo.local', 'server');
       seedPosFixture();
     },
     startServer,
     startKdsServer,
+    startServerApp,
     isShutdownRequested: () => shutdownRequested,
   });
-  console.log('[E2E] Main and KDS servers ready');
+  console.log('[E2E] Main, KDS, and Server App servers ready');
 })().catch((error) => {
   console.error(error);
   stop(1);

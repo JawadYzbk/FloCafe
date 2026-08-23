@@ -820,7 +820,7 @@ Z Report (close shift).
 ## Settings
 
 ### GET `/api/settings/business`
-Get business settings.
+Get business settings. Locale display preferences (`currency_display`, `number_digits`, `calendar`) are resolved against the active country's declared `localeOptions`; stale or unsupported stored values are normalized to neutral defaults.
 
 **Response:**
 ```json
@@ -828,7 +828,11 @@ Get business settings.
   "business_name": "My Restaurant",
   "timezone": "Asia/Kolkata",
   "currency": "INR",
-  "tax_registration_number": "22AAAAA0000A1Z5"
+  "country": "IN",
+  "tax_registration_number": "22AAAAA0000A1Z5",
+  "currency_display": "rial",
+  "number_digits": "locale",
+  "calendar": "locale"
 }
 ```
 
@@ -837,10 +841,30 @@ Get business settings.
 ### PUT `/api/settings/business`
 Update business settings.
 
+`timezone` is validated as an IANA identifier; invalid values return HTTP 400 with `"Invalid timezone, currency, or country"`.
+
+When `tax_registration_number` is provided, the backend validates it against the active country pack's registration format. A mismatch returns HTTP 400:
+
+```json
+{
+  "error": "Tax ID does not match the expected IN format: 15-digit GSTIN",
+  "tax_id_format": { "pattern": "...", "description": "..." }
+}
+```
+
+Locale display preferences (`currency_display`, `number_digits`, `calendar`) are validated against the effective country's `localeOptions`. Unsupported values return HTTP 400 with `"Invalid <key> for country <code>"`. Changing the country normalizes any previously stored preferences that are not supported by the new country to their neutral defaults (`rial`, `locale`, `locale`).
+
 ---
 
 ### GET `/api/settings/tax`
 Get tax settings.
+
+---
+
+### PUT `/api/settings/tax`
+Update tax settings (owner/manager only).
+
+Validates `tax_registration_number` against the active country pack format, same as `PUT /api/settings/business`.
 
 ---
 
@@ -957,9 +981,13 @@ Print the bill identified by `billId` or the bill associated with `orderId`.
 {
   "billId": 123,
   "useUnicode": false,
-  "isReprint": false
+  "isReprint": false,
+  "preview": false,
+  "arabicShaping": false
 }
 ```
+
+Pass `preview: true` to generate receipt preview text, base64 ESC/POS payload, and column metrics without dispatching to a physical printer. If no hardware printer is configured, preview mode falls back to default 80 mm formatting.
 
 ### POST `/api/printers/print-kot`
 
@@ -968,9 +996,61 @@ Print a kitchen order ticket for `orderId`. A caller may provide `stationName` a
 ```json
 {
   "orderId": 123,
-  "useUnicode": false
+  "useUnicode": false,
+  "arabicShaping": false
 }
 ```
+
+---
+
+## Merchant Print Templates
+
+Owner-role CRUD for tenant-owned semantic receipt templates (#447). See
+[Merchant print templates](merchant-print-templates.md) for the payload schema, validation policy,
+provenance/trust model, and offline transfer contract. Payloads are validated
+fail-closed on every write.
+
+### GET `/api/print-templates`
+List merchant templates (all statuses). Owner or manager.
+
+### POST `/api/print-templates`
+Create a template in `draft` status. Body: `{ name, payload, origin?, derivedFrom? }`.
+`origin` is one of `created | imported | cloned`; `cloned` requires a
+`derivedFrom` reference `{ type: 'compliance-pack-template' | 'merchant-template' | 'offline-import', templateId }`
+(informational only — no compliance trust transfers).
+
+### PUT `/api/print-templates/:id`
+Update name and/or payload. Editing an ACTIVE template snapshots its current
+payload into the single-step rollback point. Archived templates are immutable.
+
+### POST `/api/print-templates/:id/activate`
+Promote to `active`. Fails closed (409) if the stored checksum does not match
+the payload.
+
+### POST `/api/print-templates/:id/archive`
+Terminal state; archived templates stop being selectable.
+
+### POST `/api/print-templates/:id/rollback`
+Restore `previous_payload_json` after verifying the current checksum; clears
+the rollback point. 409 when there is nothing to roll back to, when the
+restored payload fails current validation, or when the template is archived.
+
+### GET `/api/print-templates/:id/payload`
+Read the stored payload (owner or manager).
+
+### GET `/api/print-templates/:id/export`
+Download an active or archived template as a portable
+`*.flocafe-template.json` envelope. Owner only. Drafts and rows with invalid
+stored checksums are rejected; the response is JSON with an attachment
+filename.
+
+### POST `/api/print-templates/import`
+Import a portable envelope as a new `draft`. Owner only. Body:
+`{ file, name?, fileName? }`, where `file` is the raw envelope JSON text and
+`fileName` is the optional source filename recorded in offline-import
+provenance. The import path enforces the envelope and payload validators,
+checksum verification, and the 256 KB raw-byte cap; it never activates or
+overwrites an existing template.
 
 ---
 

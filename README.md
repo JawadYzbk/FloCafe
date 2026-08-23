@@ -64,6 +64,28 @@ For Linux package choices, updates, FUSE setup, printing permissions, and tray b
 
 Node.js is only required to develop FloCafe, not to run a packaged release.
 
+<details>
+<summary>Uninstall a direct-download build</summary>
+
+App Store and Microsoft Store installs should be removed through the relevant store or operating system.
+
+```sh
+# macOS
+curl -fsSL https://github.com/FreeOpenSourcePOS/FloCafe/releases/latest/download/uninstall-macos.sh -o uninstall-macos.sh
+chmod +x uninstall-macos.sh
+./uninstall-macos.sh
+```
+
+```powershell
+# Windows PowerShell
+irm https://github.com/FreeOpenSourcePOS/FloCafe/releases/latest/download/uninstall-windows.ps1 -OutFile uninstall-windows.ps1
+powershell -ExecutionPolicy Bypass -File .\uninstall-windows.ps1
+```
+
+Both scripts ask whether to keep application data. Do not choose their data-purge options unless you intend to remove the local database and backups.
+
+</details>
+
 ## Highlights
 
 - **Order workflows:** Counter, dine-in, takeaway, and delivery orders with table management and held orders.
@@ -95,7 +117,7 @@ FloCafe includes UI translations for:
 - Brazilian Portuguese
 - Persian (Farsi), including RTL support
 
-UI language is independent of store country and regional settings, and tax calculation rules remain a separate concern.
+UI language is independent of store country and regional settings, and tax calculation rules remain a separate concern. For details on contributing translations or adding languages, see the [Internationalization and translation guide](docs/i18n.md).
 
 ## Tax support
 
@@ -146,6 +168,7 @@ If FloCafe is useful to you, consider starring the repository.
 - **Documentation index:** [docs/README.md](docs/README.md)
 - **Printer guide & troubleshooting:** [docs/printers.md](docs/printers.md)
 - **Linux setup & support:** [docs/linux.md](docs/linux.md)
+- **Internationalization & translations:** [docs/i18n.md](docs/i18n.md)
 - **Google Drive backup setup:** [docs/google-drive-setup.md](docs/google-drive-setup.md)
 - **Community discussion:** [Reddit r/FloPOS](https://www.reddit.com/r/FloPOS/)
 - **Bug reports & feature proposals:** [GitHub Issues](https://github.com/FreeOpenSourcePOS/FloCafe/issues)

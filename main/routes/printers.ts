@@ -3,6 +3,13 @@ import { getDatabase, now, attachEffectiveAddons, isKotPrintingEnabled, parseIte
 import { getOrderWithItems } from './bills';
 import { v4 as uuidv4 } from 'uuid';
 import { printViaNetwork, printViaUSB, buildTestPage, printReceiptDetailed, printKOTDetailed, detectConnectedPrinters, prepareReceipt, escPosToText } from '../printers/thermal';
+import { BILL_LANGUAGE_POLICY_KEY, KOT_LANGUAGE_POLICY_KEY, parseStoredLanguagePolicy } from '../lib/print-language-settings';
+import {
+  resolveKotLanguage,
+  resolveReceiptLanguages,
+  type KotLanguagePolicy,
+  type ReceiptLanguagePolicy,
+} from '../../shared/print';
 import { getSupportedPrinterProfiles, resolvePrinterProfile } from '../printers/profiles';
 import { requireRole } from '../middleware/security';
 import { getCountryByCode, getCurrencySymbol } from '../countries';
@@ -282,7 +289,7 @@ router.post('/:id/test', requireRole('owner', 'manager'), asyncHandler(async (re
     if (!printer) return res.status(404).json({ error: 'Printer not found' });
 
     const profile = resolvePrinterProfile(printer);
-    const testData = buildTestPage(printer.paper_width || profile.defaultPaperWidth, profile.cutMode);
+    const testData = buildTestPage(printer.paper_width || profile.defaultPaperWidth, profile.cutMode, tenantLanguage(db));
     let result: { ok: boolean; detail?: string } = { ok: false };
 
     switch (printer.connection_type) {
@@ -347,6 +354,9 @@ router.post('/print-raw', requireRole('owner', 'manager', 'cashier'), asyncHandl
 router.post('/print-bill', requireRole('owner', 'manager', 'cashier'), asyncHandler(async (req: Request, res: Response) => {
   try {
     const { billId, orderId, useUnicode = false, isReprint = false, preview = false } = req.body;
+    // Renderer's global "Arabic/Persian shaping" setting (#437). Only an
+    // explicit boolean overrides the printer profile's declared capability.
+    const arabicShapingOverride = typeof req.body?.arabicShaping === 'boolean' ? req.body.arabicShaping : undefined;
     console.log('[Print Bill] Request received', { useUnicode, isReprint, preview });
     
     if (!billId && !orderId) {
@@ -355,9 +365,18 @@ router.post('/print-bill', requireRole('owner', 'manager', 'cashier'), asyncHand
     }
 
     const db = getDatabase();
-    const printer = db.prepare('SELECT * FROM printers WHERE is_default = 1').get() as { id?: unknown; name?: unknown } | undefined;
-    console.log('[Print Bill] Default printer:', printer ? { id: printer.id, name: printer.name } : undefined);
+    let printer = db.prepare(
+      `SELECT * FROM printers
+       WHERE connection_type != 'webusb'
+       ORDER BY is_default DESC, name
+       LIMIT 1`,
+    ).get() as { id?: unknown; name?: unknown; paper_width?: unknown } | undefined;
+    console.log('[Print Bill] Resolved printer:', printer ? { id: printer.id, name: printer.name } : undefined);
     
+    if (!printer && preview === true) {
+      printer = { id: 0, name: 'Default 80mm Preview', paper_width: '80mm' };
+    }
+
     if (!printer) {
       console.log('[Print Bill] Error: No default printer');
       return res.status(400).json({ error: 'No default printer configured. Add a printer in Settings.' });
@@ -455,10 +474,19 @@ router.post('/print-bill', requireRole('owner', 'manager', 'cashier'), asyncHand
       footer_note: settings.bill_footer_message || '',
     };
     const billTemplate = settings.bill_template;
+    // Receipt label languages (#443): the tenant's `bill_language_policy`
+    // (kernel B) resolves against the tenant `language` setting through the
+    // shared kernel; primary first, optional additional second.
+    const receiptLanguages = resolveTenantReceiptLanguages(db);
     console.log('[Print Bill] Preparing receipt', { template: billTemplate || 'classic' });
 
     if (preview === true) {
-      const prepared = prepareReceipt(order, bill, business, billTemplate || 'classic', useUnicode, isReprint);
+      // Preview and production share one code path (#443): prepareReceipt →
+      // formatReceipt renders through PrintDocument for classic + compact
+      // (plugin templates keep their dedicated renderer). Merchant templates
+      // (#447) resolve through the same document pipeline inside
+      // formatReceipt, so previews need no special-casing here.
+      const prepared = prepareReceipt(order, bill, business, billTemplate || 'classic', useUnicode, isReprint, arabicShapingOverride, receiptLanguages.primary, receiptLanguages.additional);
       return res.json({
         success: true,
         preview: true,
@@ -472,7 +500,7 @@ router.post('/print-bill', requireRole('owner', 'manager', 'cashier'), asyncHand
 
     // Use existing printReceipt function with template support
     console.log('[Print Bill] Calling printReceipt...');
-    const result = await printReceiptDetailed(order, bill, business, billTemplate || 'classic', useUnicode, isReprint, getHttpRequestSignal(req));
+    const result = await printReceiptDetailed(order, bill, business, billTemplate || 'classic', useUnicode, isReprint, getHttpRequestSignal(req), arabicShapingOverride, receiptLanguages.primary, receiptLanguages.additional);
     console.log('[Print Bill] Print completed', result);
 
     if (result.ok) {
@@ -505,7 +533,10 @@ export function routeItemsToStations(db: any, orderItems: any[]): { stationName:
       } catch {
         categoryIds = [];
       }
-      const printer = db.prepare('SELECT * FROM printers WHERE id = ?').get(s.printer_id);
+      const printer = db.prepare(
+        `SELECT * FROM printers
+         WHERE id = ? AND connection_type != 'webusb'`,
+      ).get(s.printer_id);
       return { ...s, categoryIds, printer };
     })
     .filter((s) => s.categoryIds.length > 0 && s.printer);
@@ -547,13 +578,21 @@ router.post('/print-kot', requireRole('owner', 'manager', 'cashier'), asyncHandl
   }
   try {
     const { orderId, stationName, items, useUnicode = false } = req.body;
+    // Renderer's global "Arabic/Persian shaping" setting (#437). Only an
+    // explicit boolean overrides the printer profile's declared capability.
+    const arabicShapingOverride = typeof req.body?.arabicShaping === 'boolean' ? req.body.arabicShaping : undefined;
 
     if (!orderId) {
       return res.status(400).json({ error: 'orderId is required' });
     }
 
     const db = getDatabase();
-    const printer = db.prepare('SELECT * FROM printers WHERE is_default = 1').get();
+    const printer = db.prepare(
+      `SELECT * FROM printers
+       WHERE connection_type != 'webusb'
+       ORDER BY is_default DESC, name
+       LIMIT 1`,
+    ).get();
 
     if (!printer) {
       return res.status(400).json({ error: 'No default printer configured. Add a printer in Settings.' });
@@ -563,6 +602,8 @@ router.post('/print-kot', requireRole('owner', 'manager', 'cashier'), asyncHandl
     if (!order) {
       return res.status(404).json({ error: 'Order not found' });
     }
+
+    const kotLanguage = resolveTenantKotLanguage(db);
 
     // Fetch order items from database
     const orderItems: any[] = getEffectiveOrderItems(db, orderId);
@@ -584,14 +625,14 @@ router.post('/print-kot', requireRole('owner', 'manager', 'cashier'), asyncHandl
     if (stationName || items) {
       const kotItems = items || orderItems;
       const station = stationName || 'Kitchen';
-      const result = await printKOTDetailed(order, kotItems, station, useUnicode, undefined, getHttpRequestSignal(req));
+      const result = await printKOTDetailed(order, kotItems, station, useUnicode, undefined, getHttpRequestSignal(req), arabicShapingOverride, kotLanguage);
       success = result.ok;
       failure = result.ok ? null : result;
       warnings.push(...(result.warnings || []));
     } else {
       const groups = routeItemsToStations(db, orderItems).filter((g) => g.items.length > 0);
       for (const group of groups) {
-        const result = await printKOTDetailed(order, group.items, group.stationName, useUnicode, group.printer || undefined, getHttpRequestSignal(req));
+        const result = await printKOTDetailed(order, group.items, group.stationName, useUnicode, group.printer || undefined, getHttpRequestSignal(req), arabicShapingOverride, kotLanguage);
         success = success && result.ok;
         warnings.push(...(result.warnings || []));
         if (!result.ok && !failure) failure = result;
@@ -611,3 +652,54 @@ router.post('/print-kot', requireRole('owner', 'manager', 'cashier'), asyncHandl
 }));
 
 export const printerRoutes = router;
+
+/**
+ * Tenant-configured language for print label selection (#440). Defaults to
+ * 'en' when unset; unknown values fall back to English at render time.
+ */
+function tenantLanguage(db: ReturnType<typeof getDatabase>): string {
+  try {
+    const row = db.prepare("SELECT value FROM settings WHERE key = 'language'").get() as { value?: string } | undefined;
+    return row?.value || 'en';
+  } catch {
+    return 'en';
+  }
+}
+
+function tenantSettingValue(db: ReturnType<typeof getDatabase>, key: string): string | undefined {
+  try {
+    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value?: string } | undefined;
+    return row?.value;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Receipt label languages for one print request (#443). The stored
+ * `bill_language_policy` is resolved through the shared kernel against the
+ * tenant `language` setting; malformed stored values fall back to the
+ * inherit/none default (read-side parse never breaks printing).
+ */
+function resolveTenantReceiptLanguages(db: ReturnType<typeof getDatabase>): { primary: string; additional?: string } {
+  const policy = parseStoredLanguagePolicy(
+    BILL_LANGUAGE_POLICY_KEY,
+    tenantSettingValue(db, BILL_LANGUAGE_POLICY_KEY),
+  ) as ReceiptLanguagePolicy;
+  const languages = resolveReceiptLanguages(policy, tenantLanguage(db));
+  return languages.length > 1
+    ? { primary: languages[0], additional: languages[1] }
+    : { primary: languages[0] };
+}
+
+/**
+ * Kitchen ticket label language (#443): `kot_language_policy` resolved
+ * through the kernel, independently of the receipt language policy.
+ */
+function resolveTenantKotLanguage(db: ReturnType<typeof getDatabase>): string {
+  const policy = parseStoredLanguagePolicy(
+    KOT_LANGUAGE_POLICY_KEY,
+    tenantSettingValue(db, KOT_LANGUAGE_POLICY_KEY),
+  ) as KotLanguagePolicy;
+  return resolveKotLanguage(policy, tenantLanguage(db));
+}

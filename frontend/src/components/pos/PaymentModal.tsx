@@ -12,7 +12,7 @@ import TaxBreakdown from '@/components/pos/TaxBreakdown';
 import { resolveTaxComponents } from '@/lib/printer/tax-components';
 import { useCartStore } from '@/store/cart';
 import { useConfirm } from '@/hooks/use-confirm';
-import { useTranslations, type AppConfig } from 'use-intl';
+import { useTranslations, useLocale, type AppConfig } from 'use-intl';
 import { PAYMENT_METHODS, type CustomPaymentMethod } from '@/lib/payment-methods';
 import { useFormatCurrency } from '@/hooks/useFormatCurrency';
 import { useFormatNumber } from '@/hooks/useFormatNumber';
@@ -56,8 +56,7 @@ const LOYALTY_REDEMPTION_RATE = 100;
 
 type PosKey = keyof AppConfig['Messages']['pos'];
 
-// Built-in payment method label keys (PAYMENT_METHODS keeps dotted keys for the
-// unmigrated dashboard page, so this maps them to the typed `pos` leaf keys).
+// Built-in payment method label keys mapped to typed `pos` leaf keys.
 const BUILT_IN_PAYMENT_KEYS = {
   cash: 'methodCash',
   card: 'methodCard',
@@ -70,13 +69,13 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
   const effectiveCustomerId = bill.customer_id || cartCustomerId || null;
   const { confirm, ConfirmDialog } = useConfirm();
   const t = useTranslations('pos');
+  const locale = useLocale();
   const tCommon = useTranslations('common');
   const tOrders = useTranslations('orders');
   const tWhatsappSend = useTranslations('whatsapp.send');
 
-  // sendBillViaFlo (shared with the not-yet-migrated orders page) still takes a
-  // legacy dotted-key translator; bridge the typed `whatsapp.send` namespace to
-  // that contract without reintroducing the legacy global `t()`.
+  // sendBillViaFlo (shared with OrdersPage) takes a translator callback;
+  // bridge the typed `whatsapp.send` namespace to that contract.
   const whatsappSendT = (key: string): string =>
     tWhatsappSend(
       key.replace(/^whatsapp\.send\./, '') as
@@ -417,7 +416,7 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
     }
     setSendingWa(true);
     try {
-      await sendBillViaFlo(bill, phone, tenantForShare, whatsappSendT, { pointsEarned });
+      await sendBillViaFlo(bill, phone, tenantForShare, whatsappSendT, { pointsEarned }, locale);
     } finally {
       setSendingWa(false);
     }
@@ -433,7 +432,8 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
         bill,
         { phone: cartCustomer.phone, country_code: cartCustomer.country_code },
         tenantForShare,
-        { pointsEarned }
+        { pointsEarned },
+        locale,
       );
     } catch {
       toast.error(tOrders('whatsappFailed'));

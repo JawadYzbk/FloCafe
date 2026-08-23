@@ -18,6 +18,7 @@ import { initFromDb as initWhatsAppFromDb, requestShutdown as requestWhatsAppShu
 import log from 'electron-log/main';
 import { autoUpdater } from 'electron-updater';
 import { isAllowedLocalWindowUrl, isSafeExternalUrl } from './security/url-allowlist';
+import { clearStaleRenderCachesOnVersionChange } from './startup-cache';
 import {
   createShutdownCoordinator,
   createShutdownEntrypoints,
@@ -248,6 +249,14 @@ if (gotSingleInstanceLock) {
 }
 
 function createWindow(): void {
+  // Runs on every call, not just the initial one — the crash-recovery path
+  // below (render-process-gone) and the macOS 'activate' handler both call
+  // createWindow() again without going through initialize(). If a stale
+  // cache directory failed to clear on the previous attempt (e.g. a
+  // transient lock), retrying here means the app can still self-heal within
+  // the same run instead of only on the next full relaunch.
+  clearStaleRenderCachesOnVersionChange(app.getPath('userData'), process.versions.electron, log);
+
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 900,
@@ -274,17 +283,19 @@ function createWindow(): void {
   // This avoids file:// protocol issues and keeps dev/prod behaviour identical.
   mainWindow.loadURL(`http://localhost:${getServerPort()}`);
 
-  // Allow target="_blank" links to open new windows for local URLs (e.g. the KDS page).
-  // External URLs are sent to the system browser instead.
+  // Allow target="_blank" links to open new windows for local URLs (e.g. the KDS page)
+  // and blank popup windows (e.g. browser print popups). External URLs are sent to the system browser.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    const isBlank = url === 'about:blank' || url === '';
     const isLocal = isAllowedLocalWindowUrl(url, getServerPort(), getLocalIP());
     if (isLocal) {
       return {
         action: 'allow',
         overrideBrowserWindowOptions: {
-          width: 1280,
-          height: 800,
-          title: 'Flo - Kitchen Display',
+          width: isBlank ? 800 : 1280,
+          height: isBlank ? 600 : 800,
+          title: isBlank ? 'Print Receipt' : 'Flo - Kitchen Display',
+          autoHideMenuBar: isBlank,
           webPreferences: {
             contextIsolation: true,
             nodeIntegration: false,

@@ -5,10 +5,13 @@
  */
 
 import fs from 'node:fs';
+import * as os from 'node:os';
 import path from 'node:path';
 import type { Bill, Order, Tenant, OrderItem, Customer, Table } from '../frontend/src/lib/types';
 
-const EVIDENCE_DIR = '/var/folders/y_/1ltcxtwj0zd_w1dg9jv4jl580000gn/T/no-mistakes-evidence/01M08RB2SB8PFH2S5J0748TA3V';
+const EVIDENCE_DIR =
+  process.env.EVIDENCE_DIR ||
+  path.join(os.tmpdir(), 'no-mistakes-evidence', '01M0EAZP7Q6BWADVK3WPM4HZDV');
 
 // Dynamic resolver for frontend modules
 function loadFrontendModules() {
@@ -23,6 +26,8 @@ function loadFrontendModules() {
       resolvedRequest = path.resolve(__dirname, '../main/countries.ts');
     } else if (request.startsWith('@/')) {
       resolvedRequest = path.resolve(__dirname, '../frontend/src', request.slice(2));
+    } else if (request.startsWith('@print/')) {
+      resolvedRequest = path.resolve(__dirname, '../shared/print', request.slice('@print/'.length));
     }
     return originalResolveFilename.call(this, resolvedRequest, parent, isMain, options);
   };
@@ -175,7 +180,7 @@ async function run() {
       includeTaxId: true,
     });
 
-    assert('HTML contains lang="fa" and dir="rtl"', html.includes('<html lang="fa" dir="rtl">'));
+    assert('HTML contains lang="fa-IR" and dir="rtl"', html.includes('<html lang="fa-IR" dir="rtl">'));
     assert('CSS contains RTL logical properties and bidi styles',
       html.includes('.text-end { text-align: end !important; }') &&
       html.includes('.num { unicode-bidi: isolate; white-space: nowrap; }') &&
@@ -333,7 +338,7 @@ async function run() {
       timezone: 'Europe/Lisbon',
     };
     const ptHtml = generateBillHtml(sampleEnBill, ptTenant, { language: 'pt', isReprint: true });
-    assert('PT receipt has lang="pt" and dir="ltr"', ptHtml.includes('<html lang="pt" dir="ltr">'));
+    assert('PT receipt has lang="pt-BR" and dir="ltr"', ptHtml.includes('<html lang="pt-BR" dir="ltr">'));
     assert('PT labels are Portuguese',
       ptHtml.includes('REIMPRESSÃO') &&
       ptHtml.includes('Conta #') &&
@@ -534,9 +539,10 @@ async function run() {
   }
 
   // Use Playwright to capture screenshots of each receipt
+  let browser: any;
   try {
     const playwright = require(path.resolve(__dirname, '../frontend/node_modules/@playwright/test'));
-    const browser = await playwright.chromium.launch({ headless: true });
+    browser = await playwright.chromium.launch({ headless: true });
     const context = await browser.newContext({
       viewport: { width: 480, height: 900 },
       deviceScaleFactor: 2,
@@ -557,9 +563,11 @@ async function run() {
       console.log(`   Captured screenshot artifact: ${pngPath}`);
     }
 
-    await browser.close();
   } catch (err: any) {
+    if (process.env.REQUIRE_VISUAL_EVIDENCE === '1') throw err;
     console.warn(`   Could not capture Playwright screenshot: ${err?.message || err}`);
+  } finally {
+    if (browser) await browser.close().catch(() => undefined);
   }
 
   console.log(`\n==================================================`);

@@ -21,7 +21,7 @@ import { useHeldOrdersStore } from '@/store/held-orders';
 import { useRouter } from 'next/navigation';
 import { useCartStore } from '@/store/cart';
 import { usePosSettingsStore } from '@/store/pos-settings';
-import { useTranslations, type AppConfig } from 'use-intl';
+import { useTranslations, useLocale, type AppConfig } from 'use-intl';
 import { Ltr } from '@/components/layout/Ltr';
 import { useFormatDate } from '@/hooks/useFormatDate';
 import { useWhatsAppReady } from '@/hooks/useWhatsAppReady';
@@ -70,8 +70,7 @@ const paymentStatusBadge: Record<'paid' | 'partial' | 'unpaid', { bg: string; te
   unpaid: { bg: 'bg-red-100', text: 'text-red-700', labelKey: 'unpaidBadge' },
 };
 
-// Typed leaf-key order-type map. The shared ORDER_TYPE_LABEL_KEYS stays dotted
-// for the not-yet-migrated KDS batch (5D), so this page uses a local map.
+// Typed leaf-key order-type map.
 const ORDER_TYPE_KEYS = {
   dine_in: 'dineIn',
   takeaway: 'takeaway',
@@ -123,14 +122,14 @@ export default function OrdersPage() {
   const heldOrdersStore = useHeldOrdersStore();
   const router = useRouter();
   const cartStore = useCartStore();
-  const { setTablesRequired, autoPrintBill, printerUseUnicode } = usePosSettingsStore();
+  const { setTablesRequired, autoPrintBill, printerUseUnicode, printerArabicShaping } = usePosSettingsStore();
   const tOrders = useTranslations('orders');
   const tCommon = useTranslations('common');
   const tNav = useTranslations('nav');
   const tWhatsappSend = useTranslations('whatsapp.send');
 
-  // sendBillViaFlo (shared with PaymentModal) still takes a legacy dotted-key
-  // translator; bridge the typed `whatsapp.send` namespace to that contract.
+  // sendBillViaFlo (shared with PaymentModal) takes a translator callback;
+  // bridge the typed `whatsapp.send` namespace to that contract.
   const whatsappSendT = (key: string): string =>
     tWhatsappSend(
       key.replace(/^whatsapp\.send\./, '') as
@@ -142,6 +141,7 @@ export default function OrdersPage() {
         | 'error.rateLimited',
     );
   const { formatTime, formatDateTime } = useFormatDate();
+  const locale = useLocale();
   const [orders, setOrders] = useState<Order[]>([]);
   const [loading, setLoading] = useState(true);
   const [previewingBillId, setPreviewingBillId] = useState<number | null>(null);
@@ -537,7 +537,7 @@ export default function OrdersPage() {
         const fallbackOrder = orders.find((o) => o.bill?.id === bill.id);
         const { data } = await api.get(`/bills/${bill.id}`);
         const latestBill = preferChildScopedBill(data.bill as Bill, fallbackOrder);
-        await printBill(
+        const printWarnings = await printBill(
           latestBill,
           {
             business_name: currentTenant?.business_name || tCommon('businessNameFallback'),
@@ -550,6 +550,7 @@ export default function OrdersPage() {
           },
           { isReprint: false }
         );
+        showPrintWarningsToast(printWarnings);
         await api.post(`/bills/${bill.id}/print`, { print_type: 'receipt' });
       } catch {
         toast.error(tOrders('receiptPrintFailedHint'));
@@ -606,6 +607,7 @@ export default function OrdersPage() {
       }>('/printers/print-bill', {
         billId,
         useUnicode: printerUseUnicode,
+        arabicShaping: printerArabicShaping,
         isReprint,
         preview: true,
       });
@@ -687,7 +689,8 @@ export default function OrdersPage() {
           currency,
           country: currentTenant?.country || 'IN',
         },
-        { pointsEarned: order.bill.points_earned ?? 0 }
+        { pointsEarned: order.bill.points_earned ?? 0 },
+        locale,
       );
     } catch {
       toast.error(tOrders('whatsappFailed'));
@@ -714,7 +717,8 @@ export default function OrdersPage() {
           country: currentTenant?.country || 'IN',
         },
         whatsappSendT,
-        { pointsEarned: order.bill.points_earned ?? 0 }
+        { pointsEarned: order.bill.points_earned ?? 0 },
+        locale,
       );
     } finally {
       setSendingWaOrderId(null);

@@ -9,6 +9,7 @@ import * as crypto from 'crypto';
 import { BUNDLED_COUNTRY_PACKS, bundledPackVersionId } from './tax-packs/bundled';
 import { SHUTDOWN_TIMEOUT_MS } from './shutdown';
 import { resolveContainedPath } from './lib/path-containment';
+import { serializeMerchantTemplatePayload, validateMerchantTemplateText } from '../shared/print';
 
 let db: Database.Database;
 let dbHealthError: string | null = null;
@@ -351,7 +352,10 @@ export function getDbHealth(): { ok: boolean; error?: string } {
 }
 
 export function getDbPath(): string {
-  const userDataPath = app.isPackaged ? app.getPath('userData') : path.join(__dirname, '../');
+  const projectRoot = path.basename(path.dirname(__dirname)) === 'dist'
+    ? path.resolve(__dirname, '../..')
+    : path.resolve(__dirname, '..');
+  const userDataPath = app.isPackaged ? app.getPath('userData') : projectRoot;
   return path.join(userDataPath, 'flo.db');
 }
 
@@ -3950,6 +3954,107 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
   },
   {
     version: 72,
+    name: 'merchant_print_templates',
+    up: () => {
+      // Tenant-owned semantic receipt templates (#447). Deliberately separate
+      // from installed_print_templates (signed compliance-pack artifacts):
+      // merchant rows are ordinary editable documents and carry NO compliance
+      // trust. The embedded database is single-store, so every row is scoped
+      // to the local business tenant (business_id = 'local').
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS merchant_print_templates (
+          id TEXT PRIMARY KEY,
+          business_id TEXT NOT NULL DEFAULT 'local',
+          name TEXT NOT NULL,
+          origin TEXT NOT NULL DEFAULT 'created' CHECK (origin IN ('created', 'imported', 'cloned')),
+          derived_from TEXT,
+          document_type TEXT NOT NULL DEFAULT 'receipt' CHECK (document_type IN ('receipt')),
+          schema_version INTEGER NOT NULL DEFAULT 1 CHECK (schema_version >= 1),
+          payload_json TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'active', 'archived')),
+          previous_payload_json TEXT,
+          checksum TEXT NOT NULL DEFAULT '',
+          created_by TEXT,
+          updated_by TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_merchant_print_templates_business_status
+          ON merchant_print_templates(business_id, status);
+      `);
+
+      // One-time, idempotent upgrade of the bill_template setting to the
+      // structured selection identity ({ source, id } JSON). Only values that
+      // resolve unambiguously today are upgraded; unrecognized legacy strings
+      // are left untouched and keep resolving during the transition.
+      const current = db.prepare("SELECT value FROM settings WHERE key = 'bill_template'").get() as { value: string } | undefined;
+      const rawValue = typeof current?.value === 'string' ? current.value.trim() : '';
+      if (rawValue.length > 0 && !(rawValue.startsWith('{') && rawValue.endsWith('}'))) {
+        let upgraded: string | null = null;
+        if (['classic', 'compact'].includes(rawValue.toLowerCase())) {
+          upgraded = JSON.stringify({ source: 'core', id: rawValue.toLowerCase() });
+        } else if (db.prepare('SELECT 1 FROM installed_print_templates WHERE template_id = ?').get(rawValue)) {
+          upgraded = JSON.stringify({ source: 'pack', id: rawValue });
+        }
+        if (upgraded) {
+          db.prepare(`
+            INSERT INTO settings (key, value, updated_at) VALUES ('bill_template', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+          `).run(upgraded, now());
+        }
+      }
+    },
+  },
+  {
+    version: 73,
+    name: 'normalize_merchant_template_payloads',
+    up: () => {
+      // #448 moved merchant template persistence onto the CANONICAL payload
+      // serialization (recursively key-sorted, whitespace-free): its sha256 is
+      // both the row's `checksum` column and the offline transfer envelope's
+      // integrity value. Rows written by earlier builds kept client key order,
+      // so their stored text — and therefore their checksum and any envelope
+      // they exported — failed canonical verification on import after the
+      // upgrade. Rewrite each intact row once so every stored payload matches
+      // what checksums hash. Rows whose stored text no longer matches their
+      // checksum (possible tampering) or no longer validates under the current
+      // schema are left untouched, so the existing fail-closed paths keep
+      // surfacing them instead of silently healing or destroying data.
+      const rows = db.prepare(`
+        SELECT id, payload_json, previous_payload_json, checksum
+        FROM merchant_print_templates
+      `).all() as { id: string; payload_json: string; previous_payload_json: string | null; checksum: string }[];
+      let normalized = 0;
+      for (const row of rows) {
+        if (crypto.createHash('sha256').update(row.payload_json, 'utf8').digest('hex') !== row.checksum) continue;
+        const validation = validateMerchantTemplateText(row.payload_json);
+        if (!validation.ok) continue;
+        const payloadJson = serializeMerchantTemplatePayload(validation.payload);
+        let previousPayloadJson = row.previous_payload_json;
+        if (previousPayloadJson !== null) {
+          const previousValidation = validateMerchantTemplateText(previousPayloadJson);
+          if (previousValidation.ok) {
+            previousPayloadJson = serializeMerchantTemplatePayload(previousValidation.payload);
+          }
+        }
+        if (payloadJson === row.payload_json && previousPayloadJson === row.previous_payload_json) continue;
+        db.prepare(`
+          UPDATE merchant_print_templates
+          SET payload_json = ?, previous_payload_json = ?, checksum = ?
+          WHERE id = ?
+        `).run(
+          payloadJson,
+          previousPayloadJson,
+          crypto.createHash('sha256').update(payloadJson, 'utf8').digest('hex'),
+          row.id,
+        );
+        normalized++;
+      }
+      console.log(`[MIGRATION v73] normalized ${normalized} merchant template payload(s); ${rows.length - normalized} already canonical or left untouched`);
+    },
+  },
+  {
+    version: 74,
     name: 'add_cash_shifts',
     up: () => {
       db.exec(`

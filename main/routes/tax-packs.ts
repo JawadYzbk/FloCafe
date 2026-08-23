@@ -4,6 +4,7 @@ import Decimal from 'decimal.js';
 import { getDatabase, getSettingValue, now, upsertSettings, withTxn } from '../db';
 import { requireRole } from '../middleware/security';
 import { TaxEngine } from '../services/tax-engine';
+import { resolveTaxIdFormat } from '../services/tax';
 import type { CountryPack, PluginPrintTemplate, TaxBehavior, TaxCategory, TaxRule } from '../tax-packs/types';
 import { BUNDLED_COUNTRY_PACKS } from '../tax-packs/bundled';
 import {
@@ -589,6 +590,25 @@ export function validationChecklist(
   try { vectorPassed = activationVectorPasses(pack); } catch { vectorPassed = false; }
   add(23, vectorPassed, 'Mandatory component, total, interstate, and rounding vectors are self-consistent');
   add(24, true, 'Activation uses one SQLite transaction and does not modify transactions');
+  let registrationFormatValid = true;
+  if (pack.registrationNumberFormat) {
+    const { pattern, description } = pack.registrationNumberFormat;
+    registrationFormatValid = typeof pattern === 'string' && pattern.length > 0
+      && typeof description === 'string' && description.length > 0;
+    if (registrationFormatValid) {
+      try { new RegExp(pattern, 'i'); } catch { registrationFormatValid = false; }
+    }
+    // A syntactically valid pattern can still be catastrophically slow: the
+    // Settings page runs this pattern against the Tax ID field on every
+    // keystroke (frontend length-bounds the tested value as a backstop, see
+    // TAX_ID_WARNING_MAX_LENGTH), so a pack that ships a classic nested-
+    // quantifier shape — (x+)+, (x*)+, (x+b+)*, etc. — must never activate.
+    // This is a known-shape heuristic, not a formal safety proof (full ReDoS
+    // detection is undecidable in general); it catches the textbook case a
+    // trusted publisher could ship by mistake.
+    if (registrationFormatValid && /\([^()]*[+*][^()]*\)[+*]/.test(pattern)) registrationFormatValid = false;
+  }
+  add(25, registrationFormatValid, 'Registration-number format, if declared, is a well-formed, non-catastrophic pattern and description');
   return { valid: checks.every((check) => check.passed), checks };
 }
 
@@ -896,7 +916,13 @@ router.post('/ensure-country', requireRole('owner', 'manager'), asyncHandler(asy
         .run(definition.defaultCategories.addon);
     });
     upsertSettings({ taxes_enabled: 'true' });
-    return res.json({ enabled: true, country, pack_id: pack.id, version: version.version });
+    return res.json({
+      enabled: true,
+      country,
+      pack_id: pack.id,
+      version: version.version,
+      tax_id_format: resolveTaxIdFormat(country),
+    });
   } catch (error: any) {
     const statusCode = error.statusCode || 502;
     return res.status(statusCode).json({ error: error.message || 'Could not install the country tax plugin' });
