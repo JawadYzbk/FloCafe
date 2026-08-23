@@ -21,17 +21,18 @@
     "build:all-platforms": "npm run build:frontend && npm run build && electron-builder --win --mac --linux",
     "postinstall": "install-electron && electron-builder install-app-deps && npm run verify:electron",
     "verify:electron": "node scripts/verify-electron-runtime.cjs",
+    "verify:release-artifacts": "node scripts/assert-release-artifact-names.cjs",
     "build:win": "npm run build:frontend && npm run build && electron-builder --win",
     "build:appx": "npm run build:frontend && npm run build && electron-builder --win appx --x64 --arm64 --config.npmRebuild=false",
     "build:mac": "npm run build:frontend && npm run build && electron-builder --mac",
     "build:mas": "MAS_BUILD=1 npm run build:frontend && MAS_BUILD=1 npm run build && MAS_BUILD=1 electron-builder --mac mas --universal",
     "build:mas-dev": "MAS_BUILD=1 npm run build:frontend && MAS_BUILD=1 npm run build && MAS_BUILD=1 electron-builder --mac masDev",
     "build:linux": "npm run build:frontend && npm run build && electron-builder --linux",
-    "release:linux": "npm run build:frontend && npm run build && electron-builder --linux --publish always",
-    "release:mac": "npm run build:frontend && npm run build && electron-builder --mac --publish always",
-    "release:win": "npm run build:frontend && npm run build && electron-builder --win --publish always",
-    "pack": "electron-builder --dir",
-    "pretest": "node tests/run-test.cjs npm run test:payment-methods-split && node tests/run-test.cjs npm run test:release-regressions",
+    "release:linux": "npm run build:frontend && npm run build && electron-builder --linux --publish never",
+    "release:mac": "npm run build:frontend && npm run build && electron-builder --mac --publish never",
+    "release:win": "npm run build:frontend && npm run build && electron-builder --win --publish never",
+    "pack": "electron-builder --dir && node scripts/mark-unpacked-artifact.cjs",
+    "pretest": "bash tests/run-test.sh npm run test:payment-methods-split && bash tests/run-test.sh npm run test:release-regressions",
     "start": "electron .",
     "rebuild": "HOME=~/.electron-gyp node-gyp rebuild --target=$(node -p \"require('./node_modules/electron/package.json').version\") --arch=$(node -p \"process.arch\") --dist-url=https://electronjs.org/headers --runtime=electron --directory node_modules/better-sqlite3",
     "test": "node tests/run-test.cjs npm run test:smoke && node tests/run-test.cjs npm run test:server-port-collision && node tests/run-test.cjs npm run test:kds-integration && node tests/run-test.cjs npm run test:kds-contract && node tests/run-test.cjs npm run test:kds-frontend-conflict && node tests/run-test.cjs npm run test:kds-window-hardening && node tests/run-test.cjs npm run test:cors && node tests/run-test.cjs npm run test:csp-lan && node tests/run-test.cjs npm run test:release-config && node tests/run-test.cjs npm run test:telemetry && node tests/run-test.cjs npm run test:first-run && node tests/run-test.cjs npm run test:security && node tests/run-test.cjs npm run test:staff-authz && node tests/run-test.cjs npm run test:orders-authz && node tests/run-test.cjs npm run test:authz-phase3 && node tests/run-test.cjs npm run test:auth-ui-deterministic && node tests/run-test.cjs npm run test:customer-auth && node tests/run-test.cjs npm run test:customer-pagination && node tests/run-test.cjs npm run test:backup && node tests/run-test.cjs npm run test:recovery-cloud && node tests/run-test.cjs npm run test:cloud-account-status && node tests/run-test.cjs npm run test:printer && node tests/run-test.cjs npm run test:printer-width-refresh && node tests/run-test.cjs npm run test:printer-migrations && node tests/run-test.cjs npm run test:print-parity && node tests/run-test.cjs npm run test:merchant-print-templates && node tests/run-test.cjs npm run test:merchant-template-transfer && node tests/run-test.cjs npm run test:print-document && node tests/run-test.cjs npm run test:print-kernel && node tests/run-test.cjs npm run test:translations && node tests/run-test.cjs npm run test:print-labels && node tests/run-test.cjs npm run test:locale-chunks && node tests/run-test.cjs npm run test:rtl-foundation && node tests/run-test.cjs npm run test:rtl-setup-auth-settings && node tests/run-test.cjs npm run test:rtl-dashboard-pos-common && node tests/run-test.cjs npm run test:rtl-kds-server-whatsapp && node tests/run-test.cjs npm run test:phone && node tests/run-test.cjs npm run test:country-localization && node tests/run-test.cjs npm run test:currency && node tests/run-test.cjs npm run test:tax-engine && node tests/run-test.cjs npm run test:tax-components && node tests/run-test.cjs npm run test:tax-pack-catalog && node tests/run-test.cjs npm run test:tax-pack-management && node tests/run-test.cjs npm run test:manual-tax-config && node tests/run-test.cjs npm run test:legacy-tax-pack-digest && node tests/run-test.cjs npm run test:support-ticket && node tests/run-test.cjs npm run test:customer-phone-search && node tests/run-test.cjs npm run test:phone-search-integration && node tests/run-test.cjs npm run test:receipt-column-width && node tests/run-test.cjs npm run test:notes-validation && node tests/run-test.cjs npm run test:receipt-printing && node tests/run-test.cjs npm run test:cancel-override && node tests/run-test.cjs npm run test:kitchen-addons && node tests/run-test.cjs npm run test:order-item-addons && node tests/run-test.cjs npm run test:issue-125-addon-reads && node tests/run-test.cjs npm run test:windows-country-code-crash && node tests/run-test.cjs npm run test:reports-insights && node tests/run-test.cjs npm run test:sequence && node tests/run-test.cjs npm run test:integration-happy && node tests/run-test.cjs npm run test:integration-tax && node tests/run-test.cjs npm run test:integration-payments && node tests/run-test.cjs npm run test:issue-214 && node tests/run-test.cjs npm run test:issue-214-auth && node tests/run-test.cjs npm run test:issue-214-migration && node tests/run-test.cjs npm run test:integration-lifecycle && node tests/run-test.cjs npm run test:integration-reconciliation && node tests/run-test.cjs npm run test:integration-loyalty && node tests/run-test.cjs npm run test:integration-discount && node tests/run-test.cjs npm run test:loyalty-toggle && node tests/run-test.cjs npm run test:discount-system && node tests/run-test.cjs npm run test:integration-discount-settings && node tests/run-test.cjs npm run test:integration-loyalty-global && node tests/run-test.cjs npm run test:issue-248-csv && node tests/run-test.cjs npm run test:integration-loyalty-redemption && node tests/run-test.cjs npm run test:bills-print-api && node tests/run-test.cjs npm run test:issue-24 && node tests/run-test.cjs npm run test:issue-134-routing && node tests/run-test.cjs npm run test:issue-134-mgmt && node tests/run-test.cjs npm run test:issue-137-barcode && node tests/run-test.cjs npm run test:issue-244-product-addon-links && node tests/run-test.cjs npm run test:issue-250-catalog-perf && node tests/run-test.cjs npm run test:issue-258-bill-pagination && node tests/run-test.cjs npm run test:issue-265-morocco-profile && node tests/run-test.cjs npm run test:issue-266-currency-symbol-print && node tests/run-test.cjs npm run test:tables-string-ids && node tests/run-test.cjs npm run test:held-orders && node tests/run-test.cjs npm run test:schema-health && node tests/run-test.cjs npm run test:upgrade-path && node tests/run-test.cjs npm run test:migration-v56-v57 && node tests/run-test.cjs npm run test:migration-v71-repair && node tests/run-test.cjs npm run test:master-pin && node tests/run-test.cjs npm run test:google-drive && node tests/run-test.cjs npm run test:database-tools-api && node tests/run-test.cjs npm run test:phone-validation && node tests/run-test.cjs npm run test:phone-migration && node tests/run-test.cjs npm run test:issue-133-kds-kot-toggles && node tests/run-test.cjs npm run test:whatsapp-schema && node tests/run-test.cjs npm run test:whatsapp-service && node tests/run-test.cjs npm run test:whatsapp-middleware && node tests/run-test.cjs npm run test:issue-127-password-recovery && node tests/run-test.cjs npm run test:dev-tooling && node tests/run-test.cjs npm run test:windows-uninstaller && node tests/run-test.cjs npm run test:shutdown-lifecycle && node tests/run-test.cjs npm run test:redos-hardening && node tests/run-test.cjs npm run test:startup-cache && node tests/run-test.cjs npm run test:issue-389-timezone-override && node tests/run-test.cjs npm run test:issue-390-locale-preference-invariants",
@@ -55,9 +56,10 @@
     "test:kds-frontend-conflict": "ts-node --transpile-only -P tests/tsconfig.json tests/kds-frontend-conflict.test.ts",
     "test:kds-window-hardening": "ts-node --transpile-only -P tests/tsconfig.json tests/kds-window-hardening.test.ts",
     "test:e2e": "npm run build && npm run build:frontend && cd frontend && npx playwright install chromium && npx playwright test",
-    "test:release-config": "ts-node --transpile-only -P tests/tsconfig.json tests/release-config.test.ts && ts-node --transpile-only -P tests/tsconfig.json tests/verify-electron-runtime-xattr.test.ts",
+    "test:release-config": "ts-node --transpile-only -P tests/tsconfig.json tests/release-config.test.ts && ts-node --transpile-only -P tests/tsconfig.json tests/verify-electron-runtime-xattr.test.ts && node tests/release-asset-verifier.test.cjs",
     "test:windows-uninstaller": "node tests/run-windows-uninstaller-tests.cjs",
     "test:telemetry": "node tests/run-electron-node-test.cjs tests/telemetry-delivery.test.ts",
+    "test:country-provenance": "node tests/run-electron-node-test.cjs tests/country-provenance.test.ts",
     "test:static-routes": "ts-node --transpile-only -P tests/tsconfig.json tests/path-containment.test.ts && node tests/run-electron-node-test.cjs tests/static-route-resolution.test.ts",
     "test:notes-validation": "ts-node --transpile-only -P tests/tsconfig.json tests/order-notes-validation.test.ts",
     "test:first-run": "node tests/run-electron-node-test.cjs tests/first-run-setup.test.ts && node tests/run-electron-node-test.cjs tests/setup-failure-recovery.test.ts",
@@ -157,6 +159,7 @@
     "test:phone": "ts-node --transpile-only -P tests/tsconfig.json tests/phone.test.ts",
     "test:country-localization": "ts-node --transpile-only -P tests/tsconfig.json tests/country-localization.test.ts",
     "test:currency": "ts-node --transpile-only -P tests/tsconfig.json tests/currency.test.ts && ts-node --transpile-only -P tests/tsconfig.json tests/country-profile.test.ts && ts-node --transpile-only -P tests/tsconfig.json tests/locale-iran.test.ts",
+    "test:update-state": "ts-node --transpile-only -P tests/tsconfig.json tests/update-state.test.ts",
     "test:tax-engine": "ts-node --transpile-only -P tests/tsconfig.json tests/tax-engine.test.ts",
     "test:tax-components": "ts-node --transpile-only -P tests/tsconfig.json tests/tax-components.test.ts",
     "test:tax-pack-catalog": "ts-node --transpile-only -P tests/tsconfig.json tests/tax-pack-catalog.test.ts",
@@ -207,6 +210,7 @@
     "electron": "^43.4.0",
     "electron-builder": "^26.15.3",
     "eslint": "^10.8.1",
+    "js-yaml": "^4.3.1",
     "supertest": "^7.2.2",
     "ts-node": "^10.9.2",
     "typescript": "^5.4.5"
@@ -250,8 +254,11 @@
       "provider": "github",
       "owner": "FreeOpenSourcePOS",
       "repo": "FloCafe",
-      "releaseType": "release"
+      "releaseType": "release",
+      "channel": "latest"
     },
+    "detectUpdateChannel": false,
+    "generateUpdatesFilesForAllChannels": true,
     "extraResources": [
       {
         "from": "assets",
@@ -379,7 +386,7 @@
       "icon": "assets",
       "category": "Office",
       "executableName": "flocafe",
-      "artifactName": "flocafe-${version}-${arch}.${ext}",
+      "artifactName": "flocafe-${version}-linux.${ext}",
       "extraFiles": [
         {
           "from": "assets/com.flo.desktop.metainfo.xml",
@@ -399,6 +406,9 @@
           "StartupWMClass": "flo-desktop"
         }
       }
+    },
+    "appImage": {
+      "artifactName": "flocafe-${version}-linux.appimage"
     },
     "snapcraft": {
       "base": "core24",
