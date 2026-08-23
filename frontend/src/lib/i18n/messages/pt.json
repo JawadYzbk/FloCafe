@@ -1666,7 +1666,9 @@
     "rateAutoFailed": "Não foi possível obter uma taxa ao vivo — insira manualmente",
     "fxRefreshLabel": "Atualizar taxas ao vivo a cada",
     "fxRefreshHint": "0 = apenas quando você toca em Atualizar taxas ao vivo.",
-    "minutesShort": "min"
+    "minutesShort": "min",
+    "rateHistory": "Histórico de taxas",
+    "noRateHistory": "Ainda sem histórico"
   },
   "setup": {
     "alreadyCompleted": "A configuração já foi concluída nesta instalação. Redirecionando para o login…",

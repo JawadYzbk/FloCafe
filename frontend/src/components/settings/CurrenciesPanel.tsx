@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { Coins, Plus, RefreshCw, Trash2, Save } from 'lucide-react';
+import { Coins, Plus, RefreshCw, Trash2, Save, History } from 'lucide-react';
 import api from '@/lib/api';
 import toast from 'react-hot-toast';
 import { Button } from '@/components/ui/button';
@@ -89,6 +89,24 @@ export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
 
   const setRow = (idx: number, changes: Partial<Row>) =>
     setRows((old) => old.map((r, i) => (i === idx ? { ...r, ...changes } : r)));
+
+  // Standalone exchange-rate trail (see GET /settings/currencies/rate-history).
+  const [historyCode, setHistoryCode] = useState<string | null>(null);
+  const [historyRows, setHistoryRows] = useState<Array<{ rate: number; source: string; recorded_at: string }>>([]);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+  const toggleHistory = async (code: string) => {
+    if (historyCode === code) { setHistoryCode(null); return; }
+    setHistoryCode(code);
+    setLoadingHistory(true);
+    try {
+      const { data } = await api.get('/settings/currencies/rate-history', { params: { code, limit: 20 } });
+      setHistoryRows(Array.isArray(data?.history) ? data.history : []);
+    } catch {
+      setHistoryRows([]);
+    } finally {
+      setLoadingHistory(false);
+    }
+  };
 
   // When a currency is switched to the live (Frankfurter) source, fetch and
   // fill the current base -> code rate immediately so the owner sees the real
@@ -306,6 +324,27 @@ export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
                       defaultValue: `1 ${baseCurrency} ≈ ${row.rate} ${row.code} → charged ${preview.rounded} ${row.code}`,
                     })}
                   </p>
+                )}
+
+                <button type="button" onClick={() => toggleHistory(row.code)} className="flex items-center gap-1 text-[11px] font-medium text-gray-400 hover:text-brand transition-colors">
+                  <History size={11} /> {t('settings.rateHistory', { defaultValue: 'Rate history' })}
+                </button>
+                {historyCode === row.code && (
+                  <div className="rounded-lg bg-gray-50 border border-gray-100 p-2 space-y-1 text-[11px]">
+                    {loadingHistory ? (
+                      <p className="text-gray-400">…</p>
+                    ) : historyRows.length === 0 ? (
+                      <p className="text-gray-400">{t('settings.noRateHistory', { defaultValue: 'No history yet' })}</p>
+                    ) : historyRows.map((h, i) => (
+                      <div key={i} className="flex flex-wrap justify-between gap-x-2 text-gray-500">
+                        <span dir="ltr">1 {row.code === baseCurrency ? row.code : baseCurrency} = {Number(h.rate).toLocaleString()} {row.code}</span>
+                        <span className="text-gray-400">
+                          {h.source === 'frankfurter' ? t('settings.rateAuto', { defaultValue: 'Live' }) : t('settings.rateManual', { defaultValue: 'Manual' })}
+                          {' · '}{new Date(h.recorded_at.replace(' ', 'T') + 'Z').toLocaleString()}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
                 )}
               </div>
             );

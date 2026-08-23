@@ -17,6 +17,7 @@ import {
   saveSecondaryCurrencies,
   isFrankfurterSupported,
   getFxRefreshMinutes,
+  recordExchangeRate,
 } from '../currency-config';
 import { now } from '../db';
 import type { SecondaryCurrency } from '../countries';
@@ -91,6 +92,7 @@ export async function refreshRates(): Promise<number> {
       const fresh = rates[currency.code];
       if (!Number.isFinite(fresh) || fresh <= 0) return currency;
       updated += 1;
+      recordExchangeRate(base, currency.code, fresh, 'frankfurter');
       return { ...currency, rate: fresh, rate_updated_at: timestamp };
     });
 

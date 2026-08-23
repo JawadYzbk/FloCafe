@@ -10,7 +10,7 @@
  * malformed row can never reach the authoritative money math.
  */
 
-import { getSettingValue, upsertSettings } from './db';
+import { getSettingValue, upsertSettings, getDatabase, now } from './db';
 import {
   normalizeRoundingRule,
   type SecondaryCurrency,
@@ -102,6 +102,48 @@ export function getSecondaryCurrency(code: string): SecondaryCurrency | undefine
 
 export function saveSecondaryCurrencies(currencies: SecondaryCurrency[]): void {
   upsertSettings({ secondary_currencies: serializeSecondaryCurrencies(currencies) });
+}
+
+/**
+ * Append a rate to the exchange_rate_history log, but only when it differs from
+ * the currency's most recent entry — so a poll that returns an unchanged rate
+ * doesn't spam the log. Best-effort: never throws (history must not block a
+ * refresh or a settings save).
+ */
+export function recordExchangeRate(
+  baseCurrency: string,
+  currency: string,
+  rate: number,
+  source: 'manual' | 'frankfurter',
+): void {
+  try {
+    if (!(Number.isFinite(rate) && rate > 0)) return;
+    const db = getDatabase();
+    const base = String(baseCurrency || '').toUpperCase();
+    const code = String(currency || '').toUpperCase();
+    if (!base || !code) return;
+    const last = db
+      .prepare('SELECT rate, base_currency FROM exchange_rate_history WHERE currency = ? ORDER BY id DESC LIMIT 1')
+      .get(code) as { rate: number; base_currency: string } | undefined;
+    if (last && Number(last.rate) === rate && String(last.base_currency).toUpperCase() === base) return;
+    db.prepare(
+      'INSERT INTO exchange_rate_history (base_currency, currency, rate, source, recorded_at) VALUES (?, ?, ?, ?, ?)',
+    ).run(base, code, rate, source, now());
+  } catch { /* non-fatal: rate history is best-effort */ }
+}
+
+/** Recent exchange-rate history for a currency (newest first). */
+export function getExchangeRateHistory(currency: string, limit = 50): Array<{ base_currency: string; currency: string; rate: number; source: string; recorded_at: string }> {
+  try {
+    const db = getDatabase();
+    const code = String(currency || '').toUpperCase();
+    const capped = Math.min(Math.max(1, Math.floor(limit) || 50), 500);
+    return db
+      .prepare('SELECT base_currency, currency, rate, source, recorded_at FROM exchange_rate_history WHERE currency = ? ORDER BY id DESC LIMIT ?')
+      .all(code, capped) as Array<{ base_currency: string; currency: string; rate: number; source: string; recorded_at: string }>;
+  } catch {
+    return [];
+  }
 }
 
 /** Default auto-refresh cadence for live rates (minutes). ECB publishes ~daily,

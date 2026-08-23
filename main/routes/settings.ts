@@ -16,6 +16,8 @@ import {
   serializeSecondaryCurrencies,
   FRANKFURTER_CURRENCIES,
   getFxRefreshMinutes,
+  recordExchangeRate,
+  getExchangeRateHistory,
 } from '../currency-config';
 import { refreshRates, fetchFrankfurterRates, fxRateService } from '../services/fx-rate';
 import { getHttpRequestSignal, trackHttpRequestWork } from '../shutdown';
@@ -378,6 +380,8 @@ router.put('/currencies', requireRole('owner', 'manager'), (req: Request, res: R
         }
         seen.add(parsed.code);
         if (parsed.rate_source === 'frankfurter') hasFrankfurter = true;
+        // Log the rate into the standalone history (dedupes unchanged rates).
+        recordExchangeRate(effectiveBase, parsed.code, parsed.rate, parsed.rate_source === 'frankfurter' ? 'frankfurter' : 'manual');
         cleaned.push(parsed);
       }
       serialized = serializeSecondaryCurrencies(cleaned);
@@ -439,6 +443,23 @@ router.get('/currencies/live-rate', requireRole('owner', 'manager'), asyncHandle
   }
   res.json({ base, code, rate });
 }));
+
+// Standalone exchange-rate trail for a currency (newest first), so the owner
+// can audit how a rate moved over time. Per-order rates at sale time live on
+// bills.payment_details; this is the independent rate log.
+router.get('/currencies/rate-history', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+  try {
+    const code = String(req.query.code || '').toUpperCase();
+    if (!isValidCurrencyCode(code)) {
+      return res.status(400).json({ error: 'Invalid currency code' });
+    }
+    const limit = Number(req.query.limit) || 50;
+    res.json({ currency: code, history: getExchangeRateHistory(code, limit) });
+  } catch (error: any) {
+    console.error('[API] Internal error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 router.get('/tax', requireRole('owner', 'manager', 'cashier', 'server', 'chef'), (req: Request, res: Response) => {
   try {

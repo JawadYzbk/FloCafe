@@ -1666,7 +1666,9 @@
     "rateAutoFailed": "Could not fetch a live rate — enter it manually",
     "fxRefreshLabel": "Auto-update live rates every",
     "fxRefreshHint": "0 = only when you tap Refresh live rates.",
-    "minutesShort": "min"
+    "minutesShort": "min",
+    "rateHistory": "Rate history",
+    "noRateHistory": "No history yet"
   },
   "setup": {
     "alreadyCompleted": "Setup has already been completed on this install. Redirecting to login…",

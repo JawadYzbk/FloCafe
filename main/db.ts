@@ -4095,6 +4095,29 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
       `);
     },
   },
+  {
+    version: 75,
+    name: 'add_exchange_rate_history',
+    up: () => {
+      // Append-only log of secondary-currency exchange rates over time, so the
+      // owner can audit what a currency was worth at any point. Each order's
+      // rate at sale time is already captured on bills.payment_details
+      // (tender_currency/exchange_rate); this table is the standalone rate
+      // trail (live refreshes and manual edits), independent of any sale.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS exchange_rate_history (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          base_currency TEXT NOT NULL,
+          currency TEXT NOT NULL,
+          rate REAL NOT NULL,
+          source TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual', 'frankfurter')),
+          recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_exchange_rate_history_currency
+          ON exchange_rate_history(currency, recorded_at);
+      `);
+    },
+  },
 ];
 
 function syncBackupBeforeMigration(fromVersion: number, toVersion: number): void {
