@@ -267,7 +267,11 @@ function createWindow(): void {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      // Chromium renderer sandbox. Safe to enable because the preload
+      // (main/preload.ts) is a narrow contextBridge allowlist that only uses
+      // `electron` (contextBridge/ipcRenderer) and `process.platform` — all
+      // available to sandboxed preloads — with no fs/path/Node-module access.
+      sandbox: true,
     },
     show: false,
   });

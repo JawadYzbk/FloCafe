@@ -2,6 +2,18 @@ import axios from 'axios';
 
 let authRedirectInProgress = false;
 
+// Default request timeout so a wedged/slow request can't hang a UI flow
+// forever (the backend runs synchronous better-sqlite3 on its event loop, so a
+// heavy query elsewhere can stall responses under load). Applied per-request in
+// the interceptor below.
+const DEFAULT_TIMEOUT_MS = 30_000;
+
+// Endpoints that legitimately run longer than the default — large database
+// backups/imports/restores, CSV menu imports, and cloud (Google Drive) uploads.
+// These keep their previous no-timeout behavior so a big or slow operation is
+// never aborted mid-flight.
+const NO_TIMEOUT_PATH = /(?:\/db\/(?:backup|import|restore)\b|\/db-tools\/|\/menu-csv\/import\b|\/settings\/google-drive\/)/;
+
 // Derived from the page's own origin (not a build-time env var) so LAN
 // clients that load the app via the server's IP — e.g. http://192.168.1.5:3001 —
 // talk back to that same host instead of a hardcoded "localhost", which would
@@ -23,6 +35,12 @@ api.interceptors.request.use((config) => {
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
     }
+  }
+  // Apply the default timeout unless the caller set one explicitly, exempting
+  // the known long-running endpoints. (0/undefined both mean "no timeout" to
+  // axios; no current caller passes an explicit timeout through this client.)
+  if (!config.timeout) {
+    config.timeout = NO_TIMEOUT_PATH.test(config.url || '') ? 0 : DEFAULT_TIMEOUT_MS;
   }
   return config;
 });

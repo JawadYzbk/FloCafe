@@ -3,7 +3,7 @@
  * CI test sharding for the FloCafe "Core test suite" (`npm test`).
  *
  * The canonical, ordered suite list lives in package.json's "test" script as a
- * chain of `bash tests/run-test.sh npm run test:<name>` invocations. This helper
+ * chain of `node tests/run-test.cjs npm run test:<name>` invocations. This helper
  * reads that script at run time (so there is no second list to drift), assigns
  * suites to shards round-robin by position, and runs this shard's subset with
  * the same `run-test.sh` wrapper that `npm test` uses.
@@ -66,7 +66,7 @@ console.log(
 let failed = false;
 for (const suite of mine) {
   console.log(`\n=== [shard ${index}] ${suite} ===`);
-  const result = spawnSync('bash', ['tests/run-test.sh', 'npm', 'run', suite], {
+  const result = spawnSync(process.execPath, ['tests/run-test.cjs', 'npm', 'run', suite], {
     stdio: 'inherit',
     env: process.env,
   });

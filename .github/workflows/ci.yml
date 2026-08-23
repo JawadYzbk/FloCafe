@@ -165,7 +165,7 @@ jobs:
 
       - name: Payment method split checks (npm pretest)
         if: matrix.shard == 0
-        run: bash tests/run-test.sh npm run test:payment-methods-split
+        run: node tests/run-test.cjs npm run test:payment-methods-split
 
       - name: Core test suite (shard ${{ matrix.shard }})
         # The suite list is derived from package.json's "test" script at run
