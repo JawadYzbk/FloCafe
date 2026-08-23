@@ -1668,7 +1668,9 @@
     "fxRefreshHint": "0 = solo cuando tocas Actualizar tasas en vivo.",
     "minutesShort": "min",
     "rateHistory": "Historial de tasas",
-    "noRateHistory": "Aún no hay historial"
+    "noRateHistory": "Aún no hay historial",
+    "liveBaseUnsupported": "Las tasas en vivo requieren una moneda base compatible con Frankfurter.",
+    "liveNotSupported": "No está en Frankfurter — solo tasa manual."
   },
   "setup": {
     "alreadyCompleted": "La configuración ya se completó en esta instalación. Redirigiendo al inicio de sesión…",

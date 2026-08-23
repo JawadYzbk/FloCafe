@@ -1668,7 +1668,9 @@
     "fxRefreshHint": "0 = only when you tap Refresh live rates.",
     "minutesShort": "min",
     "rateHistory": "Rate history",
-    "noRateHistory": "No history yet"
+    "noRateHistory": "No history yet",
+    "liveBaseUnsupported": "Live rates need a base currency Frankfurter supports.",
+    "liveNotSupported": "Not on Frankfurter — manual rate only."
   },
   "setup": {
     "alreadyCompleted": "Setup has already been completed on this install. Redirecting to login…",

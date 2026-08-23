@@ -1623,7 +1623,9 @@
     "fxRefreshHint": "0 = فقط عند الضغط على تحديث الأسعار المباشرة.",
     "minutesShort": "دقيقة",
     "rateHistory": "سجل الأسعار",
-    "noRateHistory": "لا يوجد سجل بعد"
+    "noRateHistory": "لا يوجد سجل بعد",
+    "liveBaseUnsupported": "تتطلب الأسعار المباشرة عملة أساسية يدعمها Frankfurter.",
+    "liveNotSupported": "غير متوفر في Frankfurter — سعر يدوي فقط."
   },
   "setup": {
     "alreadyCompleted": "تم إكمال الإعداد بالفعل على هذا التثبيت. جارٍ التحويل إلى تسجيل الدخول…",

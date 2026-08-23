@@ -276,6 +276,11 @@ export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
                         <SelectItem value="frankfurter" disabled={!canAuto || !baseSupportsLive}>{t('settings.rateAuto', { defaultValue: 'Live (Frankfurter)' })}</SelectItem>
                       </SelectContent>
                     </Select>
+                    {!baseSupportsLive
+                      ? <p className="text-[11px] text-amber-600">{t('settings.liveBaseUnsupported', { defaultValue: 'Live rates need a base currency Frankfurter supports.' })}</p>
+                      : !canAuto
+                        ? <p className="text-[11px] text-amber-600">{t('settings.liveNotSupported', { defaultValue: 'Not on Frankfurter — manual rate only.' })}</p>
+                        : null}
                   </div>
                   <label className="text-xs text-gray-500 space-y-1">
                     <span className="flex items-center gap-1.5">

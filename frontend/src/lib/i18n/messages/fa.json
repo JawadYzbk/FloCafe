@@ -1668,7 +1668,9 @@
     "fxRefreshHint": "۰ = فقط وقتی روی به‌روزرسانی نرخ زنده بزنید.",
     "minutesShort": "دقیقه",
     "rateHistory": "تاریخچه نرخ",
-    "noRateHistory": "هنوز تاریخچه‌ای نیست"
+    "noRateHistory": "هنوز تاریخچه‌ای نیست",
+    "liveBaseUnsupported": "نرخ زنده به ارز پایه‌ای نیاز دارد که Frankfurter پشتیبانی کند.",
+    "liveNotSupported": "در Frankfurter نیست — فقط نرخ دستی."
   },
   "setup": {
     "alreadyCompleted": "راه‌اندازی در این نصب پیش‌تر انجام شده است. در حال بازگشت به ورود…",
