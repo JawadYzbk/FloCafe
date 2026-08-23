@@ -4,8 +4,25 @@ import { getDatabase, getSettingValue, parseDbTimestamp, utcDayBounds, utcTodayD
 import { requireRole } from '../middleware/security';
 import { getOrdersWithItemsForBills } from './bills';
 import { aggregateTaxComponents } from '../services/tax-components';
+import {
+  resolveRange, reportMeta, buildOverview,
+  salesSummary, dailySales, hourlySales, dayOfWeekSales,
+  productSales, categorySales, modifierSales,
+  orderTypeBreakdown, orderStatusBreakdown, discountReport, voidReport, staffSales,
+  paymentBreakdown, expensesSummary, profitAndLoss, storeTzOffset,
+} from '../services/reports';
 
 const router = Router();
+
+/** Resolve a report window (+ optional comparison) from query params. */
+function resolvedRange(req: Request) {
+  return resolveRange({
+    preset: typeof req.query.preset === 'string' ? req.query.preset : undefined,
+    start_date: req.query.start_date,
+    end_date: req.query.end_date,
+    compare: req.query.compare,
+  });
+}
 
 const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
@@ -596,5 +613,36 @@ router.get('/insights', requireRole('owner', 'manager'), (req: Request, res: Res
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
+// ── Reporting engine endpoints (main/services/reports) ───────────────────────
+// Thin handlers: resolve the window, call the authoritative engine, return it.
+// All are owner/manager (financial data). Every response carries `meta` (range,
+// timezone, generatedAt) so the UI and exports agree on the window.
+
+const ownerManager = requireRole('owner', 'manager');
+function withMeta<T extends object>(req: Request, build: (bounds: [string, string], range: { startDate: string; endDate: string }, tz: number) => T) {
+  const r = resolvedRange(req);
+  return { meta: reportMeta(r), ...build(r.bounds, r.range, storeTzOffset()) } as { meta: ReturnType<typeof reportMeta> } & T;
+}
+function guard(res: Response, fn: () => unknown) {
+  try { res.json(fn()); } catch (error: any) { console.error('[API] Internal error:', error); res.status(500).json({ error: 'Internal server error' }); }
+}
+
+// Executive overview / dashboard — everything from one window.
+router.get('/overview', ownerManager, (req, res) => guard(res, () => buildOverview(getDatabase(), resolvedRange(req))));
+
+router.get('/sales-summary', ownerManager, (req, res) => guard(res, () => withMeta(req, (b) => ({ summary: salesSummary(getDatabase(), b[0], b[1]) }))));
+router.get('/daily', ownerManager, (req, res) => guard(res, () => withMeta(req, (b) => ({ daily: dailySales(getDatabase(), b[0], b[1]) }))));
+router.get('/hourly', ownerManager, (req, res) => guard(res, () => withMeta(req, (b, _r, tz) => ({ hourly: hourlySales(getDatabase(), b[0], b[1], tz) }))));
+router.get('/day-of-week', ownerManager, (req, res) => guard(res, () => withMeta(req, (b, _r, tz) => ({ dayOfWeek: dayOfWeekSales(getDatabase(), b[0], b[1], tz) }))));
+router.get('/products', ownerManager, (req, res) => guard(res, () => withMeta(req, (b) => ({ products: productSales(getDatabase(), b[0], b[1]) }))));
+router.get('/categories', ownerManager, (req, res) => guard(res, () => withMeta(req, (b) => ({ categories: categorySales(getDatabase(), b[0], b[1]) }))));
+router.get('/modifiers', ownerManager, (req, res) => guard(res, () => withMeta(req, (b) => ({ modifiers: modifierSales(getDatabase(), b[0], b[1]) }))));
+router.get('/order-types', ownerManager, (req, res) => guard(res, () => withMeta(req, (b) => ({ orderTypes: orderTypeBreakdown(getDatabase(), b[0], b[1]), orderStatuses: orderStatusBreakdown(getDatabase(), b[0], b[1]) }))));
+router.get('/discounts', ownerManager, (req, res) => guard(res, () => withMeta(req, (b) => ({ discounts: discountReport(getDatabase(), b[0], b[1]) }))));
+router.get('/voids', ownerManager, (req, res) => guard(res, () => withMeta(req, (b) => ({ voids: voidReport(getDatabase(), b[0], b[1]) }))));
+router.get('/staff', ownerManager, (req, res) => guard(res, () => withMeta(req, (b) => ({ staff: staffSales(getDatabase(), b[0], b[1]) }))));
+router.get('/payments', ownerManager, (req, res) => guard(res, () => withMeta(req, (b) => ({ payments: paymentBreakdown(getDatabase(), b[0], b[1]) }))));
+router.get('/profit-loss', ownerManager, (req, res) => guard(res, () => withMeta(req, (b, r) => ({ profit: profitAndLoss(getDatabase(), b, r), expenses: expensesSummary(getDatabase(), r.startDate, r.endDate) }))));
 
 export const reportRoutes = router;

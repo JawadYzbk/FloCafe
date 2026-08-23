@@ -87,6 +87,7 @@
     "test:issue-125-addon-reads": "node tests/run-electron-node-test.cjs tests/issue-125-addon-read-paths.test.ts",
     "test:windows-country-code-crash": "node tests/run-electron-node-test.cjs tests/issue-windows-country-code-crash.test.ts",
     "test:reports-insights": "node tests/run-electron-node-test.cjs tests/reports-insights.test.ts",
+    "test:reports-engine": "node tests/run-electron-node-test.cjs tests/reports-engine.test.ts",
     "test:integration-happy": "node tests/run-electron-node-test.cjs tests/integration-happy-path.test.ts",
     "test:integration-tax": "node tests/run-electron-node-test.cjs tests/integration-tax.test.ts",
     "test:integration-payments": "node tests/run-electron-node-test.cjs tests/integration-payments.test.ts",
