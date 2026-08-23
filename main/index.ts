@@ -283,9 +283,12 @@ function createWindow(): void {
     }
   });
 
-  // Always load from the embedded Express server (serves static Next.js export).
-  // This avoids file:// protocol issues and keeps dev/prod behaviour identical.
-  mainWindow.loadURL(`http://localhost:${getServerPort()}`);
+  // Normally load from the embedded Express server (serves the static Next.js
+  // export). `npm run hot` sets FLO_DEV_URL to a running Next dev server so the
+  // window gets fast refresh; that dev server proxies /api back to this
+  // process's Express (see frontend/next.config.ts rewrites).
+  const startUrl = process.env.FLO_DEV_URL || `http://localhost:${getServerPort()}`;
+  mainWindow.loadURL(startUrl);
 
   // Allow target="_blank" links to open new windows for local URLs (e.g. the KDS page)
   // and blank popup windows (e.g. browser print popups). External URLs are sent to the system browser.
