@@ -296,7 +296,9 @@
     "uptimeLabel": "التشغيل: ",
     "user": "المستخدم",
     "whatsapp": "واتساب",
-    "shift": "الوردية"
+    "shift": "الوردية",
+    "reports": "التقارير",
+    "expenses": "المصاريف"
   },
   "orders": {
     "active": "نشط",
@@ -2284,5 +2286,43 @@
       "wrapHint": "إذا التفّ السطر التالي، اختر قيمة أعمدة أصغر.",
       "success": "إذا كنت تستطيع قراءة هذا، فطابعتك تعمل!"
     }
+  },
+  "expenses": {
+    "title": "المصاريف",
+    "addExpense": "إضافة مصروف",
+    "editExpense": "تعديل المصروف",
+    "totalSpent": "إجمالي المصروف",
+    "from": "من",
+    "to": "إلى",
+    "category": "الفئة",
+    "allCategories": "كل الفئات",
+    "clearFilters": "مسح",
+    "date": "التاريخ",
+    "description": "الوصف",
+    "staff": "الموظف",
+    "amount": "المبلغ",
+    "actions": "إجراءات",
+    "empty": "لا توجد مصاريف مسجلة",
+    "selectStaff": "اختر موظفًا",
+    "paymentMethod": "دُفع عبر",
+    "paymentMethodPlaceholder": "مثل: نقدًا، بنك",
+    "notes": "ملاحظات",
+    "deleteConfirm": "حذف هذا المصروف؟",
+    "amountInvalid": "أدخل مبلغًا صالحًا",
+    "saved": "تم حفظ المصروف",
+    "saveFailed": "تعذّر حفظ المصروف",
+    "deleted": "تم حذف المصروف",
+    "deleteFailed": "تعذّر حذف المصروف",
+    "loadFailed": "تعذّر تحميل المصاريف",
+    "catSalary": "راتب",
+    "catRent": "إيجار",
+    "catUtilities": "مرافق",
+    "catSupplies": "لوازم",
+    "catInventory": "مخزون",
+    "catMaintenance": "صيانة",
+    "catMarketing": "تسويق",
+    "catFees": "رسوم",
+    "catTax": "ضريبة",
+    "catOther": "أخرى"
   }
 }
