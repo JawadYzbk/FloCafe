@@ -15,8 +15,9 @@ import {
   parseSecondaryCurrenciesJson,
   serializeSecondaryCurrencies,
   FRANKFURTER_CURRENCIES,
+  getFxRefreshMinutes,
 } from '../currency-config';
-import { refreshRates, fetchFrankfurterRates } from '../services/fx-rate';
+import { refreshRates, fetchFrankfurterRates, fxRateService } from '../services/fx-rate';
 import { getHttpRequestSignal, trackHttpRequestWork } from '../shutdown';
 import { asyncHandler } from '../middleware/async-handler';
 import { normalizeOptionalPhone } from '../lib/phone';
@@ -310,6 +311,8 @@ function currenciesShape(s: Record<string, string>) {
     secondary_currencies: parseSecondaryCurrenciesJson(s.secondary_currencies),
     // Currencies Frankfurter can auto-quote; anything else must use a manual rate.
     frankfurter_currencies: [...FRANKFURTER_CURRENCIES],
+    // Background poll cadence for live rates (minutes; 0 = manual only).
+    fx_refresh_minutes: getFxRefreshMinutes(),
   };
 }
 
@@ -324,7 +327,7 @@ router.get('/currencies', requireRole('owner', 'manager', 'cashier', 'server', '
 
 router.put('/currencies', requireRole('owner', 'manager'), (req: Request, res: Response) => {
   try {
-    const { base_currency, secondary_currencies } = req.body;
+    const { base_currency, secondary_currencies, fx_refresh_minutes } = req.body;
     const db = getDatabase();
     const current = getAllSettings(db);
 
@@ -333,6 +336,17 @@ router.put('/currencies', requireRole('owner', 'manager'), (req: Request, res: R
       : (isValidCurrencyCode(current.base_currency) ? current.base_currency : (current.currency || 'INR')).toUpperCase());
     if (!isValidCurrencyCode(effectiveBase)) {
       return res.status(400).json({ error: 'Invalid base currency code' });
+    }
+
+    // Live-rate poll cadence (minutes; 0 = manual only). Cap at a week so a
+    // typo can't effectively disable polling for months.
+    let fxMinutes: number | undefined;
+    if (fx_refresh_minutes !== undefined) {
+      const n = Number(fx_refresh_minutes);
+      if (!Number.isFinite(n) || n < 0) {
+        return res.status(400).json({ error: 'fx_refresh_minutes must be a non-negative number of minutes' });
+      }
+      fxMinutes = Math.min(Math.floor(n), 7 * 24 * 60);
     }
 
     let serialized: string | undefined;
@@ -377,7 +391,12 @@ router.put('/currencies', requireRole('owner', 'manager'), (req: Request, res: R
       // app instead of the country-derived default.
       currency: base_currency !== undefined ? effectiveBase : undefined,
       secondary_currencies: serialized,
+      fx_refresh_minutes: fxMinutes !== undefined ? String(fxMinutes) : undefined,
     });
+
+    // Re-arm the background poll with the new cadence so it takes effect
+    // immediately (no app restart).
+    if (fxMinutes !== undefined) fxRateService.schedule();
 
     // Pull fresh Frankfurter rates in the background so a newly-added auto
     // currency shows a live rate promptly. Offline/failure is a no-op.

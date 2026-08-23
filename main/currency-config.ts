@@ -103,3 +103,19 @@ export function getSecondaryCurrency(code: string): SecondaryCurrency | undefine
 export function saveSecondaryCurrencies(currencies: SecondaryCurrency[]): void {
   upsertSettings({ secondary_currencies: serializeSecondaryCurrencies(currencies) });
 }
+
+/** Default auto-refresh cadence for live rates (minutes). ECB publishes ~daily,
+ *  so 6h is ample, but the owner can poll more/less often or disable it. */
+export const DEFAULT_FX_REFRESH_MINUTES = 360;
+
+/**
+ * How often (in minutes) to auto-poll Frankfurter for fresh rates. `0` disables
+ * background polling entirely (manual "Refresh live rates" only). A configured
+ * value is clamped to at least 1 minute.
+ */
+export function getFxRefreshMinutes(): number {
+  const raw = Number(getSettingValue('fx_refresh_minutes'));
+  if (!Number.isFinite(raw)) return DEFAULT_FX_REFRESH_MINUTES;
+  if (raw <= 0) return 0;
+  return Math.max(1, Math.floor(raw));
+}

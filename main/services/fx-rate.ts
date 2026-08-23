@@ -16,6 +16,7 @@ import {
   getSecondaryCurrencies,
   saveSecondaryCurrencies,
   isFrankfurterSupported,
+  getFxRefreshMinutes,
 } from '../currency-config';
 import { now } from '../db';
 import type { SecondaryCurrency } from '../countries';
@@ -23,7 +24,6 @@ import type { SecondaryCurrency } from '../countries';
 export const FRANKFURTER_BASE_URL = 'https://api.frankfurter.dev/v1';
 
 const REQUEST_TIMEOUT_MS = 8_000;
-const REFRESH_INTERVAL_MS = 6 * 60 * 60_000; // ECB publishes ~once/day; 6h is ample.
 
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
 let refreshing = false;
@@ -106,12 +106,23 @@ export async function refreshRates(): Promise<number> {
 
 export const fxRateService = {
   start(): void {
+    void refreshRates();
+    this.schedule();
+  },
+  /**
+   * (Re)arm the background poll from the configured cadence. Call after the
+   * owner changes the interval so it takes effect without an app restart.
+   * A cadence of 0 leaves polling off (manual refresh only).
+   */
+  schedule(): void {
     if (refreshTimer) {
       clearInterval(refreshTimer);
       refreshTimer = null;
     }
-    void refreshRates();
-    refreshTimer = setInterval(() => void refreshRates(), REFRESH_INTERVAL_MS);
+    const minutes = getFxRefreshMinutes();
+    if (minutes > 0) {
+      refreshTimer = setInterval(() => void refreshRates(), minutes * 60_000);
+    }
   },
   stop(): void {
     if (refreshTimer) {

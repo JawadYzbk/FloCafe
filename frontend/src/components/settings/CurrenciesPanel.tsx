@@ -69,11 +69,13 @@ export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
   const [newCode, setNewCode] = useState('');
   const [saving, setSaving] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [fxRefreshMinutes, setFxRefreshMinutes] = useState('');
 
   const load = async () => {
     const { data } = await api.get('/settings/currencies');
     setBaseCurrency(String(data.base_currency || ''));
     setSupported(Array.isArray(data.frankfurter_currencies) ? data.frankfurter_currencies : []);
+    setFxRefreshMinutes(String(data.fx_refresh_minutes ?? ''));
     setRows((Array.isArray(data.secondary_currencies) ? data.secondary_currencies : []).map(toRow));
     // Keep the shared store in sync so the POS rate chip, cart dual total, and
     // payment modal reflect edits immediately instead of only after a reload.
@@ -142,7 +144,11 @@ export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
     }
     setSaving(true);
     try {
-      await api.put('/settings/currencies', { base_currency: baseCurrency, secondary_currencies: rows.map(toPayload) });
+      await api.put('/settings/currencies', {
+        base_currency: baseCurrency,
+        secondary_currencies: rows.map(toPayload),
+        fx_refresh_minutes: Number(fxRefreshMinutes) || 0,
+      });
       await load();
       toast.success(t('settings.saved', { defaultValue: 'Saved' }));
     } catch (e: unknown) {
@@ -204,6 +210,26 @@ export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
           <p className="text-xs text-amber-600 mb-4">
             {t('settings.baseNoLiveRates', { defaultValue: `Live rates aren't available for a ${baseCurrency} base — secondary rates must be set manually.` })}
           </p>
+        )}
+
+        {supported.includes(baseCurrency) && (
+          <div className="rounded-lg border border-gray-100 px-3 py-2 flex items-center justify-between gap-3 text-sm mb-4">
+            <div className="min-w-0">
+              <span className="text-gray-600">{t('settings.fxRefreshLabel', { defaultValue: 'Auto-update live rates every' })}</span>
+              <p className="text-xs text-gray-400">{t('settings.fxRefreshHint', { defaultValue: '0 = only when you tap Refresh live rates.' })}</p>
+            </div>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <input
+                type="number" min="0" step="1"
+                disabled={!isAdmin}
+                value={fxRefreshMinutes}
+                onChange={(e) => setFxRefreshMinutes(e.target.value)}
+                placeholder="360"
+                className="w-20 px-2 py-1.5 text-sm border rounded-lg text-end disabled:bg-gray-50"
+              />
+              <span className="text-xs text-gray-500">{t('settings.minutesShort', { defaultValue: 'min' })}</span>
+            </div>
+          </div>
         )}
 
         <div className="space-y-4">
