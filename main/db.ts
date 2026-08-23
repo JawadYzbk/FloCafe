@@ -4118,6 +4118,36 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
       `);
     },
   },
+  {
+    version: 76,
+    name: 'add_expenses',
+    up: () => {
+      // Business expenses (staff salaries + operating costs) so the owner can
+      // track spend and run profit/loss reports against sales. Amounts are in
+      // the store base currency (same convention as bills.total). staff_id is an
+      // optional link to a users row for salary/wage payouts.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS expenses (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          category TEXT NOT NULL DEFAULT 'other'
+            CHECK (category IN ('salary','rent','utilities','supplies','inventory','maintenance','marketing','fees','tax','other')),
+          description TEXT,
+          amount REAL NOT NULL DEFAULT 0,
+          staff_id TEXT,
+          payment_method TEXT,
+          incurred_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          notes TEXT,
+          created_by TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (staff_id) REFERENCES users(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_expenses_incurred_at ON expenses(incurred_at);
+        CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(category);
+        CREATE INDEX IF NOT EXISTS idx_expenses_staff ON expenses(staff_id);
+      `);
+    },
+  },
 ];
 
 function syncBackupBeforeMigration(fromVersion: number, toVersion: number): void {

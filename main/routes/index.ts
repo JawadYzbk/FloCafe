@@ -16,6 +16,7 @@ import { staffRoutes } from './staff';
 import { settingsRoutes } from './settings';
 import { paymentMethodRoutes } from './payment-methods';
 import { reportRoutes } from './reports';
+import { expenseRoutes } from './expenses';
 import { kdsRoutes } from './kds';
 import { kdsInfoRoutes } from './kds-info';
 import { posInfoRoutes } from './pos-info';
@@ -90,6 +91,7 @@ export function registerRoutes(app: Express): void {
   app.use('/api/payment-methods', paymentMethodRoutes);
   app.use('/api/shifts', shiftRoutes);
   app.use('/api/reports', reportRoutes);
+  app.use('/api/expenses', expenseRoutes);
   app.use('/api/kds', kdsRoutes);
   app.use('/api/kds-info', kdsInfoRoutes);
   app.use('/api/pos-info', posInfoRoutes);
