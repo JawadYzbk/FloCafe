@@ -18,7 +18,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, Di
 import { Button } from '@/components/ui/button';
 import api from '@/lib/api';
 import toast from 'react-hot-toast';
-import { COUNTRIES, getCountryByCode, getLocalizedCountryName, sortCountriesByLocalizedName, type CurrencyDisplay, type DigitMode, type CalendarMode } from '@/lib/countries';
+import { COUNTRIES, getCountryByCode, getCurrencySymbol, getLocalizedCountryName, sortCountriesByLocalizedName, type CurrencyDisplay, type DigitMode, type CalendarMode } from '@/lib/countries';
 import { dialCodeFor, normalizeOptionalPhone } from '@/lib/phone';
 import { useConfirm } from '@/hooks/use-confirm';
 import { MasterPinPrompt } from '@/components/settings/MasterPinPrompt';
@@ -54,6 +54,21 @@ const CURRENCY_CODES: string[] = (() => {
   } catch { /* fall through */ }
   return ['USD', 'EUR', 'GBP', 'LBP', 'AED', 'SAR', 'EGP', 'JOD', 'TRY', 'INR', 'JPY'];
 })();
+
+// Localized currency names (e.g. "Lebanese Pound") for the searchable picker.
+const CURRENCY_NAMES = (() => {
+  try { return new Intl.DisplayNames(['en'], { type: 'currency' }); } catch { return null; }
+})();
+
+// Combobox item for a currency code, labelled with its symbol (e.g. "EUR  ·  €")
+// and searchable by its full name.
+function currencyItem(code: string): ComboboxItem {
+  const symbol = getCurrencySymbol(code);
+  let name = '';
+  try { name = CURRENCY_NAMES?.of(code) ?? ''; } catch { /* unknown code */ }
+  const hasSymbol = symbol && symbol.toUpperCase() !== code.toUpperCase();
+  return { value: code, label: hasSymbol ? `${code}  ·  ${symbol}` : code, keywords: name };
+}
 
 function tenantStatusLabel(status: string | undefined, tCommon: (key: 'active' | 'inactive') => string): string {
   const key = (TENANT_STATUS_LABEL_KEYS as Record<string, 'active' | 'inactive' | undefined>)[status ?? ''];
@@ -2461,9 +2476,9 @@ export default function SettingsPage() {
                       <Combobox
                         items={[
                           ...(form.currency && !CURRENCY_CODES.includes(form.currency)
-                            ? [{ value: form.currency, label: form.currency }]
+                            ? [currencyItem(form.currency)]
                             : []),
-                          ...CURRENCY_CODES.map((c): ComboboxItem => ({ value: c, label: c })),
+                          ...CURRENCY_CODES.map(currencyItem),
                         ]}
                         value={form.currency || undefined}
                         onValueChange={(code) => setForm((p) => ({ ...p, currency: code }))}

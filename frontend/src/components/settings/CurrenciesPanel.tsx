@@ -1,14 +1,15 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { Coins, Plus, RefreshCw, Trash2, Save, History } from 'lucide-react';
+import { Coins, RefreshCw, Trash2, Save, History } from 'lucide-react';
 import api from '@/lib/api';
 import toast from 'react-hot-toast';
 import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Combobox, type ComboboxItem } from '@/components/ui/combobox';
 import { useTranslations } from 'use-intl';
 import { useCurrenciesStore } from '@/store/currencies';
-import { convertBaseToTender, type SecondaryCurrency, type RoundingMode } from '@/lib/countries';
+import { convertBaseToTender, getCurrencySymbol, type SecondaryCurrency, type RoundingMode } from '@/lib/countries';
 
 // Full ISO 4217 currency list for the base-currency picker, from the platform
 // when available (falls back to a common set for older runtimes).
@@ -20,6 +21,21 @@ const CURRENCY_CODES: string[] = (() => {
   } catch { /* fall through */ }
   return ['USD', 'EUR', 'GBP', 'LBP', 'AED', 'SAR', 'EGP', 'JOD', 'TRY', 'INR', 'JPY'];
 })();
+
+// Localized currency names for the searchable pickers (e.g. "Lebanese Pound").
+const CURRENCY_NAMES = (() => {
+  try { return new Intl.DisplayNames(['en'], { type: 'currency' }); } catch { return null; }
+})();
+
+// Combobox item for a currency code, labelled with its symbol (e.g. "EUR  ·  €")
+// and searchable by its full name.
+function currencyItem(code: string): ComboboxItem {
+  const symbol = getCurrencySymbol(code);
+  let name = '';
+  try { name = CURRENCY_NAMES?.of(code) ?? ''; } catch { /* unknown code */ }
+  const hasSymbol = symbol && symbol.toUpperCase() !== code.toUpperCase();
+  return { value: code, label: hasSymbol ? `${code}  ·  ${symbol}` : code, keywords: name };
+}
 
 // Editable row model — mirrors SecondaryCurrency but keeps rate as a string so
 // the input can be cleared while typing.
@@ -128,8 +144,8 @@ export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
     }
   };
 
-  const addCurrency = () => {
-    const code = newCode.trim().toUpperCase();
+  const addCurrency = (rawCode?: string) => {
+    const code = (rawCode ?? newCode).trim().toUpperCase();
     if (!/^[A-Z]{3}$/.test(code)) {
       toast.error(t('settings.currencyCodeInvalid', { defaultValue: 'Enter a valid 3-letter currency code' }));
       return;
@@ -139,10 +155,15 @@ export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
       return;
     }
     const canAuto = supported.includes(code) && supported.includes(baseCurrency.toUpperCase());
+    const newIdx = rows.length;
     setRows((old) => [...old, {
       code, symbol: '', rate: '', rate_source: canAuto ? 'frankfurter' : 'manual', increment: '1', mode: 'half_up',
     }]);
     setNewCode('');
+    // Auto-fetch the live rate right away when the new currency defaults to the
+    // Frankfurter source, so the owner doesn't have to toggle manual↔live to
+    // trigger it. The appended row sits at the previous length index.
+    if (canAuto) void fillLiveRate(newIdx, code);
   };
 
   const removeRow = (idx: number) => setRows((old) => old.filter((_, i) => i !== idx));
@@ -213,13 +234,17 @@ export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
 
         <div className="rounded-lg border border-gray-100 px-3 py-2 flex items-center justify-between gap-3 text-sm mb-1.5">
           <span className="text-gray-600">{t('settings.baseCurrency', { defaultValue: 'Base currency' })}</span>
-          <Select value={baseCurrency} onValueChange={(v) => setBaseCurrency(v.toUpperCase())} disabled={!isAdmin}>
-            <SelectTrigger id="base-currency" size="sm" className="w-32 font-semibold"><SelectValue /></SelectTrigger>
-            <SelectContent>
-              {baseCurrency && !CURRENCY_CODES.includes(baseCurrency) && <SelectItem value={baseCurrency}>{baseCurrency}</SelectItem>}
-              {CURRENCY_CODES.map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}
-            </SelectContent>
-          </Select>
+          <Combobox
+            items={[
+              ...(baseCurrency && !CURRENCY_CODES.includes(baseCurrency) ? [currencyItem(baseCurrency)] : []),
+              ...CURRENCY_CODES.map(currencyItem),
+            ]}
+            value={baseCurrency || undefined}
+            onValueChange={(v) => setBaseCurrency(v.toUpperCase())}
+            disabled={!isAdmin}
+            className="w-40 font-semibold"
+            searchPlaceholder={t('common.search')}
+          />
         </div>
         <p className="text-xs text-gray-400 mb-3">
           {t('settings.baseCurrencyHint', { defaultValue: 'Prices, taxes, and reports are kept in this currency. Changing it does not reconvert existing amounts.' })}
@@ -358,15 +383,16 @@ export function CurrenciesPanel({ isAdmin }: { isAdmin: boolean }) {
 
         {isAdmin && (
           <div className="flex gap-2 mt-5">
-            <input
-              value={newCode}
-              onChange={(e) => setNewCode(e.target.value.toUpperCase())}
-              onKeyDown={(e) => { if (e.key === 'Enter') addCurrency(); }}
-              maxLength={3}
-              placeholder={t('settings.currencyCodePlaceholder', { defaultValue: 'e.g. LBP' })}
-              className="w-40 px-3 py-2 text-sm border rounded-lg uppercase"
+            <Combobox
+              items={CURRENCY_CODES
+                .filter((c) => c !== baseCurrency.toUpperCase() && !rows.some((r) => r.code.toUpperCase() === c))
+                .map(currencyItem)}
+              value={undefined}
+              onValueChange={(code) => addCurrency(code)}
+              placeholder={t('settings.currencyCodePlaceholder', { defaultValue: 'Add a currency…' })}
+              searchPlaceholder={t('common.search')}
+              className="w-56"
             />
-            <Button variant="outline" onClick={addCurrency} disabled={!newCode.trim()}><Plus size={14} className="me-1" />{t('common.add')}</Button>
           </div>
         )}
 
