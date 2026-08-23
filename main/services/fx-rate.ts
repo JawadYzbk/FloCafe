@@ -1,13 +1,13 @@
 /**
  * Foreign-exchange rate service. Refreshes the exchange rate for each secondary
- * currency whose `rate_source` is `frankfurter` from https://frankfurter.dev
- * (ECB reference rates), caching the last-known rate in settings.
+ * currency whose `rate_source` is `frankfurter` from the Frankfurter v2 API
+ * (https://frankfurter.dev — ECB + IMF + ~40 central banks, so it covers LBP,
+ * IQD, SYP and most world currencies), caching the last-known rate in settings.
  *
  * Offline-first (invariant #1): a failed fetch is non-fatal — the previously
  * cached rate stays in effect, and payment settlement never depends on the
  * network. Manual rates (`rate_source: 'manual'`) are owner-controlled and are
- * never overwritten here — this is the *only* path for LBP and any other
- * currency Frankfurter does not cover.
+ * never overwritten here — the path for currencies Frankfurter can't quote.
  */
 
 import log from 'electron-log';
@@ -22,23 +22,28 @@ import {
 import { now } from '../db';
 import type { SecondaryCurrency } from '../countries';
 
-export const FRANKFURTER_BASE_URL = 'https://api.frankfurter.dev/v1';
+export const FRANKFURTER_BASE_URL = 'https://api.frankfurter.dev/v2';
 
 const REQUEST_TIMEOUT_MS = 8_000;
 
 let refreshTimer: ReturnType<typeof setInterval> | null = null;
 let refreshing = false;
 
-interface FrankfurterLatest {
-  base: string;
+/** One row of the v2 `/rates` response: rates are returned as a flat array. */
+interface FrankfurterV2Rate {
   date: string;
-  rates: Record<string, number>;
+  base: string;
+  quote: string;
+  rate: number;
 }
 
 /**
- * Fetch live rates for `symbols` expressed in `base` from Frankfurter.
+ * Fetch live rates for `symbols` expressed in `base` from Frankfurter v2.
  * Returns a code→rate map, or `null` on any failure (offline, HTTP error,
  * malformed body). Callers keep their cached rates when this returns null.
+ *
+ * v2 `/rates?base=X` returns every quote for the base as an array (there is no
+ * `symbols` filter — it 422s), so we fetch once and pick out the wanted codes.
  */
 export async function fetchFrankfurterRates(
   base: string,
@@ -46,19 +51,21 @@ export async function fetchFrankfurterRates(
 ): Promise<Record<string, number> | null> {
   const wanted = symbols.filter(isFrankfurterSupported);
   if (!isFrankfurterSupported(base) || wanted.length === 0) return null;
-  const url = `${FRANKFURTER_BASE_URL}/latest?base=${encodeURIComponent(base)}&symbols=${encodeURIComponent(wanted.join(','))}`;
+  const wantedSet = new Set(wanted.map((code) => code.toUpperCase()));
+  const url = `${FRANKFURTER_BASE_URL}/rates?base=${encodeURIComponent(base)}`;
   try {
     const response = await fetch(url, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
     if (!response.ok) {
       log.debug(`[FX] Frankfurter responded HTTP ${response.status}`);
       return null;
     }
-    const body = (await response.json()) as FrankfurterLatest;
-    if (!body || typeof body.rates !== 'object' || body.rates === null) return null;
+    const body = (await response.json()) as FrankfurterV2Rate[];
+    if (!Array.isArray(body)) return null;
     const out: Record<string, number> = {};
-    for (const [code, value] of Object.entries(body.rates)) {
-      const rate = Number(value);
-      if (Number.isFinite(rate) && rate > 0) out[code.toUpperCase()] = rate;
+    for (const row of body) {
+      const code = String(row?.quote || '').toUpperCase();
+      const rate = Number(row?.rate);
+      if (wantedSet.has(code) && Number.isFinite(rate) && rate > 0) out[code] = rate;
     }
     return out;
   } catch (e) {
