@@ -28,6 +28,23 @@ const PORT = parseInt(process.env.PORT || '3001', 10);
 let activePort = PORT;
 
 /**
+ * Resolve the running app version. server.ts runs both inside the packaged
+ * Electron shell and under the standalone dev/backend server (dev-server.js),
+ * so it cannot rely on Electron's `app.getVersion()` being available. Read it
+ * from package.json — the same source Electron itself uses and the pattern
+ * already used by cloud-sync/support-ticket/tax-packs.
+ * (`npm_package_version` is unset in the packaged app, so the old fallback
+ * always reported a stale hardcoded version.)
+ */
+function getAppVersion(): string {
+  try {
+    return String(require('../package.json').version);
+  } catch {
+    return 'unknown';
+  }
+}
+
+/**
  * JWT verification middleware. Skips health check and auth routes (those
  * verify tokens individually). Protects all resource routes from unauthenticated
  * LAN access.
@@ -191,11 +208,14 @@ export function startServer(): Promise<void> {
     // ── API health check ───────────────────────────────────────────────
     app.get('/api/health', (_req: Request, res: Response) => {
       const db = getDbHealth();
+      // Unauthenticated LAN-facing endpoint: report liveness only. Do not leak
+      // raw db.error text (may contain filesystem paths / internal detail) to
+      // anonymous callers.
       res.status(db.ok ? 200 : 503).json({
         status: db.ok ? 'ok' : 'error',
-        db: db.ok ? 'ok' : db.error,
+        db: db.ok ? 'ok' : 'error',
         service: 'Flo Local API',
-        version: process.env.npm_package_version || '2.4.7',
+        version: getAppVersion(),
         timestamp: new Date().toISOString(),
       });
     });

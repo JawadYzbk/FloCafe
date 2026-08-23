@@ -33,12 +33,11 @@ import { supportTicketRoutes } from './support-ticket';
 import { getDatabase, now, parseItemJson, attachEffectiveAddons, withTxn, getSettingValue, getCachedPairingCode, setCachedPairingCode, verifyPin } from '../db';
 import { checkPinRateLimit } from './orders';
 import {
-  calculateConfiguredChargeTaxes,
-  combineItemAndChargeTaxes,
   getActiveCountryPack,
   invertTaxBreakdown,
   invertTaxSnapshot,
 } from '../services/tax';
+import { recalculateOrderTotals } from '../services/order-recalc';
 import { cloudSync } from '../services/cloud-sync';
 import { parsePhoneE164, stripPhoneDigits } from '../lib/phone';
 import QRCode from 'qrcode';
@@ -417,81 +416,17 @@ export function registerRoutes(app: Express): void {
           }
         }
 
-        // Recalculate order totals excluding cancelled, voided, and void_adjustment items
-        const activeItems = db.prepare("SELECT * FROM order_items WHERE order_id = ? AND status NOT IN ('cancelled', 'voided', 'void_adjustment')")
-          .all(orderId) as any[];
-        let subtotal = 0;
-        let totalTax = 0;
-        let exclusiveTax = 0;
-        const allTaxBreakdowns: any[] = [];
-        const allTaxSnapshots: (string | null)[] = [];
-        for (const i of activeItems) {
-          subtotal += i.subtotal || 0;
-          totalTax += i.tax_amount || 0;
-          if (i.tax_type !== 'inclusive') {
-            exclusiveTax += i.tax_amount || 0;
-          }
-          if (i.tax_breakdown) {
-            try {
-              const breakdown = JSON.parse(i.tax_breakdown);
-              if (Array.isArray(breakdown)) allTaxBreakdowns.push(breakdown);
-            } catch { }
-          }
-          allTaxSnapshots.push(i.tax_snapshot || null);
-        }
-        // BUG #13 FIX: Preserve order-level discount (scale percentage proportionally)
-        const existingDiscountAmount = currentOrder.discount_amount || 0;
-        let newDiscountAmount = existingDiscountAmount;
-        if (existingDiscountAmount > 0 && currentOrder.subtotal > 0) {
-          if (currentOrder.discount_type === 'percentage') {
-            const pct = currentOrder.discount_value || 0;
-            newDiscountAmount = Math.round(subtotal * pct / 100 * 100) / 100;
-          }
-          // amount type: keep same value
-        }
-
-        const discountedSubtotal = Math.max(0, subtotal - newDiscountAmount);
-        let newTaxAmount = totalTax;
-        let newExclusiveTax = exclusiveTax;
-        let taxRatio = 1;
-        if (newDiscountAmount > 0 && subtotal > 0) {
-          taxRatio = discountedSubtotal / subtotal;
-          newTaxAmount = Math.round(totalTax * taxRatio * 100) / 100;
-          newExclusiveTax = Math.round(exclusiveTax * taxRatio * 100) / 100;
-        }
-        const tenantInfo = {
-          country: getSettingValue('country') || 'IN',
-          business_type: getSettingValue('business_type') || 'restaurant',
-          state_code: getSettingValue('state_code') || '',
-          taxes_enabled: getSettingValue('taxes_enabled') === 'true',
-        };
-        const customer = currentOrder.customer_id
-          ? db.prepare('SELECT * FROM customers WHERE id = ?').get(currentOrder.customer_id) as any
-          : null;
-        const chargeTaxes = calculateConfiguredChargeTaxes(tenantInfo, {
-          ...currentOrder,
-          service_charge: 0,
-        }, customer);
-        const taxRollup = combineItemAndChargeTaxes({
-          itemTaxAmount: newTaxAmount,
-          itemExclusiveTaxAmount: newExclusiveTax,
-          itemBreakdowns: allTaxBreakdowns,
-          itemSnapshots: allTaxSnapshots,
-          itemTaxRatio: taxRatio,
-          chargeTaxes,
-        });
-
-        // BUG #5 FIX: Correct round-off formula; BUG #24 FIX: include delivery_charge (was missing, causing total mismatch with bill generation)
-        const preRoundTotal = discountedSubtotal + taxRollup.exclusiveTaxAmount
-          + (currentOrder.delivery_charge || 0) + (currentOrder.packaging_charge || 0);
-        const roundOff = 0;
-        const total = Number(preRoundTotal.toFixed(2));
+        // Recalculate order totals excluding cancelled, voided, and
+        // void_adjustment items. Single Decimal.js-based engine shared with the
+        // restore handler (services/order-recalc.ts).
+        const { subtotal, newDiscountAmount, taxRollup, total, roundOff, activeItemCount, tenantInfo } =
+          recalculateOrderTotals(db, orderId, currentOrder);
 
         // #132 FIX: cancelling the last active item leaves nothing to serve or
         // bill — treat it as the whole order being cancelled, the same way the
         // explicit order-level cancel (routes/orders.ts) does: free the table,
         // and stamp cancelled_at/cancellation_reason. (Item stock was already restored above).
-        const orderCancelled = activeItems.length === 0 && currentOrder.status !== 'cancelled';
+        const orderCancelled = activeItemCount === 0 && currentOrder.status !== 'cancelled';
 
         if (orderCancelled) {
           db.prepare(`
@@ -514,8 +449,8 @@ export function registerRoutes(app: Express): void {
           taxBreakdown: JSON.stringify(taxRollup.breakdowns),
           taxSnapshot: taxRollup.snapshotJson,
           discountAmount: newDiscountAmount,
-          deliveryCharge: order.delivery_charge || 0,
-          packagingCharge: order.packaging_charge || 0,
+          deliveryCharge: currentOrder.delivery_charge || 0,
+          packagingCharge: currentOrder.packaging_charge || 0,
           total,
         }, tenantInfo.country);
 
@@ -603,75 +538,9 @@ export function registerRoutes(app: Express): void {
         db.prepare("UPDATE order_items SET status = 'pending', updated_at = ? WHERE id = ?")
           .run(now(), itemId);
 
-        // Recalculate order totals
-        const activeItems = db.prepare("SELECT * FROM order_items WHERE order_id = ? AND status NOT IN ('cancelled', 'voided', 'void_adjustment')")
-          .all(orderId) as any[];
-        let subtotal = 0;
-        let totalTax = 0;
-        let exclusiveTax = 0;
-        const allTaxBreakdowns: any[] = [];
-        const allTaxSnapshots: (string | null)[] = [];
-        for (const i of activeItems) {
-          subtotal += i.subtotal || 0;
-          totalTax += i.tax_amount || 0;
-          if (i.tax_type !== 'inclusive') {
-            exclusiveTax += i.tax_amount || 0;
-          }
-          if (i.tax_breakdown) {
-            try {
-              const breakdown = JSON.parse(i.tax_breakdown);
-              if (Array.isArray(breakdown)) allTaxBreakdowns.push(breakdown);
-            } catch { }
-          }
-          allTaxSnapshots.push(i.tax_snapshot || null);
-        }
-        // BUG #13 FIX: Preserve order-level discount (scale percentage proportionally)
-        const existingDiscountAmount = currentOrder.discount_amount || 0;
-        let newDiscountAmount = existingDiscountAmount;
-        if (existingDiscountAmount > 0 && currentOrder.subtotal > 0) {
-          if (currentOrder.discount_type === 'percentage') {
-            const pct = currentOrder.discount_value || 0;
-            newDiscountAmount = Math.round(subtotal * pct / 100 * 100) / 100;
-          }
-          // amount type: keep same value
-        }
-
-        const discountedSubtotal = Math.max(0, subtotal - newDiscountAmount);
-        let newTaxAmount = totalTax;
-        let newExclusiveTax = exclusiveTax;
-        let taxRatio = 1;
-        if (newDiscountAmount > 0 && subtotal > 0) {
-          taxRatio = discountedSubtotal / subtotal;
-          newTaxAmount = Math.round(totalTax * taxRatio * 100) / 100;
-          newExclusiveTax = Math.round(exclusiveTax * taxRatio * 100) / 100;
-        }
-        const tenantInfo = {
-          country: getSettingValue('country') || 'IN',
-          business_type: getSettingValue('business_type') || 'restaurant',
-          state_code: getSettingValue('state_code') || '',
-          taxes_enabled: getSettingValue('taxes_enabled') === 'true',
-        };
-        const customer = currentOrder.customer_id
-          ? db.prepare('SELECT * FROM customers WHERE id = ?').get(currentOrder.customer_id) as any
-          : null;
-        const chargeTaxes = calculateConfiguredChargeTaxes(tenantInfo, {
-          ...currentOrder,
-          service_charge: 0,
-        }, customer);
-        const taxRollup = combineItemAndChargeTaxes({
-          itemTaxAmount: newTaxAmount,
-          itemExclusiveTaxAmount: newExclusiveTax,
-          itemBreakdowns: allTaxBreakdowns,
-          itemSnapshots: allTaxSnapshots,
-          itemTaxRatio: taxRatio,
-          chargeTaxes,
-        });
-
-        // BUG #5 FIX: Correct round-off formula; BUG #24 FIX: include delivery_charge (was missing, causing total mismatch with bill generation)
-        const preRoundTotal = discountedSubtotal + taxRollup.exclusiveTaxAmount
-          + (currentOrder.delivery_charge || 0) + (currentOrder.packaging_charge || 0);
-        const roundOff = 0;
-        const total = Number(preRoundTotal.toFixed(2));
+        // Recalculate order totals — same Decimal.js engine as the cancel path.
+        const { subtotal, newDiscountAmount, taxRollup, total, roundOff, tenantInfo } =
+          recalculateOrderTotals(db, orderId, currentOrder);
 
         db.prepare(`
           UPDATE orders SET subtotal = ?, tax_amount = ?, tax_breakdown = ?, tax_snapshot = ?, discount_amount = ?, total = ?, round_off = ?, updated_at = ? WHERE id = ?
@@ -683,8 +552,8 @@ export function registerRoutes(app: Express): void {
           taxBreakdown: JSON.stringify(taxRollup.breakdowns),
           taxSnapshot: taxRollup.snapshotJson,
           discountAmount: newDiscountAmount,
-          deliveryCharge: order.delivery_charge || 0,
-          packagingCharge: order.packaging_charge || 0,
+          deliveryCharge: currentOrder.delivery_charge || 0,
+          packagingCharge: currentOrder.packaging_charge || 0,
           total,
         }, tenantInfo.country);
 
