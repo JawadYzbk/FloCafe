@@ -20,6 +20,7 @@ import {
   LifeBuoy,
   Banknote,
   Receipt,
+  BarChart3,
   type LucideIcon,
 } from 'lucide-react';
 import { useTranslations, type AppConfig } from 'use-intl';
@@ -58,6 +59,7 @@ interface NavItem {
 const ALL_NAV_ITEMS: NavItem[] = [
   { href: '/pos', labelKey: 'pos', icon: ShoppingCart, roles: ['owner', 'manager', 'cashier'], businessTypes: null },
   { href: '/dashboard', labelKey: 'dashboard', icon: LayoutDashboard, roles: ['owner'], businessTypes: null },
+  { href: '/reports', labelKey: 'reports', icon: BarChart3, roles: ['owner', 'manager'], businessTypes: null },
   { href: '/orders', labelKey: 'orders', icon: ClipboardList, roles: ['owner', 'manager', 'cashier'], businessTypes: null },
   { href: '/shift', labelKey: 'shift', icon: Banknote, roles: ['owner', 'manager'], businessTypes: null },
   { href: '/expenses', labelKey: 'expenses', icon: Receipt, roles: ['owner', 'manager'], businessTypes: null },

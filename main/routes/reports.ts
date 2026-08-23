@@ -182,6 +182,96 @@ router.get('/summary', requireRole('owner', 'manager'), (req: Request, res: Resp
   }
 });
 
+// Unified ERP-style financial report over a date range: sales, payment-method
+// breakdown, expenses, profit & loss, per-staff sales, item/category sales, and
+// a shift summary — everything connected in one payload so the Reports screen
+// and any accounting export see a single consistent picture of a period.
+router.get('/financial', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+  try {
+    const db = getDatabase();
+    const startDate = reportDate(req.query.start_date, utcTodayDate());
+    const endDate = reportDate(req.query.end_date, startDate);
+    const start = utcDayBounds(startDate)[0];
+    const end = utcDayBounds(endDate)[1];
+
+    // Sales — exclude cancelled orders. "net" is the order total (incl. tax and
+    // charges), "gross" the pre-discount item subtotal.
+    const sales = db.prepare(`
+      SELECT COUNT(*) AS order_count,
+        COALESCE(SUM(subtotal), 0) AS gross,
+        COALESCE(SUM(discount_amount), 0) AS discounts,
+        COALESCE(SUM(tax_amount), 0) AS tax,
+        COALESCE(SUM(total), 0) AS net
+      FROM orders
+      WHERE created_at >= ? AND created_at < ? AND status != 'cancelled'
+    `).get(start, end) as { order_count: number; gross: number; discounts: number; tax: number; net: number };
+    const collected = (db.prepare(
+      `SELECT COALESCE(SUM(paid_amount), 0) AS collected FROM bills WHERE created_at >= ? AND created_at < ?`,
+    ).get(start, end) as { collected: number }).collected;
+
+    const payments = paymentMethodBreakdown(db, startDate, endDate, true);
+
+    // Expenses (the expenses module) — compared by local incurred date.
+    const expenseTotal = (db.prepare(
+      `SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE date(incurred_at) >= date(?) AND date(incurred_at) <= date(?)`,
+    ).get(startDate, endDate) as { total: number }).total;
+    const expensesByCategory = db.prepare(`
+      SELECT category, COUNT(*) AS count, COALESCE(SUM(amount), 0) AS total
+      FROM expenses WHERE date(incurred_at) >= date(?) AND date(incurred_at) <= date(?)
+      GROUP BY category ORDER BY total DESC
+    `).all(startDate, endDate);
+
+    const staff = db.prepare(`
+      SELECT o.user_id, u.name AS staff_name, COUNT(*) AS order_count, COALESCE(SUM(o.total), 0) AS sales
+      FROM orders o LEFT JOIN users u ON u.id = o.user_id
+      WHERE o.created_at >= ? AND o.created_at < ? AND o.status != 'cancelled'
+      GROUP BY o.user_id ORDER BY sales DESC
+    `).all(start, end);
+
+    const items = db.prepare(`
+      SELECT oi.product_name, SUM(oi.quantity) AS quantity, COALESCE(SUM(oi.subtotal), 0) AS revenue
+      FROM order_items oi JOIN orders o ON o.id = oi.order_id
+      WHERE o.created_at >= ? AND o.created_at < ? AND o.status != 'cancelled'
+        AND oi.status NOT IN ('cancelled', 'voided', 'void_adjustment')
+      GROUP BY oi.product_name ORDER BY quantity DESC LIMIT 200
+    `).all(start, end);
+
+    const categories = db.prepare(`
+      SELECT COALESCE(c.name, '—') AS category, SUM(oi.quantity) AS quantity, COALESCE(SUM(oi.subtotal), 0) AS revenue
+      FROM order_items oi
+      JOIN orders o ON o.id = oi.order_id
+      LEFT JOIN products p ON p.id = oi.product_id
+      LEFT JOIN categories c ON c.id = p.category_id
+      WHERE o.created_at >= ? AND o.created_at < ? AND o.status != 'cancelled'
+        AND oi.status NOT IN ('cancelled', 'voided', 'void_adjustment')
+      GROUP BY category ORDER BY revenue DESC
+    `).all(start, end);
+
+    const shifts = db.prepare(`
+      SELECT COUNT(*) AS count,
+        SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open_count,
+        SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) AS closed_count
+      FROM shifts WHERE opened_at >= ? AND opened_at < ?
+    `).get(start, end);
+
+    const revenue = Number(sales.net) || 0;
+    res.json({
+      period: { start_date: startDate, end_date: endDate },
+      sales: { ...sales, collected },
+      payments,
+      expenses: { total: expenseTotal, by_category: expensesByCategory },
+      profit: { revenue, expenses: expenseTotal, net: revenue - expenseTotal },
+      staff,
+      items,
+      categories,
+      shifts,
+    });
+  } catch (error: any) {
+    console.error('[API] Internal error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Dynamic tax-component report for receipt/report consumers. Components are
 // derived item by item so mixed legacy + categorized bills cannot double-count
 // the categorized portion already present in the bill-level tax_breakdown.
