@@ -2373,6 +2373,22 @@
     "item": "کالا",
     "noData": "داده‌ای نیست",
     "period": "دوره",
-    "shifts": "شیفت‌ها"
+    "shifts": "شیفت‌ها",
+    "yesterday": "دیروز",
+    "monthToDate": "ماه",
+    "custom": "سفارشی",
+    "compare": "مقایسه با قبل",
+    "vsPrevious": "نسبت به قبل",
+    "profit": "سود",
+    "grossProfit": "سود ناخالص",
+    "cogs": "بهای تمام‌شده",
+    "profitAndLoss": "سود و زیان",
+    "orderType": "نوع سفارش",
+    "orderTypes": "انواع سفارش",
+    "modifiers": "افزودنی‌ها",
+    "modifier": "افزودنی",
+    "reason": "دلیل",
+    "discountsTitle": "تخفیف‌ها",
+    "voids": "ابطال‌ها"
   }
 }

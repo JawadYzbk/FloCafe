@@ -1628,7 +1628,19 @@
     "rateHistory": "سجل الأسعار",
     "noRateHistory": "لا يوجد سجل بعد",
     "liveBaseUnsupported": "تتطلب الأسعار المباشرة عملة أساسية يدعمها Frankfurter.",
-    "liveNotSupported": "غير متوفر في Frankfurter — سعر يدوي فقط."
+    "liveNotSupported": "غير متوفر في Frankfurter — سعر يدوي فقط.",
+    "softwareUpdatesHintBrowser": "تتم إدارة التحديثات بواسطة تطبيق FloCafe لسطح المكتب.",
+    "updateStatusNotCheckedYet": "لم يتم التحقق بعد",
+    "updateStatusDownloading": "جارٍ تنزيل التحديث...",
+    "updateStatusCheckFailed": "فشل التحقق من التحديثات",
+    "updateStatusOffline": "غير متصل",
+    "updateStatusOfflineHint": "يبدو أنك غير متصل. أعد الاتصال وحاول مرة أخرى.",
+    "notCheckedYetHint": "لم يتحقق Flo Desktop من التحديثات بعد.",
+    "devModeTitle": "نسخة تطويرية",
+    "updateErrorManifestMissing": "لم يتم العثور على حزمة تحديث لهذه النسخة.",
+    "updateErrorDownloadFailed": "فشل تنزيل التحديث. ستتم إعادة المحاولة عند التحقق التالي.",
+    "updateErrorGeneric": "حدث خطأ ما أثناء التحقق من التحديثات.",
+    "errorDetails": "التفاصيل"
   },
   "setup": {
     "alreadyCompleted": "تم إكمال الإعداد بالفعل على هذا التثبيت. جارٍ التحويل إلى تسجيل الدخول…",
@@ -2361,6 +2373,22 @@
     "item": "الصنف",
     "noData": "لا توجد بيانات",
     "period": "الفترة",
-    "shifts": "المناوبات"
+    "shifts": "المناوبات",
+    "yesterday": "أمس",
+    "monthToDate": "الشهر",
+    "custom": "مخصص",
+    "compare": "قارن بالسابق",
+    "vsPrevious": "مقابل السابق",
+    "profit": "الربح",
+    "grossProfit": "الربح الإجمالي",
+    "cogs": "تكلفة البضاعة",
+    "profitAndLoss": "الأرباح والخسائر",
+    "orderType": "نوع الطلب",
+    "orderTypes": "أنواع الطلبات",
+    "modifiers": "الإضافات",
+    "modifier": "الإضافة",
+    "reason": "السبب",
+    "discountsTitle": "الخصومات",
+    "voids": "الإلغاءات"
   }
 }

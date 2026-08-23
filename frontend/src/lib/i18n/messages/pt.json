@@ -2373,6 +2373,22 @@
     "item": "Item",
     "noData": "Sem dados",
     "period": "Período",
-    "shifts": "Turnos"
+    "shifts": "Turnos",
+    "yesterday": "Ontem",
+    "monthToDate": "Mês",
+    "custom": "Personalizado",
+    "compare": "Comparar com anterior",
+    "vsPrevious": "vs anterior",
+    "profit": "Lucro",
+    "grossProfit": "Lucro bruto",
+    "cogs": "Custo dos produtos",
+    "profitAndLoss": "Lucros e perdas",
+    "orderType": "Tipo de pedido",
+    "orderTypes": "Tipos de pedido",
+    "modifiers": "Modificadores",
+    "modifier": "Modificador",
+    "reason": "Motivo",
+    "discountsTitle": "Descontos",
+    "voids": "Cancelamentos"
   }
 }

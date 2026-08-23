@@ -2373,6 +2373,22 @@
     "item": "Item",
     "noData": "No data",
     "period": "Period",
-    "shifts": "Shifts"
+    "shifts": "Shifts",
+    "yesterday": "Yesterday",
+    "monthToDate": "Month",
+    "custom": "Custom",
+    "compare": "Compare to previous",
+    "vsPrevious": "vs previous",
+    "profit": "Profit",
+    "grossProfit": "Gross profit",
+    "cogs": "Cost of goods",
+    "profitAndLoss": "Profit & loss",
+    "orderType": "Order type",
+    "orderTypes": "Order types",
+    "modifiers": "Modifiers",
+    "modifier": "Modifier",
+    "reason": "Reason",
+    "discountsTitle": "Discounts",
+    "voids": "Voids"
   }
 }
