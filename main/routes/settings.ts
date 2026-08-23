@@ -277,6 +277,10 @@ router.put('/business', requireRole('owner', 'manager'), (req: Request, res: Res
 
     upsertSettings(db, {
       business_name, timezone, currency, country, language,
+      // The store's currency IS the base currency — keep the multi-currency
+      // base_currency setting in lockstep so the Currencies panel and the POS
+      // never disagree about which currency is the base.
+      base_currency: currency !== undefined ? String(currency).toUpperCase() : undefined,
       currency_symbol: (currency !== undefined || country !== undefined)
         ? deriveCurrencySymbol(effectiveCurrency, effectiveCountry)
         : undefined,
@@ -367,6 +371,11 @@ router.put('/currencies', requireRole('owner', 'manager'), (req: Request, res: R
 
     upsertSettings(db, {
       base_currency: base_currency !== undefined ? effectiveBase : undefined,
+      // Keep the store's display currency (settings.currency, read by the POS,
+      // orders, products, and receipts via currentTenant.currency) in lockstep
+      // with the base currency so setting a base here actually drives the whole
+      // app instead of the country-derived default.
+      currency: base_currency !== undefined ? effectiveBase : undefined,
       secondary_currencies: serialized,
     });
 

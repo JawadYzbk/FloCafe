@@ -10,6 +10,7 @@ import {
   type ReceiptOptions,
 } from '@/lib/printer/receipt-encoder';
 import { usePosSettingsStore } from '@/store/pos-settings';
+import { useCurrenciesStore } from '@/store/currencies';
 import {
   ensurePrintLanguagesLoaded,
   resolveBillPrintLanguages,
@@ -125,7 +126,19 @@ export const usePrinterStore = create<PrinterState>()(
 
           const executeBrowserPrint = async () => {
             const { printWebBill } = await import('@/lib/printer/web-print');
-            await printWebBill(bill, tenant, {
+            // The browser path renders the item table client-side, so it needs
+            // the bill's nested order + items. Bills returned by /bills/generate
+            // carry only the bill row (no order/items), which renders an empty
+            // item table — hydrate from /bills/:id when items are missing. The
+            // ESC/POS path fetches server-side and is unaffected.
+            let billToPrint = bill;
+            if (!bill.order?.items?.length && bill.id != null) {
+              try {
+                const { data } = await api.get(`/bills/${bill.id}`);
+                if (data?.bill) billToPrint = data.bill as Bill;
+              } catch { /* fall back to the bill as-is */ }
+            }
+            await printWebBill(billToPrint, tenant, {
               paperSize: printerPaperSize,
               includeTaxId: billShowTaxId,
               taxRegistrationNumber: billShowTaxId && billTaxRegistrationNumber ? billTaxRegistrationNumber : undefined,
@@ -141,6 +154,9 @@ export const usePrinterStore = create<PrinterState>()(
               useUnicode: printerUseUnicode,
               isReprint,
               trimDecimals: printerTrimDecimals,
+              // Print the grand total in each configured secondary currency too,
+              // so the customer can pay in the base or a tender currency.
+              secondaryCurrencies: useCurrenciesStore.getState().secondaryCurrencies,
             });
             return billTemplateWarning ? [billTemplateWarning] : [];
           };

@@ -707,11 +707,20 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
                   {t('changeReturned')}
                 </span>
               </div>
-              <span className={`text-xl font-bold tabular-nums ${
-                change > 0 ? 'text-emerald-600' : 'text-gray-300'
-              }`}>
-                {currencyFmt(change)}
-              </span>
+              <div className="text-end">
+                <span className={`text-xl font-bold tabular-nums ${
+                  change > 0 ? 'text-emerald-600' : 'text-gray-300'
+                }`}>
+                  {currencyFmt(change)}
+                </span>
+                {change > 0 && secondaryCurrencies.length > 0 && (
+                  <p className="text-xs font-semibold text-emerald-700/80 mt-0.5 ltr-island" dir="ltr">
+                    {secondaryCurrencies
+                      .map((c) => `${fmtNum(convertBaseToTender(change, c).rounded)} ${c.symbol || c.code}`)
+                      .join('  ·  ')}
+                  </p>
+                )}
+              </div>
             </div>
           )}
 

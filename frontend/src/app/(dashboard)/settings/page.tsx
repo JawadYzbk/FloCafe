@@ -30,6 +30,7 @@ import { PaymentMethodsSettings } from '@/components/settings/PaymentMethodsSett
 import { CurrenciesPanel } from '@/components/settings/CurrenciesPanel';
 import { LocalePreferencesPanel } from '@/components/settings/LocalePreferencesPanel';
 import { TimeZoneSelect } from '@/components/TimeZoneSelect';
+import { Combobox, type ComboboxItem } from '@/components/ui/combobox';
 import type { HealthCheckReport } from '@/types/electron';
 import { useLocale, useTranslations, type AppConfig } from 'use-intl';
 import { Ltr } from '@/components/layout/Ltr';
@@ -41,6 +42,18 @@ import { TENANT_STATUS_LABEL_KEYS } from '@/lib/i18n-enums';
 const SELECTABLE_LANGUAGES: Language[] = (Object.keys(LANGUAGES) as Language[]).filter(
   (lang) => LANGUAGES[lang].selectable,
 );
+
+// Full ISO 4217 currency list for the base-currency picker, from the platform
+// when available (falls back to a common set for older runtimes). Mirrors
+// CurrenciesPanel so both pickers offer the same options.
+const CURRENCY_CODES: string[] = (() => {
+  try {
+    const list = (Intl as unknown as { supportedValuesOf?: (k: string) => string[] })
+      .supportedValuesOf?.('currency');
+    if (list && list.length) return list;
+  } catch { /* fall through */ }
+  return ['USD', 'EUR', 'GBP', 'LBP', 'AED', 'SAR', 'EGP', 'JOD', 'TRY', 'INR', 'JPY'];
+})();
 
 function tenantStatusLabel(status: string | undefined, tCommon: (key: 'active' | 'inactive') => string): string {
   const key = (TENANT_STATUS_LABEL_KEYS as Record<string, 'active' | 'inactive' | undefined>)[status ?? ''];
@@ -2395,47 +2408,49 @@ export default function SettingsPage() {
                   {/* Input fields */}
                   {isAdmin ? (
                     <div className="grid grid-cols-3 gap-2">
-                      <select
-                        value={form.countryCode}
-                        onChange={(e) => {
-                           const country = COUNTRIES.find(c => c.code === e.target.value);
-                           setForm((p) => {
-                             const previousCountry = getCountryByCode(p.countryCode);
-                             const timezoneWasDefault = !previousCountry || p.timezone === previousCountry.timezone;
-                             const options = country?.localeOptions;
-                             // Re-evaluate locale display preferences against the
-                             // newly selected country (#390): keep supported values
-                             // and reset unsupported ones to their neutral defaults.
-                             const currencyDisplay = (options?.currencyDisplay?.includes(p.currencyDisplay) || p.currencyDisplay === 'rial')
-                               ? p.currencyDisplay
-                               : 'rial';
-                             const numberDigits = (options?.digits?.includes(p.numberDigits) || p.numberDigits === 'locale')
-                               ? p.numberDigits
-                               : 'locale';
-                             const calendar = (options?.calendar?.includes(p.calendar) || p.calendar === 'locale')
-                               ? p.calendar
-                               : 'locale';
-                             return {
-                               ...p,
-                               countryCode: e.target.value,
-                               currency: country?.currency || p.currency,
-                               timezone: timezoneWasDefault
-                                 ? (country?.timezone || p.timezone)
-                                 : p.timezone,
-                               currencyDisplay,
-                               numberDigits,
-                               calendar,
-                             };
-                           });
+                      <Combobox
+                        items={sortedCountries.map((c) => ({ value: c.code, label: getLocalizedCountryName(c.code, locale) }))}
+                        value={form.countryCode || undefined}
+                        onValueChange={(code) => {
+                          const country = COUNTRIES.find(c => c.code === code);
+                          setForm((p) => {
+                            const previousCountry = getCountryByCode(p.countryCode);
+                            const timezoneWasDefault = !previousCountry || p.timezone === previousCountry.timezone;
+                            // Only prefill the currency from the newly chosen country when the
+                            // current value is empty or still the previous country's default. A
+                            // currency the owner picked on purpose is never overwritten — this is
+                            // what lets the base currency differ from the country default.
+                            const currencyWasDefault = !p.currency || !previousCountry || p.currency === previousCountry.currency;
+                            const options = country?.localeOptions;
+                            // Re-evaluate locale display preferences against the
+                            // newly selected country (#390): keep supported values
+                            // and reset unsupported ones to their neutral defaults.
+                            const currencyDisplay = (options?.currencyDisplay?.includes(p.currencyDisplay) || p.currencyDisplay === 'rial')
+                              ? p.currencyDisplay
+                              : 'rial';
+                            const numberDigits = (options?.digits?.includes(p.numberDigits) || p.numberDigits === 'locale')
+                              ? p.numberDigits
+                              : 'locale';
+                            const calendar = (options?.calendar?.includes(p.calendar) || p.calendar === 'locale')
+                              ? p.calendar
+                              : 'locale';
+                            return {
+                              ...p,
+                              countryCode: code,
+                              currency: currencyWasDefault ? (country?.currency || p.currency) : p.currency,
+                              timezone: timezoneWasDefault
+                                ? (country?.timezone || p.timezone)
+                                : p.timezone,
+                              currencyDisplay,
+                              numberDigits,
+                              calendar,
+                            };
+                          });
                         }}
-                        aria-label={tCommon('search')}
-                        className="px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand bg-white"
-                      >
-                        <option value="">{t('selectCountry')}</option>
-                        {sortedCountries.map((c) => (
-                          <option key={c.code} value={c.code}>{getLocalizedCountryName(c.code, locale)}</option>
-                        ))}
-                      </select>
+                        placeholder={t('selectCountry')}
+                        searchPlaceholder={tCommon('search')}
+                        className="bg-white"
+                      />
                       <TimeZoneSelect
                         value={form.timezone}
                         onChange={(timezone) => setForm((p) => ({ ...p, timezone }))}
@@ -2443,14 +2458,18 @@ export default function SettingsPage() {
                         className="px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand bg-white"
                         ariaLabel={t('timezone')}
                       />
-                      <input 
-                        type="text" 
-                        value={form.currency} 
-                        onChange={(e) => setForm((p) => ({ ...p, currency: e.target.value }))}
-                        placeholder={t('currencyAutoFilled')}
-                        className="px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand bg-gray-50" 
-                        readOnly
-                        dir="ltr"
+                      <Combobox
+                        items={[
+                          ...(form.currency && !CURRENCY_CODES.includes(form.currency)
+                            ? [{ value: form.currency, label: form.currency }]
+                            : []),
+                          ...CURRENCY_CODES.map((c): ComboboxItem => ({ value: c, label: c })),
+                        ]}
+                        value={form.currency || undefined}
+                        onValueChange={(code) => setForm((p) => ({ ...p, currency: code }))}
+                        placeholder={t('currency')}
+                        searchPlaceholder={tCommon('search')}
+                        className="bg-white"
                       />
                     </div>
                   ) : (

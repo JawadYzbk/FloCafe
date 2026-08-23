@@ -27,6 +27,8 @@ import {
   formatCurrencyForTenant,
   formatNumberForTenant,
   formatDateForTenant,
+  convertBaseToTender,
+  type SecondaryCurrency,
 } from '@/lib/countries';
 import { parseDbTimestamp } from '@/lib/utils';
 import { getCachedMessages, loadLocaleMessages } from '@/lib/i18n/loader';
@@ -103,6 +105,12 @@ export interface WebPrintOptions {
   trimDecimals?: boolean;
   /** UI language for receipt labels (defaults to the active store language). */
   language?: Language;
+  /**
+   * Configured secondary (tender) currencies. When present, the grand total is
+   * also printed in each so the customer can pay "this or this" — e.g. a USD
+   * base total also shown in LBP at the stored rate.
+   */
+  secondaryCurrencies?: SecondaryCurrency[];
 }
 
 /**
@@ -253,6 +261,7 @@ export function generateBillHtml(
     showTableNumber = true,
     isReprint = false,
     trimDecimals = false,
+    secondaryCurrencies = [],
   } = opts;
 
   const lang = resolveLanguage(opts.language);
@@ -409,6 +418,7 @@ export function generateBillHtml(
       ${totals.serviceCharge ? `<tr><td>${escapeHtml(totals.serviceCharge.label.primary)}</td><td class="text-end num">${fmtAmount(totals.serviceCharge.amount)}</td></tr>` : ''}
       ${totals.deliveryCharge ? `<tr><td>${escapeHtml(L.deliveryCharge)}</td><td class="text-end num">${fmtAmount(totals.deliveryCharge.amount)}</td></tr>` : ''}
       <tr class="total-row"><td><strong>${escapeHtml(L.grandTotal)}</strong></td><td class="text-end num"><strong>${fmtAmount(totals.grandTotal.amount)}</strong></td></tr>
+      ${secondaryCurrencies.map((c) => `<tr class="total-secondary"><td></td><td class="text-end num">${escapeHtml(fmtQuantity(convertBaseToTender(totals.grandTotal.amount, c).rounded))} ${escapeHtml(c.symbol || c.code)}</td></tr>`).join('')}
       ` : ''}
     </table>
 
@@ -491,6 +501,7 @@ function getPaperStyles(size: PaperSize): string {
     .totals-table { width: 100%; border-collapse: collapse; margin-bottom: 15px; }
     .totals-table td { padding: 6px 8px; }
     .total-row { border-top: 2px solid #333; font-size: 16px; }
+    .total-secondary td { padding-top: 0; color: #555; font-size: 12px; }
     .footer { text-align: center; margin-top: 30px; padding-top: 15px; border-top: 1px solid #ccc; }
     .powered-by { font-size: 10px; margin-top: 8px; color: #555; }
     .text-end { text-align: end !important; }
