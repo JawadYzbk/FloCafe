@@ -10,8 +10,12 @@ import { Input } from '@/components/ui/input';
 import {
   Table, TableBody, TableCell, TableHead, TableHeader, TableRow,
 } from '@/components/ui/table';
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle,
+} from '@/components/ui/dialog';
 import { useFormatCurrency } from '@/hooks/useFormatCurrency';
 import { useFormatNumber } from '@/hooks/useFormatNumber';
+import { useAuthStore } from '@/store/auth';
 
 type ExpenseKey = keyof AppConfig['Messages']['expenses'];
 const EXPENSE_CATEGORY_KEYS: Record<string, ExpenseKey> = {
@@ -47,6 +51,7 @@ export default function ReportsPage() {
   const tExpenses = useTranslations('expenses');
   const currencyFmt = useFormatCurrency();
   const fmtNum = useFormatNumber();
+  const businessName = useAuthStore((s) => s.currentTenant?.business_name) || 'FloCafe';
   const pct = (n: number) => `${(n * 100).toFixed(1)}%`;
 
   const [preset, setPreset] = useState<Preset>('today');
@@ -108,7 +113,8 @@ export default function ReportsPage() {
     const win = window.open('', '_blank', 'width=900,height=700');
     if (!win) { toast.error(t('printBlocked')); return; }
     win.document.write(buildReportHtml(data, format, {
-      title: t('title'), currency: currencyFmt, num: (n: number) => fmtNum(n), expenseCatLabel,
+      title: t('title'), businessName, generatedAt: new Date().toLocaleString(),
+      currency: currencyFmt, num: (n: number) => fmtNum(n), expenseCatLabel,
       L: {
         grossSales: t('grossSales'), discounts: t('discounts'), tax: t('tax'), netSales: t('netSales'),
         collected: t('collected'), orders: t('orders'), netProfit: t('netProfit'), grossProfit: t('grossProfit'),
@@ -121,6 +127,86 @@ export default function ReportsPage() {
     win.document.close(); win.focus();
     setTimeout(() => win.print(), 250);
   };
+
+  // Per-report detailed views — fetch the dedicated endpoint (full, authoritative
+  // data with all columns) and show a sortable table. Column getters reuse the
+  // tenant formatters so the detail matches the summary exactly.
+  type DetailCol = { label: string; get: (row: any) => string | number; sort?: (row: any) => number | string; num?: boolean };
+  const detailConfigs: Record<string, { title: string; endpoint: string; extract: (r: any) => any[]; columns: DetailCol[] }> = {
+    products: { title: t('topItems'), endpoint: '/reports/products', extract: (r) => r.products || [], columns: [
+      { label: t('item'), get: (r) => r.product_name },
+      { label: t('quantity'), get: (r) => fmtNum(r.quantity), sort: (r) => r.quantity, num: true },
+      { label: t('revenue'), get: (r) => currencyFmt(r.revenue), sort: (r) => r.revenue, num: true },
+      { label: t('cogs'), get: (r) => currencyFmt(r.cost), sort: (r) => r.cost, num: true },
+      { label: t('profit'), get: (r) => currencyFmt(r.profit), sort: (r) => r.profit, num: true },
+      { label: t('margin'), get: (r) => pct(r.margin), sort: (r) => r.margin, num: true },
+    ] },
+    categories: { title: t('categories'), endpoint: '/reports/categories', extract: (r) => r.categories || [], columns: [
+      { label: t('category'), get: (r) => r.category },
+      { label: t('quantity'), get: (r) => fmtNum(r.quantity), sort: (r) => r.quantity, num: true },
+      { label: t('revenue'), get: (r) => currencyFmt(r.revenue), sort: (r) => r.revenue, num: true },
+      { label: t('profit'), get: (r) => currencyFmt(r.profit), sort: (r) => r.profit, num: true },
+      { label: t('margin'), get: (r) => pct(r.margin), sort: (r) => r.margin, num: true },
+    ] },
+    modifiers: { title: t('modifiers'), endpoint: '/reports/modifiers', extract: (r) => r.modifiers || [], columns: [
+      { label: t('modifier'), get: (r) => r.addon_name },
+      { label: t('quantity'), get: (r) => fmtNum(r.quantity), sort: (r) => r.quantity, num: true },
+      { label: t('revenue'), get: (r) => currencyFmt(r.revenue), sort: (r) => r.revenue, num: true },
+      { label: t('attachment'), get: (r) => pct(r.attachmentRate), sort: (r) => r.attachmentRate, num: true },
+    ] },
+    staff: { title: t('staff'), endpoint: '/reports/staff', extract: (r) => r.staff || [], columns: [
+      { label: t('staff'), get: (r) => r.staff_name || '—' },
+      { label: t('orders'), get: (r) => fmtNum(r.orders), sort: (r) => r.orders, num: true },
+      { label: t('quantity'), get: (r) => fmtNum(r.itemsSold), sort: (r) => r.itemsSold, num: true },
+      { label: t('discounts'), get: (r) => currencyFmt(r.discounts), sort: (r) => r.discounts, num: true },
+      { label: t('sales'), get: (r) => currencyFmt(r.net), sort: (r) => r.net, num: true },
+      { label: t('avgTicket'), get: (r) => currencyFmt(r.avgOrder), sort: (r) => r.avgOrder, num: true },
+    ] },
+    orderTypes: { title: t('orderTypes'), endpoint: '/reports/order-types', extract: (r) => r.orderTypes || [], columns: [
+      { label: t('orderType'), get: (r) => r.type },
+      { label: t('orders'), get: (r) => fmtNum(r.orders), sort: (r) => r.orders, num: true },
+      { label: t('sales'), get: (r) => currencyFmt(r.net), sort: (r) => r.net, num: true },
+      { label: t('avgTicket'), get: (r) => currencyFmt(r.avgOrder), sort: (r) => r.avgOrder, num: true },
+    ] },
+    payments: { title: t('paymentMethods'), endpoint: '/reports/payments', extract: (r) => r.payments || [], columns: [
+      { label: t('method'), get: (r) => r.method },
+      { label: t('orders'), get: (r) => fmtNum(r.count), sort: (r) => r.count, num: true },
+      { label: t('amount'), get: (r) => currencyFmt(r.amount), sort: (r) => r.amount, num: true },
+    ] },
+    discounts: { title: t('discountsTitle'), endpoint: '/reports/discounts', extract: (r) => r.discounts?.byStaff || [], columns: [
+      { label: t('staff'), get: (r) => r.staff_name || '—' },
+      { label: t('orders'), get: (r) => fmtNum(r.count), sort: (r) => r.count, num: true },
+      { label: t('total'), get: (r) => currencyFmt(r.total), sort: (r) => r.total, num: true },
+    ] },
+    voids: { title: t('voids'), endpoint: '/reports/voids', extract: (r) => r.voids?.byProduct || [], columns: [
+      { label: t('item'), get: (r) => r.product_name },
+      { label: t('orders'), get: (r) => fmtNum(r.count), sort: (r) => r.count, num: true },
+      { label: t('total'), get: (r) => currencyFmt(r.value), sort: (r) => r.value, num: true },
+    ] },
+  };
+
+  const [detailKey, setDetailKey] = useState<string | null>(null);
+  const [detailRows, setDetailRows] = useState<Record<string, unknown>[]>([]);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [sort, setSort] = useState<{ col: number; dir: 1 | -1 }>({ col: 1, dir: -1 });
+
+  const openDetail = async (key: string) => {
+    setDetailKey(key); setDetailRows([]); setDetailLoading(true); setSort({ col: 1, dir: -1 });
+    try {
+      const params: Record<string, string> = {};
+      if (preset === 'custom') { params.start_date = startDate; params.end_date = endDate; } else params.preset = preset;
+      const { data } = await api.get(detailConfigs[key].endpoint, { params });
+      setDetailRows(detailConfigs[key].extract(data));
+    } catch { toast.error(t('loadFailed')); } finally { setDetailLoading(false); }
+  };
+
+  const detailCfg = detailKey ? detailConfigs[detailKey] : null;
+  const sortedDetail = detailCfg ? [...detailRows].sort((a, b) => {
+    const col = detailCfg.columns[sort.col];
+    if (!col?.sort) return 0;
+    const va = col.sort(a), vb = col.sort(b);
+    return (va < vb ? -1 : va > vb ? 1 : 0) * sort.dir;
+  }) : [];
 
   const kpis = data ? [
     { label: t('netSales'), value: currencyFmt(data.summary.net), d: delta('net') },
@@ -201,7 +287,7 @@ export default function ReportsPage() {
           </ReportCard>
 
           <div className="grid gap-6 lg:grid-cols-2">
-            <ReportCard title={t('paymentMethods')}>
+            <ReportCard title={t('paymentMethods')} onDetails={() => openDetail('payments')} detailsLabel={t('details')}>
               <SimpleTable head={[t('method'), t('amount')]} align="end" empty={t('noData')}
                 rows={data.payments.map((p) => [p.method, currencyFmt(p.amount)])} />
             </ReportCard>
@@ -209,48 +295,92 @@ export default function ReportsPage() {
               <SimpleTable head={[t('category'), t('total')]} align="end" empty={t('noData')}
                 rows={data.expenses.byCategory.map((e) => [expenseCatLabel(e.category), currencyFmt(e.total)])} />
             </ReportCard>
-            <ReportCard title={t('orderTypes')}>
+            <ReportCard title={t('orderTypes')} onDetails={() => openDetail('orderTypes')} detailsLabel={t('details')}>
               <SimpleTable head={[t('orderType'), t('orders'), t('sales')]} align="end" empty={t('noData')}
                 rows={data.orderTypes.map((o) => [o.type, fmtNum(o.orders), currencyFmt(o.net)])} />
             </ReportCard>
-            <ReportCard title={t('staff')}>
+            <ReportCard title={t('staff')} onDetails={() => openDetail('staff')} detailsLabel={t('details')}>
               <SimpleTable head={[t('staff'), t('orders'), t('sales')]} align="end" empty={t('noData')}
                 rows={data.staff.map((s) => [s.staff_name || '—', fmtNum(s.orders), currencyFmt(s.net)])} />
             </ReportCard>
-            <ReportCard title={t('categories')}>
+            <ReportCard title={t('categories')} onDetails={() => openDetail('categories')} detailsLabel={t('details')}>
               <SimpleTable head={[t('category'), t('quantity'), t('revenue')]} align="end" empty={t('noData')}
                 rows={data.categories.map((c) => [c.category, fmtNum(c.quantity), currencyFmt(c.revenue)])} />
             </ReportCard>
-            <ReportCard title={t('modifiers')}>
+            <ReportCard title={t('modifiers')} onDetails={() => openDetail('modifiers')} detailsLabel={t('details')}>
               <SimpleTable head={[t('modifier'), t('quantity'), t('revenue')]} align="end" empty={t('noData')}
                 rows={data.modifiers.map((m) => [m.addon_name, fmtNum(m.quantity), currencyFmt(m.revenue)])} />
             </ReportCard>
-            <ReportCard title={t('discountsTitle')}>
+            <ReportCard title={t('discountsTitle')} onDetails={() => openDetail('discounts')} detailsLabel={t('details')}>
               <SimpleTable head={[t('reason'), t('total')]} align="end" empty={t('noData')}
                 rows={data.discounts.byReason.map((d) => [d.reason, currencyFmt(d.total)])} />
             </ReportCard>
-            <ReportCard title={t('voids')}>
+            <ReportCard title={t('voids')} onDetails={() => openDetail('voids')} detailsLabel={t('details')}>
               <SimpleTable head={[t('item'), t('total')]} align="end" empty={t('noData')}
                 rows={data.voids.byProduct.map((v) => [v.product_name, currencyFmt(v.value)])} />
             </ReportCard>
           </div>
 
-          <ReportCard title={t('topItems')}>
+          <ReportCard title={t('topItems')} onDetails={() => openDetail('products')} detailsLabel={t('details')}>
             <SimpleTable head={[t('item'), t('quantity'), t('revenue'), t('profit')]} align="end" empty={t('noData')}
               rows={data.topProducts.slice(0, 25).map((i) => [i.product_name, fmtNum(i.quantity), currencyFmt(i.revenue), currencyFmt(i.profit)])} />
           </ReportCard>
         </>
       )}
+
+      {/* Per-report detail dialog (full data, sortable) */}
+      <Dialog open={!!detailKey} onOpenChange={(o) => { if (!o) setDetailKey(null); }}>
+        <DialogContent className="sm:max-w-3xl">
+          <DialogHeader><DialogTitle>{detailCfg?.title}</DialogTitle></DialogHeader>
+          <div className="max-h-[70vh] overflow-auto">
+            {detailLoading ? (
+              <p className="text-center text-gray-400 py-10">…</p>
+            ) : !detailCfg || sortedDetail.length === 0 ? (
+              <p className="text-center text-gray-400 py-10">{t('noData')}</p>
+            ) : (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    {detailCfg.columns.map((c, i) => (
+                      <TableHead
+                        key={c.label}
+                        onClick={() => c.sort && setSort((s) => ({ col: i, dir: s.col === i ? (s.dir * -1 as 1 | -1) : -1 }))}
+                        className={`${i > 0 ? 'text-end' : ''} ${c.sort ? 'cursor-pointer select-none hover:text-brand' : ''}`}
+                      >
+                        {c.label}{sort.col === i ? (sort.dir === -1 ? ' ↓' : ' ↑') : ''}
+                      </TableHead>
+                    ))}
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {sortedDetail.map((row, ri) => (
+                    <TableRow key={ri}>
+                      {detailCfg.columns.map((c, ci) => (
+                        <TableCell key={ci} className={`${ci > 0 ? 'text-end tabular-nums' : 'text-gray-700'}`}>{c.get(row)}</TableCell>
+                      ))}
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
 
-function ReportCard({ title, subtitle, className, children }: { title: string; subtitle?: string; className?: string; children: React.ReactNode }) {
+function ReportCard({ title, subtitle, className, onDetails, detailsLabel, children }: { title: string; subtitle?: string; className?: string; onDetails?: () => void; detailsLabel?: string; children: React.ReactNode }) {
   return (
     <div className={`rounded-xl border border-gray-100 bg-white overflow-hidden ${className ?? ''}`}>
-      <div className="px-4 py-3 border-b border-gray-100">
-        <h2 className="font-semibold text-gray-900">{title}</h2>
-        {subtitle && <p className="text-xs text-gray-400">{subtitle}</p>}
+      <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between gap-2">
+        <div>
+          <h2 className="font-semibold text-gray-900">{title}</h2>
+          {subtitle && <p className="text-xs text-gray-400">{subtitle}</p>}
+        </div>
+        {onDetails && (
+          <button type="button" onClick={onDetails} className="text-xs font-medium text-brand hover:underline shrink-0">{detailsLabel}</button>
+        )}
       </div>
       <div className="overflow-x-auto">{children}</div>
     </div>
@@ -279,7 +409,7 @@ function SimpleTable({ head, rows, align, empty }: { head: string[]; rows: (stri
 function buildReportHtml(
   d: Overview,
   format: 'a4' | 'thermal',
-  ctx: { title: string; currency: (n: number) => string; num: (n: number) => string; expenseCatLabel: (c: string) => string; L: Record<string, string> },
+  ctx: { title: string; businessName: string; generatedAt: string; currency: (n: number) => string; num: (n: number) => string; expenseCatLabel: (c: string) => string; L: Record<string, string> },
 ): string {
   const { currency, num, expenseCatLabel: cat, L } = ctx;
   const esc = (s: unknown) => String(s ?? '').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c] as string));
@@ -294,9 +424,15 @@ function buildReportHtml(
     [L.orders, num(d.summary.orders)], [L.cogs, '-' + currency(d.profit.cogs)], [L.grossProfit, currency(d.profit.grossProfit)],
     [L.expenses, '-' + currency(d.profit.operatingExpenses)], [L.netProfit, currency(d.profit.netOperatingProfit)],
   ];
+  const header = thermal
+    ? `<h1>${esc(ctx.businessName)}</h1><p class="sub">${esc(ctx.title)}</p>
+       <p class="period">${esc(d.meta.range.startDate)} → ${esc(d.meta.range.endDate)}</p>`
+    : `<div class="head">
+         <div><div class="biz">${esc(ctx.businessName)}</div><div class="rtitle">${esc(ctx.title)}</div></div>
+         <div class="meta"><div>${esc(d.meta.range.startDate)} → ${esc(d.meta.range.endDate)}</div><div class="gen">${esc(ctx.generatedAt)}</div></div>
+       </div>`;
   const body = `
-    <h1>${esc(ctx.title)}</h1>
-    <p class="period">${esc(d.meta.range.startDate)} → ${esc(d.meta.range.endDate)}</p>
+    ${header}
     <table class="summary">${rows(summary)}</table>
     ${section(L.paymentMethods, [L.method, L.amount], d.payments.map((p) => [p.method, currency(p.amount)]))}
     ${section(L.expenses + ' — ' + L.byCategory, [L.category, L.total], d.expenses.byCategory.map((e) => [cat(e.category), currency(e.total)]))}
@@ -304,16 +440,25 @@ function buildReportHtml(
     ${section(L.categories, [L.category, L.revenue], d.categories.map((c) => [c.category, currency(c.revenue)]))}
     ${section(L.topItems, [L.item, L.quantity], d.topProducts.slice(0, thermal ? 20 : 60).map((i) => [i.product_name, num(i.quantity)]))}
   `;
-  return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(ctx.title)}</title><style>
-    @page { size: ${thermal ? '80mm auto' : 'A4'}; margin: ${thermal ? '4mm' : '16mm'}; }
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(ctx.businessName)} — ${esc(ctx.title)}</title><style>
+    @page { size: ${thermal ? '80mm auto' : 'A4'}; margin: ${thermal ? '4mm' : '18mm'}; }
     * { box-sizing: border-box; }
-    body { font-family: ${thermal ? "'Courier New', monospace" : 'system-ui, sans-serif'}; color: #111; margin: 0; ${thermal ? 'width: 72mm; font-size: 11px;' : 'font-size: 13px;'} }
-    h1 { font-size: ${thermal ? '14px' : '20px'}; margin: 0 0 2px; text-align: ${thermal ? 'center' : 'start'}; }
-    h2 { font-size: ${thermal ? '12px' : '15px'}; margin: 16px 0 4px; border-bottom: 1px solid #ccc; padding-bottom: 2px; }
-    .period { color: #666; margin: 0 0 10px; text-align: ${thermal ? 'center' : 'start'}; }
+    body { font-family: ${thermal ? "'Courier New', monospace" : "'Segoe UI', system-ui, -apple-system, sans-serif"}; color: #1a1a1a; margin: 0; ${thermal ? 'width: 72mm; font-size: 11px;' : 'font-size: 12.5px; line-height: 1.45;'} }
+    h1 { font-size: ${thermal ? '14px' : '22px'}; margin: 0 0 2px; text-align: ${thermal ? 'center' : 'start'}; }
+    .sub { text-align: center; color: #444; margin: 0 0 4px; }
+    .head { display: flex; justify-content: space-between; align-items: flex-end; border-bottom: 2px solid #111; padding-bottom: 10px; margin-bottom: 16px; }
+    .biz { font-size: 22px; font-weight: 800; letter-spacing: -0.01em; }
+    .rtitle { font-size: 13px; color: #555; text-transform: uppercase; letter-spacing: 0.08em; margin-top: 2px; }
+    .meta { text-align: end; font-size: 12px; color: #555; }
+    .meta .gen { color: #999; font-size: 11px; margin-top: 2px; }
+    h2 { font-size: ${thermal ? '12px' : '14px'}; margin: 18px 0 6px; text-transform: uppercase; letter-spacing: 0.05em; color: #333; border-bottom: 1px solid #ddd; padding-bottom: 3px; }
+    .period { color: #666; margin: 0 0 10px; text-align: center; }
     table { width: 100%; border-collapse: collapse; }
-    td, th { padding: ${thermal ? '2px 0' : '4px 6px'}; text-align: start; border-bottom: 1px solid #eee; }
-    th { font-weight: 700; } .num { text-align: end; white-space: nowrap; }
-    .summary td { border-bottom: 1px dashed #ddd; font-weight: 600; }
+    td, th { padding: ${thermal ? '2px 0' : '5px 8px'}; text-align: start; border-bottom: 1px solid #eee; }
+    th { font-weight: 700; ${thermal ? '' : 'background: #f7f7f7;'} font-size: ${thermal ? '11px' : '11px'}; text-transform: uppercase; letter-spacing: 0.03em; color: #666; }
+    .num { text-align: end; white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .summary { margin-bottom: 6px; } .summary td { border-bottom: 1px dashed #ddd; font-weight: 600; padding: ${thermal ? '2px 0' : '6px 8px'}; }
+    .summary tr:last-child td { border-top: 2px solid #111; border-bottom: none; font-size: ${thermal ? '12px' : '14px'}; font-weight: 800; }
+    tbody tr:nth-child(even) td { ${thermal ? '' : 'background: #fafafa;'} }
   </style></head><body>${body}</body></html>`;
 }

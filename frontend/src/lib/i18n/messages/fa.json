@@ -2389,6 +2389,9 @@
     "modifier": "افزودنی",
     "reason": "دلیل",
     "discountsTitle": "تخفیف‌ها",
-    "voids": "ابطال‌ها"
+    "voids": "ابطال‌ها",
+    "margin": "حاشیه سود",
+    "attachment": "درصد پیوست",
+    "details": "جزئیات"
   }
 }

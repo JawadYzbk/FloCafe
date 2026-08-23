@@ -2389,6 +2389,9 @@
     "modifier": "Modificador",
     "reason": "Motivo",
     "discountsTitle": "Descontos",
-    "voids": "Cancelamentos"
+    "voids": "Cancelamentos",
+    "margin": "Margem",
+    "attachment": "Anexo %",
+    "details": "Detalhes"
   }
 }

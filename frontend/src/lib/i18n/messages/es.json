@@ -2389,6 +2389,9 @@
     "modifier": "Modificador",
     "reason": "Motivo",
     "discountsTitle": "Descuentos",
-    "voids": "Anulaciones"
+    "voids": "Anulaciones",
+    "margin": "Margen",
+    "attachment": "Adjunto %",
+    "details": "Detalles"
   }
 }

@@ -2389,6 +2389,9 @@
     "modifier": "الإضافة",
     "reason": "السبب",
     "discountsTitle": "الخصومات",
-    "voids": "الإلغاءات"
+    "voids": "الإلغاءات",
+    "margin": "الهامش",
+    "attachment": "نسبة الإرفاق",
+    "details": "التفاصيل"
   }
 }

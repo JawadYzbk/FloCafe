@@ -2389,6 +2389,9 @@
     "modifier": "Modifier",
     "reason": "Reason",
     "discountsTitle": "Discounts",
-    "voids": "Voids"
+    "voids": "Voids",
+    "margin": "Margin",
+    "attachment": "Attach %",
+    "details": "Details"
   }
 }
