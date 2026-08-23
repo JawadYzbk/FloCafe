@@ -77,7 +77,7 @@ export function profitAndLoss(
     `SELECT COALESCE(SUM(total), 0) AS n FROM orders WHERE created_at >= ? AND created_at < ? AND status != 'cancelled'`,
   ).get(startISO, endISO) as { n: number }).n;
   const cogs = (db.prepare(`
-    SELECT COALESCE(SUM(oi.quantity * COALESCE(p.cost, 0)), 0) AS c
+    SELECT COALESCE(SUM(oi.quantity * COALESCE(oi.unit_cost, p.cost, 0)), 0) AS c
     FROM order_items oi JOIN orders o ON o.id = oi.order_id
     LEFT JOIN products p ON p.id = oi.product_id
     WHERE o.created_at >= ? AND o.created_at < ? AND ${ACTIVE}

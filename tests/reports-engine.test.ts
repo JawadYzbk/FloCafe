@@ -125,6 +125,17 @@ async function main() {
   eq(prev.startDate, '2026-01-14', 'previousEquivalent start');
   eq(R.rangeDays({ startDate: '2026-01-15', endDate: '2026-01-17' }), 3, 'rangeDays inclusive');
 
+  // Cost snapshot (v77): a line's stored unit_cost wins over the current
+  // products.cost, so profit stays accurate after a later cost change.
+  const D2 = '2026-02-01 12:00:00';
+  db.prepare(`INSERT INTO products (id, category_id, name, price, cost, created_at, updated_at) VALUES ('p3','c1','Mocha',8,100,?,?)`).run(now(), now());
+  db.prepare(`INSERT INTO orders (id, order_number, user_id, type, status, subtotal, tax_amount, discount_amount, total, created_at, updated_at) VALUES (10,'D','u1','dine_in','completed',8,0,0,8,?,?)`).run(D2, D2);
+  db.prepare(`INSERT INTO order_items (order_id, product_id, product_name, unit_price, unit_cost, quantity, subtotal, tax_amount, discount_amount, total, status, created_at, updated_at) VALUES (10,'p3','Mocha',8,2,1,8,0,0,8,'completed',?,?)`).run(D2, D2);
+  const [fs, fe2] = R.rangeToBounds({ startDate: '2026-02-01', endDate: '2026-02-01' });
+  const snap = R.productSales(db, fs, fe2).find((p: any) => p.product_id === 'p3');
+  eq(snap.cost, 2, 'COGS uses snapshotted unit_cost (2), not current products.cost (100)');
+  eq(snap.profit, 6, 'profit reflects the historical cost snapshot');
+
   // Empty window
   const [es, ee] = R.rangeToBounds({ startDate: '2020-01-01', endDate: '2020-01-01' });
   const empty = R.salesSummary(db, es, ee);

@@ -7,10 +7,10 @@
  *   - modifier "revenue" = Σ order_item_addons.price × quantity, reported
  *     separately so add-on revenue is never double-counted against products.
  *
- * COGS/profit use products.cost. NOTE: item cost is not snapshotted at sale
- * time, so cost/profit reflect the CURRENT product cost — a documented
- * limitation (see docs/reporting.md). Revenue, tax and quantities come from the
- * per-line snapshots and are historically accurate.
+ * COGS/profit use the cost snapshotted onto each line at sale time
+ * (order_items.unit_cost, migration v77), falling back to the current
+ * products.cost only for rows written before that migration. Revenue, tax and
+ * quantities also come from per-line snapshots — all historically accurate.
  */
 import type Database from 'better-sqlite3';
 
@@ -31,7 +31,7 @@ export function productSales(db: Database.Database, startISO: string, endISO: st
     SELECT oi.product_id, oi.product_name,
       SUM(oi.quantity) AS quantity,
       COALESCE(SUM(oi.subtotal), 0) AS revenue,
-      COALESCE(SUM(oi.quantity * COALESCE(p.cost, 0)), 0) AS cost
+      COALESCE(SUM(oi.quantity * COALESCE(oi.unit_cost, p.cost, 0)), 0) AS cost
     FROM order_items oi
     JOIN orders o ON o.id = oi.order_id
     LEFT JOIN products p ON p.id = oi.product_id
@@ -60,7 +60,7 @@ export function categorySales(db: Database.Database, startISO: string, endISO: s
     SELECT COALESCE(c.name, '—') AS category,
       SUM(oi.quantity) AS quantity,
       COALESCE(SUM(oi.subtotal), 0) AS revenue,
-      COALESCE(SUM(oi.quantity * COALESCE(p.cost, 0)), 0) AS cost
+      COALESCE(SUM(oi.quantity * COALESCE(oi.unit_cost, p.cost, 0)), 0) AS cost
     FROM order_items oi
     JOIN orders o ON o.id = oi.order_id
     LEFT JOIN products p ON p.id = oi.product_id

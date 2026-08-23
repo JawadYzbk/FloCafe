@@ -4148,6 +4148,22 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
       `);
     },
   },
+  {
+    version: 77,
+    name: 'snapshot_order_item_cost',
+    up: () => {
+      // Snapshot the product's cost onto each line at sale time so COGS/profit
+      // reports stay historically accurate even after a product's cost later
+      // changes. Nullable: rows written before this migration keep NULL and the
+      // reporting engine falls back to the current products.cost for them.
+      // Guarded so it is safe to re-run (ALTER ADD COLUMN is not idempotent) and
+      // for fresh installs whose order_items DDL already declares the column.
+      const cols = db.prepare(`PRAGMA table_info(order_items)`).all() as { name: string }[];
+      if (!cols.some((c) => c.name === 'unit_cost')) {
+        db.exec(`ALTER TABLE order_items ADD COLUMN unit_cost REAL;`);
+      }
+    },
+  },
 ];
 
 function syncBackupBeforeMigration(fromVersion: number, toVersion: number): void {
@@ -4482,6 +4498,7 @@ function createSchema(): void {
       product_name TEXT NOT NULL,
       product_sku TEXT,
       unit_price REAL NOT NULL,
+      unit_cost REAL,
       quantity INTEGER NOT NULL DEFAULT 1,
       inventory_deducted_quantity REAL NOT NULL DEFAULT 0,
       subtotal REAL NOT NULL,

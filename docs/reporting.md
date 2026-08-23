@@ -35,7 +35,7 @@ Frontend: `frontend/src/app/(dashboard)/reports/page.tsx` and the
 | **Collected** | Σ `bills.paid_amount` (cash actually taken — a *cash* figure, not a sales figure) |
 | Items sold | Σ `order_items.quantity` for non-cancelled/voided lines |
 | Avg order | Net sales ÷ order count |
-| COGS | Σ `order_items.quantity × products.cost` |
+| COGS | Σ `order_items.quantity × unit_cost` (cost snapshotted at sale time; falls back to current `products.cost` for pre-v77 rows) |
 | Gross profit | Net sales − COGS |
 | Operating expenses | Σ `expenses.amount` (Expenses module) |
 | **Net operating profit** | Gross profit − Operating expenses |
@@ -95,9 +95,10 @@ exists), price-change history, and a general audit trail (only
 
 ## Known limitations
 
-- **COGS uses current `products.cost`** — item cost is not snapshotted at sale
-  time, so cost/profit reflect the current cost. Revenue/tax/quantity are
-  historically accurate. Snapshotting item cost is a safe future migration.
+- **COGS/profit are historically accurate** — as of migration v77 each line
+  snapshots the product cost into `order_items.unit_cost` at sale time (the
+  reporting engine falls back to current `products.cost` only for rows created
+  before v77). Revenue/tax/quantity were already snapshotted.
 - Money is aggregated as SQLite `REAL` (the app's storage type); values are
   rounded for display.
 
