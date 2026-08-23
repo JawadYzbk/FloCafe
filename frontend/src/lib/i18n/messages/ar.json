@@ -630,7 +630,8 @@
     "unpaid": "غير مدفوع",
     "updateDiscount": "تحديث الخصم",
     "walletMaxAmount": "مبلغ المحفظة يتجاوز الرصيد المتاح. الحد الأقصى: {max}",
-    "noProductsFound": "لم يُعثر على منتجات"
+    "noProductsFound": "لم يُعثر على منتجات",
+    "addTenderLine": "إضافة سطر دفع"
   },
   "printTest": {
     "amt": "المبلغ",

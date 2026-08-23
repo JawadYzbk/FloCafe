@@ -630,7 +630,8 @@
     "unpaid": "Não Pago",
     "updateDiscount": "Atualizar Desconto",
     "walletMaxAmount": "O valor da carteira excede o saldo disponível. Máx.: {max}",
-    "noProductsFound": "Nenhum produto encontrado"
+    "noProductsFound": "Nenhum produto encontrado",
+    "addTenderLine": "Adicionar linha de pagamento"
   },
   "printTest": {
     "amt": "Total",

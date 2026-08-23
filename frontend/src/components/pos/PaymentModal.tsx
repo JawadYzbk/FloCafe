@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef } from 'react';
 import { Dialog as DialogPrimitive } from 'radix-ui';
-import { X, Wallet, ArrowLeftRight, CheckCircle2, Sparkles, User, Percent, Send, ChevronDown } from 'lucide-react';
+import { X, Wallet, ArrowLeftRight, CheckCircle2, Sparkles, User, Percent, Send, ChevronDown, Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import api from '@/lib/api';
@@ -42,13 +42,22 @@ interface Props {
 }
 
 interface Payment {
+  /** Stable client-side id — lets the same method appear on more than one line
+   *  (e.g. part paid in USD cash + part in LBP cash) with unique React keys. */
+  id: string;
   method: string;
   payment_method_id?: number;
   amount: string;
   // Tender currency code when paying in a secondary currency (e.g. LBP);
   // undefined means the tenant base currency.
   currency?: string;
+  /** True for an extra split line the cashier added (removable, not a fixed
+   *  per-method row). Used to preserve it across method-list refreshes. */
+  extra?: boolean;
 }
+
+let paymentLineSeq = 0;
+const makeLineId = () => `pl-${++paymentLineSeq}`;
 
 // Fixed conversion rate for redeeming loyalty wallet points as payment (points per 1 currency unit).
 // Must match LOYALTY_REDEMPTION_RATE in main/routes/bills.ts.
@@ -99,7 +108,7 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
   const [sendingWa, setSendingWa] = useState(false);
   const [pointsEarned, setPointsEarned] = useState(0);
   const [payments, setPayments] = useState<Payment[]>(
-    PAYMENT_METHODS.map((method) => ({ method: method.key, amount: '' })),
+    PAYMENT_METHODS.map((method) => ({ id: makeLineId(), method: method.key, amount: '' })),
   );
   // Tracks whether the cashier has manually typed a split amount — once true, we stop
   // auto-rescaling payment splits (e.g. on discount edits) so we don't clobber their entry.
@@ -200,8 +209,11 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
         const methods: CustomPaymentMethod[] = res.data.payment_methods || [];
         setCustomMethods(methods);
         setPayments((current) => [
-          ...PAYMENT_METHODS.map((method) => current.find((row) => row.method === method.key && row.payment_method_id === undefined) || { method: method.key, amount: '' }),
-          ...methods.map((method) => current.find((row) => row.payment_method_id === method.id) || { method: 'custom', payment_method_id: method.id, amount: '' }),
+          ...PAYMENT_METHODS.map((method) => current.find((row) => row.method === method.key && row.payment_method_id === undefined && !row.extra) || { id: makeLineId(), method: method.key, amount: '' }),
+          ...methods.map((method) => current.find((row) => row.payment_method_id === method.id && !row.extra) || { id: makeLineId(), method: 'custom', payment_method_id: method.id, amount: '' }),
+          // Preserve any extra split lines the cashier added (e.g. a second cash
+          // line in another currency) across this method-list refresh.
+          ...current.filter((row) => row.extra),
         ]);
       })
       .catch(() => setCustomMethods([]));
@@ -233,6 +245,20 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
     setPayments(payments.map((payment, index) => index === idx
       ? { ...payment, currency: code === baseCurrency ? undefined : code, amount: '' }
       : payment));
+  };
+
+  // Add an extra cash line so a bill can be settled across currencies — e.g.
+  // part in USD cash and part in LBP cash. The line defaults to the first
+  // secondary currency (the common split), and is removable.
+  const addSplitLine = () => {
+    setPaymentsTouched(true);
+    const firstSecondary = secondaryCurrencies[0]?.code;
+    setPayments((current) => [...current, { id: makeLineId(), method: 'cash', amount: '', currency: firstSecondary, extra: true }]);
+  };
+
+  const removeLine = (id: string) => {
+    setPaymentsTouched(true);
+    setPayments((current) => current.filter((p) => p.id !== id));
   };
 
   const allocateRemainingTo = (idx: number) => {
@@ -648,15 +674,15 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
               const baseEquivalent = secondary && (parseFloat(payment.amount) || 0) > 0
                 ? currencyFmt(convertTenderToBase(parseFloat(payment.amount) || 0, secondary.rate))
                 : null;
-              return <div key={payment.payment_method_id === undefined ? payment.method : `custom:${payment.payment_method_id}`} className="space-y-1">
+              return <div key={payment.id} className="space-y-1">
                 <div className="flex h-11">
-                  <button type="button" title={label} onClick={() => allocateRemainingTo(idx)} className={`w-32 shrink-0 rounded-s-xl border px-3 flex items-center gap-2 text-sm font-semibold transition-colors ${active ? 'bg-brand text-white border-brand' : 'bg-gray-50 text-gray-700 border-gray-200 hover:border-brand hover:text-brand'}`}>
-                    {Icon && <Icon size={15} />}
+                  <button type="button" title={label} onClick={() => allocateRemainingTo(idx)} className={`w-24 sm:w-32 shrink-0 rounded-s-xl border px-2 sm:px-3 flex items-center gap-1.5 sm:gap-2 text-sm font-semibold transition-colors ${active ? 'bg-brand text-white border-brand' : 'bg-gray-50 text-gray-700 border-gray-200 hover:border-brand hover:text-brand'}`}>
+                    {Icon && <Icon size={15} className="shrink-0" />}
                     <span className="truncate">{label}</span>
                   </button>
                   {secondaryCurrencies.length > 0 && (
                     <Select value={payment.currency ?? baseCurrency} onValueChange={(v) => setPaymentCurrency(idx, v)}>
-                      <SelectTrigger size="sm" aria-label={t('tenderCurrency')} className="h-11 shrink-0 rounded-none border-s-0 bg-gray-50 text-xs font-semibold text-gray-600">
+                      <SelectTrigger aria-label={t('tenderCurrency')} className="!h-11 shrink-0 rounded-none border-s-0 bg-gray-50 text-xs font-semibold text-gray-600">
                         <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
@@ -665,24 +691,34 @@ export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Pr
                       </SelectContent>
                     </Select>
                   )}
-                  <div className="flex flex-1 items-center border border-s-0 border-gray-200 rounded-e-xl bg-white focus-within:ring-2 focus-within:ring-brand focus-within:border-transparent">
-                    <span className="ps-3 text-gray-400 text-xs">{lineLabel}</span>
+                  <div className={`flex flex-1 min-w-0 items-center border border-s-0 border-gray-200 bg-white focus-within:ring-2 focus-within:ring-brand focus-within:border-transparent ${payment.extra ? '' : 'rounded-e-xl'}`}>
+                    <span className="ps-2 sm:ps-3 text-gray-400 text-xs shrink-0">{lineLabel}</span>
                     <input
                       type="number"
                       value={payment.amount}
                       onChange={(e) => updatePaymentAmount(idx, e.target.value)}
                       placeholder={secondary ? '0' : '0.00'}
-                      className="min-w-0 flex-1 px-2 py-2 text-end text-sm font-semibold outline-none rounded-e-xl"
+                      className={`min-w-0 flex-1 px-2 py-2 text-end text-sm font-semibold outline-none ${payment.extra ? '' : 'rounded-e-xl'}`}
                       step={lineStep}
                       min="0"
                     />
                   </div>
+                  {payment.extra && (
+                    <button type="button" aria-label={tCommon('delete')} onClick={() => removeLine(payment.id)} className="!h-11 w-9 shrink-0 rounded-e-xl border border-s-0 border-gray-200 bg-gray-50 text-gray-400 hover:text-red-500 hover:bg-red-50 flex items-center justify-center transition-colors">
+                      <X size={14} />
+                    </button>
+                  )}
                 </div>
                 {baseEquivalent && (
                   <p className="px-1 text-[11px] text-gray-400 text-end">≈ {baseEquivalent}</p>
                 )}
               </div>;
             })}
+            {secondaryCurrencies.length > 0 && (
+              <button type="button" onClick={addSplitLine} className="w-full flex items-center justify-center gap-1.5 py-2 rounded-xl border border-dashed border-gray-300 text-sm font-medium text-gray-500 hover:border-brand hover:text-brand transition-colors">
+                <Plus size={14} /> {t('addTenderLine')}
+              </button>
+            )}
           </div>
 
           {/* Change Returned */}

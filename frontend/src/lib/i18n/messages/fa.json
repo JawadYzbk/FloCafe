@@ -630,7 +630,8 @@
     "unpaid": "پرداخت‌نشده",
     "updateDiscount": "به‌روزرسانی تخفیف",
     "walletMaxAmount": "مبلغ کیف از مانده در دسترس بیشتر است. بیشینه: {max}",
-    "noProductsFound": "محصولی یافت نشد"
+    "noProductsFound": "محصولی یافت نشد",
+    "addTenderLine": "افزودن خط پرداخت"
   },
   "printTest": {
     "amt": "مبلغ",

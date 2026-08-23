@@ -630,7 +630,8 @@
     "unpaid": "No pagado",
     "updateDiscount": "Actualizar descuento",
     "walletMaxAmount": "El saldo de la billetera supera el disponible. Máximo: {max}",
-    "noProductsFound": "No se encontraron productos"
+    "noProductsFound": "No se encontraron productos",
+    "addTenderLine": "Agregar línea de pago"
   },
   "printTest": {
     "amt": "Total",

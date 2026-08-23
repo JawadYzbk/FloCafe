@@ -630,7 +630,8 @@
     "unpaid": "Unpaid",
     "updateDiscount": "Update Discount",
     "walletMaxAmount": "Wallet amount exceeds available balance. Max: {max}",
-    "noProductsFound": "No products found"
+    "noProductsFound": "No products found",
+    "addTenderLine": "Add payment line"
   },
   "printTest": {
     "amt": "Amt",
