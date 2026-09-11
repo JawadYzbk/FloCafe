@@ -28,6 +28,15 @@ let stopping = false;
 const PORT = parseInt(process.env.PORT || '3001', 10);
 let activePort = PORT;
 
+function getAppVersion(): string {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    return String(require('../../package.json')?.version || require('../package.json')?.version || '3.7.6');
+  } catch {
+    return '3.7.6';
+  }
+}
+
 /**
  * JWT verification middleware. Skips health check and auth routes (those
  * verify tokens individually). Protects all resource routes from unauthenticated

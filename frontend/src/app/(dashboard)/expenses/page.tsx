@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Plus, Pencil, Trash2, Receipt } from 'lucide-react';
 import { useTranslations, type AppConfig } from 'use-intl';
 import toast from 'react-hot-toast';
@@ -86,31 +86,38 @@ export default function ExpensesPage() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [form, setForm] = useState<FormState>(emptyForm());
   const [saving, setSaving] = useState(false);
+  const [reloadSeq, setReloadSeq] = useState(0);
+  const load = () => setReloadSeq((n) => n + 1);
 
   const categoryLabel = (c: Category) => t(CATEGORY_KEYS[c]);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
-      const params: Record<string, string> = {};
-      if (startDate) params.start_date = startDate;
-      if (endDate) params.end_date = endDate;
-      if (categoryFilter !== 'all') params.category = categoryFilter;
-      const [list, summary] = await Promise.all([
-        api.get('/expenses', { params }),
-        api.get('/expenses/summary', { params: { ...(startDate ? { start_date: startDate } : {}), ...(endDate ? { end_date: endDate } : {}) } }),
-      ]);
-      setExpenses(list.data.expenses || []);
-      setTotal(Number(summary.data.total) || 0);
-      setByCategory(summary.data.by_category || []);
-    } catch {
-      toast.error(t('loadFailed'));
-    } finally {
-      setLoading(false);
-    }
-  }, [startDate, endDate, categoryFilter, t]);
-
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      setLoading(true);
+      try {
+        const params: Record<string, string> = {};
+        if (startDate) params.start_date = startDate;
+        if (endDate) params.end_date = endDate;
+        if (categoryFilter !== 'all') params.category = categoryFilter;
+        const [list, summary] = await Promise.all([
+          api.get('/expenses', { params }),
+          api.get('/expenses/summary', { params: { ...(startDate ? { start_date: startDate } : {}), ...(endDate ? { end_date: endDate } : {}) } }),
+        ]);
+        if (!cancelled) {
+          setExpenses(list.data.expenses || []);
+          setTotal(Number(summary.data.total) || 0);
+          setByCategory(summary.data.by_category || []);
+        }
+      } catch {
+        if (!cancelled) toast.error(t('loadFailed'));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    void run();
+    return () => { cancelled = true; };
+  }, [startDate, endDate, categoryFilter, reloadSeq, t]);
 
   useEffect(() => {
     api.get('/staff').then(({ data }) => setStaff((data.staff || []).map((s: StaffMember) => ({ id: s.id, name: s.name })))).catch(() => {});

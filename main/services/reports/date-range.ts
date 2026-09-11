@@ -69,7 +69,7 @@ function startOfMonth(date: string): string {
   return fmt(new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)));
 }
 
-function endOfMonth(date: string): string {
+export function endOfMonth(date: string): string {
   const d = toUtc(date);
   return fmt(new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)));
 }

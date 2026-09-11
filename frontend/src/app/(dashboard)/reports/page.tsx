@@ -42,7 +42,6 @@ interface Overview {
 }
 
 const isoToday = () => new Date().toISOString().slice(0, 10);
-function isoDaysAgo(days: number) { const d = new Date(); d.setDate(d.getDate() - days); return d.toISOString().slice(0, 10); }
 
 type Preset = 'today' | 'yesterday' | 'last_7_days' | 'last_30_days' | 'this_month' | 'custom';
 
@@ -66,22 +65,25 @@ export default function ReportsPage() {
     return key ? tExpenses(key) : c;
   }, [tExpenses]);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
-      const params: Record<string, string> = { compare: String(compare) };
-      if (preset === 'custom') { params.start_date = startDate; params.end_date = endDate; }
-      else params.preset = preset;
-      const { data } = await api.get('/reports/overview', { params });
-      setData(data);
-    } catch {
-      toast.error(t('loadFailed'));
-    } finally {
-      setLoading(false);
-    }
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      setLoading(true);
+      try {
+        const params: Record<string, string> = { compare: String(compare) };
+        if (preset === 'custom') { params.start_date = startDate; params.end_date = endDate; }
+        else params.preset = preset;
+        const { data: resData } = await api.get('/reports/overview', { params });
+        if (!cancelled) setData(resData);
+      } catch {
+        if (!cancelled) toast.error(t('loadFailed'));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    void run();
+    return () => { cancelled = true; };
   }, [preset, startDate, endDate, compare, t]);
-
-  useEffect(() => { void load(); }, [load]);
 
   const delta = (key: keyof Summary) => data?.comparison?.deltaPct?.[key];
 
@@ -131,7 +133,9 @@ export default function ReportsPage() {
   // Per-report detailed views — fetch the dedicated endpoint (full, authoritative
   // data with all columns) and show a sortable table. Column getters reuse the
   // tenant formatters so the detail matches the summary exactly.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   type DetailCol = { label: string; get: (row: any) => string | number; sort?: (row: any) => number | string; num?: boolean };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const detailConfigs: Record<string, { title: string; endpoint: string; extract: (r: any) => any[]; columns: DetailCol[] }> = {
     products: { title: t('topItems'), endpoint: '/reports/products', extract: (r) => r.products || [], columns: [
       { label: t('item'), get: (r) => r.product_name },
@@ -186,7 +190,8 @@ export default function ReportsPage() {
   };
 
   const [detailKey, setDetailKey] = useState<string | null>(null);
-  const [detailRows, setDetailRows] = useState<Record<string, unknown>[]>([]);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const [detailRows, setDetailRows] = useState<any[]>([]);
   const [detailLoading, setDetailLoading] = useState(false);
   const [sort, setSort] = useState<{ col: number; dir: 1 | -1 }>({ col: 1, dir: -1 });
 
