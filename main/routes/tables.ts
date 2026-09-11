@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { getDatabase, now, parseRowJson, withTxn } from '../db';
 import { randomUUID } from 'crypto';
 import { requireRole } from '../middleware/security';
+import { ROLE_ACCESS } from '../../shared/role-permissions';
 import { notifyKdsUpdate } from '../services/kds';
 import { cloudSync } from '../services/cloud-sync';
 
@@ -30,7 +31,31 @@ function tableShape(table: any, activeOrder?: any) {
     name: table.number,
     activeOrder: currentOrder,
     current_order: currentOrder,
+    seated_at: currentOrder?.created_at ?? null,
   };
+}
+
+/** Normalize a customer-facing table name without coercing objects or nullish values. */
+function normalizeTableNumber(value: unknown): string | null {
+  if (typeof value !== 'string' && typeof value !== 'number') return null;
+  if (typeof value === 'number' && !Number.isFinite(value)) return null;
+  const normalized = String(value).trim();
+  return normalized || null;
+}
+
+/** Normalize optional floor/section labels and flag non-string payloads as invalid. */
+function normalizeOptionalTableLabel(value: unknown): string | null | undefined {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'string') return undefined;
+  return value.trim() || null;
+}
+
+/** Accept only positive integer number primitives or their non-empty string representation. */
+function normalizeTableCapacity(value: unknown): number | null {
+  if (typeof value !== 'string' && typeof value !== 'number') return null;
+  if (typeof value === 'string' && !value.trim()) return null;
+  const normalized = Number(value);
+  return Number.isInteger(normalized) && normalized > 0 ? normalized : null;
 }
 
 router.get('/', (req: Request, res: Response) => {
@@ -89,23 +114,90 @@ router.get('/:id', (req: Request, res: Response) => {
   }
 });
 
-router.post('/', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+// Rename a floor across every table. Renaming to an existing floor name merges
+// every row from `:name` into the target in one UPDATE. Issue #646.
+router.patch('/floors/:name', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+  try {
+    const oldName = String(req.params.name || '');
+    if (!oldName) {
+      return res.status(400).json({ code: 'FLOOR_NAME_REQUIRED', error: 'Floor name is required' });
+    }
+    const newName = normalizeOptionalTableLabel(req.body?.newName);
+    if (newName === undefined || newName === null || !newName) {
+      return res.status(400).json({ code: 'FLOOR_NAME_REQUIRED', error: 'Floor name is required' });
+    }
+    if (newName === oldName) {
+      return res.json({ floor: newName, affected: 0 });
+    }
+
+    const db = getDatabase();
+    const result = db.prepare(`
+      UPDATE tables SET floor = ?, updated_at = ?
+      WHERE floor = ?
+    `).run(newName, now(), oldName);
+
+    res.json({ floor: newName, previousFloor: oldName, affected: result.changes });
+  } catch (error: any) {
+    console.error('[API] Floor rename failed:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Remove a floor label from every table that uses it; tables stay and fall
+// back into the Unassigned bucket. Issue #646.
+router.delete('/floors/:name', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+  try {
+    const name = String(req.params.name || '');
+    if (!name) {
+      return res.status(400).json({ code: 'FLOOR_NAME_REQUIRED', error: 'Floor name is required' });
+    }
+
+    const db = getDatabase();
+    const result = db.prepare(`
+      UPDATE tables SET floor = NULL, updated_at = ?
+      WHERE floor = ?
+    `).run(now(), name);
+
+    res.json({ floor: null, removedFloor: name, affected: result.changes });
+  } catch (error: any) {
+    console.error('[API] Floor delete failed:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.post('/', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     // Accept `number` (schema column) or `name` (legacy frontend field)
     const { number, name, capacity, floor, section, position_x, position_y, kitchen_station_id } = req.body;
-    const tableNumber = number || name;
+    const tableNumber = normalizeTableNumber(number ?? name);
 
     if (!tableNumber) {
-      return res.status(400).json({ error: 'Table number is required' });
+      return res.status(400).json({ code: 'TABLE_NAME_REQUIRED', error: 'Table number is required' });
+    }
+
+    const normalizedCapacity = capacity === undefined ? 4 : normalizeTableCapacity(capacity);
+    if (normalizedCapacity === null) {
+      return res.status(400).json({ code: 'TABLE_CAPACITY_INVALID', error: 'Capacity must be a positive whole number' });
+    }
+
+    const normalizedFloor = normalizeOptionalTableLabel(floor);
+    const normalizedSection = normalizeOptionalTableLabel(section);
+    if (normalizedFloor === undefined || normalizedSection === undefined) {
+      return res.status(400).json({ code: 'TABLE_LOCATION_INVALID', error: 'Floor and section must be text values' });
+    }
+    const normalizedX = normalizePositionCoord(position_x);
+    const normalizedY = normalizePositionCoord(position_y);
+    if (normalizedX === undefined || normalizedY === undefined) {
+      return res.status(400).json({ error: 'Coordinates must be numbers between 0 and 100, or null' });
     }
 
     const db = getDatabase();
     const existing = db.prepare('SELECT * FROM tables WHERE number = ?').get(tableNumber) as any;
     if (existing) {
       if (existing.is_active === 0) {
-        return res.status(400).json({ error: `Table ${tableNumber} already exists but is deactivated. Please reactivate it from the list.` });
+        return res.status(400).json({ code: 'TABLE_INACTIVE_DUPLICATE', error: `Table ${tableNumber} already exists but is deactivated. Please reactivate it from the list.` });
       } else {
-        return res.status(400).json({ error: 'Table number already exists' });
+        return res.status(400).json({ code: 'TABLE_NAME_DUPLICATE', error: 'Table number already exists' });
       }
     }
 
@@ -114,8 +206,8 @@ router.post('/', requireRole('owner', 'manager'), (req: Request, res: Response) 
       INSERT INTO tables (id, number, capacity, floor, section, position_x, position_y, kitchen_station_id, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
-      tableId, tableNumber, capacity || 4, floor || null, section || null,
-      position_x || null, position_y || null, kitchen_station_id || null, now(), now()
+      tableId, tableNumber, normalizedCapacity, normalizedFloor, normalizedSection,
+      normalizedX, normalizedY, kitchen_station_id || null, now(), now()
     );
 
     const table = db.prepare('SELECT * FROM tables WHERE id = ?').get(tableId);
@@ -126,46 +218,138 @@ router.post('/', requireRole('owner', 'manager'), (req: Request, res: Response) 
   }
 });
 
-router.put('/:id', requireRole('owner', 'manager'), (req: Request, res: Response) => {
-  try {
-    const { number, name, capacity, floor, section, position_x, position_y, kitchen_station_id } = req.body;
-    const tableNumber = number || name;
-    const db = getDatabase();
+// Canvas-percentage coordinate: null/undefined clears, otherwise a finite
+// 0–100 number. Returns undefined for anything else so callers can reject it.
+function normalizePositionCoord(value: unknown): number | null | undefined {
+  if (value === null || value === undefined) return null;
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 && n <= 100 ? n : undefined;
+}
 
-    const table = db.prepare('SELECT * FROM tables WHERE id = ?').get(req.params.id);
-    if (!table) {
-      return res.status(404).json({ error: 'Table not found' });
+router.patch('/positions', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+  try {
+    const raw = req.body?.positions;
+    if (!Array.isArray(raw)) {
+      return res.status(400).json({ error: 'Positions array is required' });
     }
 
-    if (tableNumber) {
-      const existing = db.prepare('SELECT * FROM tables WHERE number = ? AND id != ?').get(tableNumber, req.params.id);
-      if (existing) {
-        return res.status(400).json({ error: 'Table number already exists' });
+    const updates: Array<{ id: string; position_x: number | null; position_y: number | null }> = [];
+    for (const item of raw) {
+      if (!item || typeof item.id !== 'string' || !item.id.trim()) {
+        return res.status(400).json({ error: 'Invalid table ID in positions payload' });
+      }
+      const x = normalizePositionCoord(item.position_x);
+      const y = normalizePositionCoord(item.position_y);
+      if (x === undefined || y === undefined) {
+        return res.status(400).json({ error: 'Coordinates must be numbers between 0 and 100, or null' });
+      }
+      updates.push({ id: item.id.trim(), position_x: x, position_y: y });
+    }
+
+    const db = getDatabase();
+    if (updates.length > 0) {
+      const rows = db.prepare(
+        `SELECT id FROM tables WHERE id IN (${updates.map(() => '?').join(',')})`
+      ).all(...updates.map((u) => u.id)) as Array<{ id: string }>;
+      const found = new Set(rows.map((r) => r.id));
+      const missing = updates.find((u) => !found.has(u.id));
+      if (missing) {
+        return res.status(404).json({ error: `Table not found: ${missing.id}` });
       }
     }
+    withTxn(() => {
+      const stmt = db.prepare(`
+        UPDATE tables SET
+          position_x = ?,
+          position_y = ?,
+          updated_at = ?
+        WHERE id = ?
+      `);
+      const currentTime = now();
+      for (const u of updates) {
+        stmt.run(u.position_x, u.position_y, currentTime, u.id);
+      }
+    });
 
-    db.prepare(`
-      UPDATE tables SET
-        number = COALESCE(?, number),
-        capacity = COALESCE(?, capacity),
-        floor = COALESCE(?, floor),
-        section = COALESCE(?, section),
-        position_x = COALESCE(?, position_x),
-        position_y = COALESCE(?, position_y),
-        kitchen_station_id = COALESCE(?, kitchen_station_id),
-        updated_at = ?
-      WHERE id = ?
-    `).run(tableNumber, capacity, floor, section, position_x, position_y, kitchen_station_id, now(), req.params.id);
-
-    const updated = db.prepare('SELECT * FROM tables WHERE id = ?').get(req.params.id);
-    res.json({ table: updated });
+    res.json({ success: true, count: updates.length });
   } catch (error: any) {
     console.error("[API] Internal error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-router.post('/:id/deactivate', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.put('/:id', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+  try {
+    const { number, name, capacity, floor, section, position_x, position_y, kitchen_station_id } = req.body;
+    const has = (key: string) => Object.prototype.hasOwnProperty.call(req.body, key);
+    const hasTableNumber = has('number') || has('name');
+    const tableNumber = hasTableNumber ? normalizeTableNumber(has('number') ? number : name) : undefined;
+    const db = getDatabase();
+
+    const table = db.prepare('SELECT * FROM tables WHERE id = ?').get(req.params.id) as any;
+    if (!table) {
+      return res.status(404).json({ error: 'Table not found' });
+    }
+
+    if (hasTableNumber && !tableNumber) {
+      return res.status(400).json({ code: 'TABLE_NAME_REQUIRED', error: 'Table number is required' });
+    }
+
+    const normalizedCapacity = has('capacity') ? normalizeTableCapacity(capacity) : table.capacity;
+    if (normalizedCapacity === null) {
+      return res.status(400).json({ code: 'TABLE_CAPACITY_INVALID', error: 'Capacity must be a positive whole number' });
+    }
+
+    const normalizedFloor = has('floor') ? normalizeOptionalTableLabel(floor) : table.floor;
+    const normalizedSection = has('section') ? normalizeOptionalTableLabel(section) : table.section;
+    const normalizedX = has('position_x') ? normalizePositionCoord(position_x) : table.position_x;
+    const normalizedY = has('position_y') ? normalizePositionCoord(position_y) : table.position_y;
+    if (normalizedX === undefined || normalizedY === undefined) {
+      return res.status(400).json({ error: 'Coordinates must be numbers between 0 and 100, or null' });
+    }
+    if (normalizedFloor === undefined || normalizedSection === undefined) {
+      return res.status(400).json({ code: 'TABLE_LOCATION_INVALID', error: 'Floor and section must be text values' });
+    }
+
+    if (hasTableNumber) {
+      const existing = db.prepare('SELECT * FROM tables WHERE number = ? AND id != ?').get(tableNumber, req.params.id);
+      if (existing) {
+        return res.status(400).json({ code: 'TABLE_NAME_DUPLICATE', error: 'Table number already exists' });
+      }
+    }
+
+    db.prepare(`
+      UPDATE tables SET
+        number = ?,
+        capacity = ?,
+        floor = ?,
+        section = ?,
+        position_x = ?,
+        position_y = ?,
+        kitchen_station_id = ?,
+        updated_at = ?
+      WHERE id = ?
+    `).run(
+      hasTableNumber ? tableNumber : table.number,
+      normalizedCapacity,
+      normalizedFloor,
+      normalizedSection,
+      normalizedX,
+      normalizedY,
+      has('kitchen_station_id') ? kitchen_station_id : table.kitchen_station_id,
+      now(),
+      req.params.id,
+    );
+
+    const updated = db.prepare('SELECT * FROM tables WHERE id = ?').get(req.params.id);
+    res.json({ table: tableShape(updated as any, activeOrderForTable(db, req.params.id as string)) });
+  } catch (error: any) {
+    console.error("[API] Internal error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+router.post('/:id/deactivate', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const table = db.prepare('SELECT * FROM tables WHERE id = ?').get(req.params.id) as any;
@@ -192,7 +376,7 @@ router.post('/:id/deactivate', requireRole('owner', 'manager'), (req: Request, r
   }
 });
 
-router.post('/:id/reactivate', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.post('/:id/reactivate', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const table = db.prepare('SELECT * FROM tables WHERE id = ?').get(req.params.id) as any;
@@ -212,7 +396,7 @@ router.post('/:id/reactivate', requireRole('owner', 'manager'), (req: Request, r
   }
 });
 
-router.post('/:id/move-order', requireRole('owner', 'manager', 'cashier', 'server'), (req: Request, res: Response) => {
+router.post('/:id/move-order', requireRole(...ROLE_ACCESS.sales), (req: Request, res: Response) => {
   try {
     const sourceTableId = req.params.id as string;
     const { target_table_id, order_id } = req.body;
@@ -293,7 +477,7 @@ router.post('/:id/move-order', requireRole('owner', 'manager', 'cashier', 'serve
   }
 });
 
-router.patch('/:id/status', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.patch('/:id/status', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const { status } = req.body;
 

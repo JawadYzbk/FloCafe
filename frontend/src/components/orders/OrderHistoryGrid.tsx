@@ -12,10 +12,8 @@ import type { Order, OrderItem, Bill } from '@/lib/types';
 import { useTranslations, type AppConfig } from 'use-intl';
 import { Ltr } from '@/components/layout/Ltr';
 
-// --- Mock data ---------------------------------------------------------
-// Shaped like the real `Order` / `Bill` types (src/lib/types.ts) so this
-// swaps over to `GET /api/orders?status=completed,cancelled` with just a
-// fetch + map, no shape changes.
+// Mock data shaped like Order/Bill types for seamless transition
+// to GET /api/orders endpoint.
 
 function hoursAgo(h: number): string {
   return new Date(Date.now() - h * 3_600_000).toISOString();
@@ -29,9 +27,9 @@ const MOCK_HISTORY: HistoryOrder[] = [
   {
     id: 981, order_number: 'A-0981', table_id: 'tbl-04', customer_id: null,
     type: 'dine_in', status: 'completed', subtotal: 890, tax_amount: 44.5,
-    discount_amount: 0, delivery_charge: 0, total: 934.5, guest_count: 3,
+    discount_amount: 0, delivery_charge: 0, service_charge: 0, total: 934.5, guest_count: 3,
     special_instructions: null, created_by: 1, created_at: hoursAgo(2),
-    table: { id: 'tbl-04', name: '4', capacity: 4, status: 'occupied', kitchen_station_id: null, floor: null, section: null, is_active: true },
+    table: { id: 'tbl-04', name: '4', capacity: 4, status: 'occupied', kitchen_station_id: null, floor: null, section: null, position_x: null, position_y: null, is_active: true },
     items: [
       { id: 1, order_id: 981, product_id: '1', product_name: 'Margherita Pizza', product_sku: null, unit_price: 350, quantity: 2, subtotal: 700, tax_amount: 35, total: 735, addons: null, special_instructions: null, status: 'served' },
       { id: 2, order_id: 981, product_id: '2', product_name: 'Garlic Bread', product_sku: null, unit_price: 150, quantity: 1, subtotal: 150, tax_amount: 7.5, total: 157.5, addons: null, special_instructions: null, status: 'served' },
@@ -47,7 +45,7 @@ const MOCK_HISTORY: HistoryOrder[] = [
   {
     id: 976, order_number: 'A-0976', table_id: null, customer_id: null,
     type: 'takeaway', status: 'cancelled', subtotal: 480, tax_amount: 24,
-    discount_amount: 0, delivery_charge: 0, total: 504, guest_count: null,
+    discount_amount: 0, delivery_charge: 0, service_charge: 0, total: 504, guest_count: null,
     special_instructions: null, created_by: 1, created_at: hoursAgo(5),
     items: [
       { id: 4, order_id: 976, product_id: '4', product_name: 'Chicken Biryani', product_sku: null, unit_price: 280, quantity: 1, subtotal: 280, tax_amount: 14, total: 294, addons: null, special_instructions: null, status: 'cancelled' },
@@ -64,9 +62,9 @@ const MOCK_HISTORY: HistoryOrder[] = [
   {
     id: 970, order_number: 'A-0970', table_id: 'tbl-09', customer_id: null,
     type: 'dine_in', status: 'completed', subtotal: 1240, tax_amount: 62,
-    discount_amount: 100, delivery_charge: 0, total: 1202, guest_count: 5,
+    discount_amount: 100, delivery_charge: 0, service_charge: 0, total: 1202, guest_count: 5,
     special_instructions: null, created_by: 1, created_at: hoursAgo(9),
-    table: { id: 'tbl-09', name: '9', capacity: 6, status: 'occupied', kitchen_station_id: null, floor: null, section: null, is_active: true },
+    table: { id: 'tbl-09', name: '9', capacity: 6, status: 'occupied', kitchen_station_id: null, floor: null, section: null, position_x: null, position_y: null, is_active: true },
     items: [
       { id: 8, order_id: 970, product_id: '8', product_name: 'Paneer Tikka', product_sku: null, unit_price: 240, quantity: 2, subtotal: 480, tax_amount: 24, total: 504, addons: null, special_instructions: null, status: 'served' },
       { id: 9, order_id: 970, product_id: '9', product_name: 'Dal Makhani', product_sku: null, unit_price: 220, quantity: 2, subtotal: 440, tax_amount: 22, total: 462, addons: null, special_instructions: null, status: 'served' },
@@ -84,7 +82,7 @@ const MOCK_HISTORY: HistoryOrder[] = [
   {
     id: 964, order_number: 'A-0964', table_id: null, customer_id: null,
     type: 'delivery', status: 'completed', subtotal: 360, tax_amount: 18,
-    discount_amount: 0, delivery_charge: 40, total: 418, guest_count: null,
+    discount_amount: 0, delivery_charge: 40, service_charge: 0, total: 418, guest_count: null,
     special_instructions: null, created_by: 1, created_at: hoursAgo(26),
     items: [
       { id: 12, order_id: 964, product_id: '12', product_name: 'Veg Hakka Noodles', product_sku: null, unit_price: 200, quantity: 1, subtotal: 200, tax_amount: 10, total: 210, addons: null, special_instructions: null, status: 'served' },

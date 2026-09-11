@@ -32,9 +32,8 @@ export default function ImageUploader({ value, onChange, productId }: ImageUploa
   
   const cameraInputRef = useRef<HTMLInputElement>(null);
   const cropAreaRef = useRef<{ x: number; y: number; width: number; height: number }>({ x: 0, y: 0, width: 0, height: 0 });
-  // Cache-busting query param for the existing-image URL below. Lazy-initialized once per
-  // mount (the form modal remounts this component each time it opens) instead of calling
-  // Date.now() directly during render, which would refetch the image on every re-render.
+  // Lazy cache-busting timestamp initialized once per mount to prevent
+  // refetching image on every render.
   const [cacheBust] = useState(() => Date.now());
 
   const processFile = useCallback(async (file: File) => {
@@ -159,14 +158,14 @@ export default function ImageUploader({ value, onChange, productId }: ImageUploa
   if (mode === 'cropping' && cropSrc) {
     return (
       <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4">
-        <div className="bg-white rounded-2xl max-w-lg w-full overflow-hidden">
+        <div className="bg-card rounded-2xl max-w-lg w-full overflow-hidden">
           <div className="flex items-center justify-between px-4 py-3 border-b">
-            <h3 className="font-semibold text-gray-900">{t('cropImage')}</h3>
-            <button type="button" onClick={() => { setMode('idle'); setCropSrc(null); }} className="text-gray-400 hover:text-gray-600">
+            <h3 className="font-semibold text-foreground">{t('cropImage')}</h3>
+            <button type="button" onClick={() => { setMode('idle'); setCropSrc(null); }} className="text-gray-400 hover:text-muted-foreground">
               <X size={20} />
             </button>
           </div>
-          <div className="relative w-full aspect-square bg-gray-100">
+          <div className="relative w-full aspect-square bg-muted">
             <Cropper
               image={cropSrc}
               crop={crop}
@@ -210,7 +209,7 @@ export default function ImageUploader({ value, onChange, productId }: ImageUploa
             value={urlInput}
             onChange={(e) => setUrlInput(e.target.value)}
             placeholder="https://example.com/photo.jpg"
-            className="flex-1 px-3 py-2 border border-gray-200 rounded-lg text-sm focus:border-brand outline-none"
+            className="flex-1 px-3 py-2 border border-border rounded-lg text-sm focus:border-brand outline-none"
             dir="ltr"
             onKeyDown={(e) => e.key === 'Enter' && handleUrlFetch()}
           />
@@ -223,7 +222,7 @@ export default function ImageUploader({ value, onChange, productId }: ImageUploa
           </button>
           <button type="button"
             onClick={() => { setMode('idle'); setUrlInput(''); }}
-            className="px-3 py-2 text-gray-500 hover:text-gray-700 text-sm"
+            className="px-3 py-2 text-muted-foreground hover:text-foreground text-sm"
           >
             {tCommon('cancel')}
           </button>
@@ -242,7 +241,7 @@ export default function ImageUploader({ value, onChange, productId }: ImageUploa
     <div className="space-y-2">
       {/* Current image preview */}
       {previewUrl && (
-        <div className="relative w-24 h-24 rounded-lg overflow-hidden border border-gray-200">
+        <div className="relative w-24 h-24 rounded-lg overflow-hidden border border-border">
           <img src={previewUrl} alt="Product" className="w-full h-full object-cover" />
           <button type="button"
             onClick={handleRemove}
@@ -259,7 +258,7 @@ export default function ImageUploader({ value, onChange, productId }: ImageUploa
         <div
           {...getRootProps()}
           className={`w-full flex flex-col items-center justify-center p-6 border-2 border-dashed rounded-xl cursor-pointer transition-colors ${
-            isDragActive ? 'border-brand bg-brand/5 text-brand' : 'border-gray-300 text-gray-500 hover:border-brand hover:bg-gray-50'
+            isDragActive ? 'border-brand bg-brand/5 text-brand' : 'border-gray-300 dark:border-border text-muted-foreground hover:border-brand hover:bg-muted'
           }`}
         >
           <input {...getInputProps()} />
@@ -270,16 +269,16 @@ export default function ImageUploader({ value, onChange, productId }: ImageUploa
         </div>
 
         <div className="flex items-center gap-2 justify-center">
-          <div className="flex-1 h-px bg-gray-200"></div>
+          <div className="flex-1 h-px bg-gray-200 dark:bg-border"></div>
           <span className="text-xs text-gray-400 font-medium uppercase px-2">{t('imageOrUse')}</span>
-          <div className="flex-1 h-px bg-gray-200"></div>
+          <div className="flex-1 h-px bg-gray-200 dark:bg-border"></div>
         </div>
 
         <div className="flex flex-wrap gap-2 justify-center">
           {/* Camera button (tablet POS) */}
           <button type="button"
             onClick={() => cameraInputRef.current?.click()}
-            className="flex items-center gap-2 px-4 py-2 border border-gray-200 rounded-lg text-sm text-gray-700 hover:bg-gray-50 hover:border-gray-300 transition-colors"
+            className="flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-lg text-sm text-foreground hover:bg-muted hover:border-gray-400 dark:border-border dark:hover:border-border transition-colors"
           >
             <Camera size={16} />
             {t('imageCamera')}
@@ -300,7 +299,7 @@ export default function ImageUploader({ value, onChange, productId }: ImageUploa
           {/* URL paste */}
           <button type="button"
             onClick={() => setMode('url-input')}
-            className="flex items-center gap-2 px-4 py-2 border border-gray-200 rounded-lg text-sm text-gray-700 hover:bg-gray-50 hover:border-gray-300 transition-colors"
+            className="flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-lg text-sm text-foreground hover:bg-muted hover:border-gray-400 dark:border-border dark:hover:border-border transition-colors"
           >
             <Link size={16} />
             {t('imagePasteUrl')}

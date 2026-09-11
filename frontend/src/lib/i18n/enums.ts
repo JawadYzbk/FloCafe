@@ -1,23 +1,10 @@
-/**
- * Maps backend enum/status strings to i18n translation keys.
- *
- * Backend values (roles, order statuses, item statuses, table statuses, etc.)
- * are English identifiers stored in the DB. The UI must never render them
- * raw — pass them through these maps and then through the appropriate
- * translator (`useTranslations()` leaf keys) so every language shows a
- * localized label.
- *
- * All maps in this module are exhaustively typed against use-intl leaf keys
- * (`AppConfig['Messages']`), including `ORDER_TYPE_LABEL_KEYS` re-exported
- * from `order-types.ts`.
- *
- * Unknown values fall back to the raw string, so a new backend status never
- * crashes the UI — it just shows in English until a translation key is added.
- */
+/** Maps backend domain enum and status strings to typed
+ * use-intl translation keys. */
 
 import { ORDER_TYPE_LABEL_KEYS } from '../order-types';
 import type { Order, Table, OrderItem } from '../types';
 import type { AppConfig } from 'use-intl';
+import { ROLE_LABEL_KEYS as SHARED_ROLE_LABEL_KEYS } from '../../../../shared/role-permissions';
 
 export { ORDER_TYPE_LABEL_KEYS };
 
@@ -28,13 +15,7 @@ type CommonKey = keyof AppConfig['Messages']['common'];
 type BusinessTypeKey = keyof AppConfig['Messages']['businessType'];
 
 /** Staff/tenant role → label. Used in login tenant picker, staff table, etc. */
-export const ROLE_LABEL_KEYS = {
-  owner: 'roleOwner',
-  manager: 'roleManager',
-  cashier: 'roleCashier',
-  chef: 'roleChef',
-  server: 'roleServer',
-} as const satisfies Record<'owner' | 'manager' | 'cashier' | 'chef' | 'server', StaffKey>;
+export const ROLE_LABEL_KEYS = SHARED_ROLE_LABEL_KEYS as Record<string, StaffKey>;
 
 /** Order-level status → label (exhaustively typed against `Order['status']`). */
 export const ORDER_STATUS_LABEL_KEYS = {

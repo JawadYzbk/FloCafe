@@ -7,7 +7,7 @@
  *   - invalid payloads are rejected with a reason (unknown language,
  *     duplicate additional entry, >1 additional entry, bad JSON);
  *   - stored values parse leniently and fall back to inherit/none defaults;
- *   - the two settings keys are exposed for the wildcard allowlist.
+ *   - all three settings keys are exposed for the wildcard allowlist.
  *
  * Run: npm run test:print-kernel
  */
@@ -17,6 +17,7 @@ import assert from 'node:assert/strict';
 import {
   BILL_LANGUAGE_POLICY_KEY,
   KOT_LANGUAGE_POLICY_KEY,
+  Z_REPORT_LANGUAGE_POLICY_KEY,
   LANGUAGE_POLICY_SETTING_KEYS,
   defaultLanguagePolicySettingJson,
   parseStoredLanguagePolicy,
@@ -26,7 +27,7 @@ import {
 console.log('Testing language-policy settings keys...');
 assert.deepEqual(
   [...LANGUAGE_POLICY_SETTING_KEYS].sort(),
-  ['bill_language_policy', 'kot_language_policy'],
+  ['bill_language_policy', 'kot_language_policy', 'z_report_language_policy'],
 );
 
 console.log('✓ keys registered');
@@ -63,13 +64,19 @@ if (stringPayload.ok) {
 const kotFixed = validateLanguagePolicySetting(KOT_LANGUAGE_POLICY_KEY,
   '{"primary":{"mode":"fixed","language":"pt"},"additional":[]}');
 assert.ok(kotFixed.ok);
+const zFixed = validateLanguagePolicySetting(Z_REPORT_LANGUAGE_POLICY_KEY,
+  '{"primary":{"mode":"fixed","language":"fa"},"additional":["en"]}');
+assert.ok(zFixed.ok);
+if (zFixed.ok) {
+  assert.equal(zFixed.stored, '{"primary":{"mode":"fixed","language":"fa"},"additional":["en"]}');
+}
 
 console.log('✓ canonical storage');
 
 console.log('Testing invalid payloads are rejected...');
 const rejections: Array<[string, unknown]> = [
   [BILL_LANGUAGE_POLICY_KEY, 'not json'],
-  [BILL_LANGUAGE_POLICY_KEY, '{"primary":{"mode":"fixed","language":"de"}}'],
+  [BILL_LANGUAGE_POLICY_KEY, '{"primary":{"mode":"fixed","language":"xx"}}'],
   [BILL_LANGUAGE_POLICY_KEY, '{"primary":{"mode":"auto"}}'],
   [BILL_LANGUAGE_POLICY_KEY, '{"primary":{"mode":"inherit"},"additional":["fa","es"]}'],
   [BILL_LANGUAGE_POLICY_KEY, '{"primary":{"mode":"inherit"},"additional":["fa","fa"]}'],
@@ -103,4 +110,6 @@ const okStored = parseStoredLanguagePolicy(BILL_LANGUAGE_POLICY_KEY,
 assert.ok('primary' in okStored && okStored.primary.mode === 'fixed');
 
 console.log('✓ lenient reader with safe fallback');
+
+console.log('✓ Z-report policy normalizes through the public policy contract');
 console.log('\nAll print-language settings tests passed.');

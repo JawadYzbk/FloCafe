@@ -3,6 +3,7 @@ import expressRateLimit from 'express-rate-limit';
 import { randomUUID } from 'crypto';
 import { getDatabase, now, getSettingValue } from '../db';
 import { requireRole } from '../middleware/security';
+import { ROLE_ACCESS } from '../../shared/role-permissions';
 import { parsePhoneE164, stripPhoneDigits } from '../lib/phone';
 
 export function parseCustomer(c: any): any {
@@ -54,7 +55,7 @@ export function getWalletBalance(customerId: string | number | null): number {
 }
 
 // Cleanup endpoint: delete all customers with null IDs - must be before /:id
-router.delete('/admin/cleanup', customerWriteRateLimit, requireRole('owner'), (req: Request, res: Response) => {
+router.delete('/admin/cleanup', customerWriteRateLimit, requireRole(...ROLE_ACCESS.owner), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const result = db.prepare("DELETE FROM customers WHERE id IS NULL").run();
@@ -65,7 +66,7 @@ router.delete('/admin/cleanup', customerWriteRateLimit, requireRole('owner'), (r
   }
 });
 
-router.post('/admin/repair-phones', customerWriteRateLimit, requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.post('/admin/repair-phones', customerWriteRateLimit, requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const tenantCountry = getSettingValue('country') || 'IN';
@@ -108,7 +109,7 @@ router.post('/admin/repair-phones', customerWriteRateLimit, requireRole('owner',
   }
 });
 
-router.get('/alerts', customerReadRateLimit, requireRole('owner', 'manager', 'cashier', 'server'), (req: Request, res: Response) => {
+router.get('/alerts', customerReadRateLimit, requireRole(...ROLE_ACCESS.sales), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const result = db.prepare(`
@@ -124,14 +125,10 @@ router.get('/alerts', customerReadRateLimit, requireRole('owner', 'manager', 'ca
   }
 });
 
-router.get('/', customerReadRateLimit, requireRole('owner', 'manager', 'cashier', 'server'), (req: Request, res: Response) => {
+router.get('/', customerReadRateLimit, requireRole(...ROLE_ACCESS.sales), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
-    // #208: the previous version ran 4 correlated subqueries per customer
-    // (visits, spent, wallet credits, wallet debits, last visit) and never
-    // hit any index for `WHERE o.customer_id = c.id`. The equivalent join
-    // uses the new `idx_orders_customer` and groups once. Aggregates across
-    // customers sit in three CTEs so each scans its index once.
+    // Aggregate customer order and wallet stats using CTEs and indexes.
     let query = `
       WITH order_stats AS (
         SELECT customer_id,
@@ -172,9 +169,10 @@ router.get('/', customerReadRateLimit, requireRole('owner', 'manager', 'cashier'
       const digitsSearch = stripPhoneDigits(rawSearch);
       const isPhoneLikeSearch = digitsSearch.length > 0 && !/\p{L}/u.test(rawSearch);
       const search = `%${rawSearch}%`;
+      const phoneDigitsSearch = `REPLACE(c.phone_digits, '/', '')`;
 
       if (isPhoneLikeSearch) {
-        query += ' AND (c.name LIKE ? OR c.phone_digits LIKE ? OR c.email LIKE ?)';
+        query += ` AND (c.name LIKE ? OR ${phoneDigitsSearch} LIKE ? OR c.email LIKE ?)`;
         params.push(search, `%${digitsSearch}%`, search);
       } else {
         query += ' AND (c.name LIKE ? OR c.email LIKE ?)';
@@ -213,10 +211,7 @@ router.get('/', customerReadRateLimit, requireRole('owner', 'manager', 'cashier'
       const limit = Math.min(parsed, 500);
       query += ` LIMIT ${limit}`;
     } else {
-      // #208: unbounded default meant every customers list response fanned
-      // the full backend on each search keystroke. Cap at 200 as a sensible
-      // first-page default; clients that need more can page (cursor support
-      // is a follow-up).
+      // Default to 200 customers when per_page is omitted.
       query += ` LIMIT 200`;
     }
 
@@ -228,7 +223,7 @@ router.get('/', customerReadRateLimit, requireRole('owner', 'manager', 'cashier'
   }
 });
 
-router.get('/:id', customerReadRateLimit, requireRole('owner', 'manager', 'cashier', 'server'), (req: Request, res: Response) => {
+router.get('/:id', customerReadRateLimit, requireRole(...ROLE_ACCESS.sales), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const customerRaw = db.prepare('SELECT * FROM customers WHERE id = ?').get(req.params.id);
@@ -253,7 +248,7 @@ router.get('/:id', customerReadRateLimit, requireRole('owner', 'manager', 'cashi
   }
 });
 
-router.get('/:id/wallet', customerReadRateLimit, requireRole('owner', 'manager', 'cashier', 'server'), (req: Request, res: Response) => {
+router.get('/:id/wallet', customerReadRateLimit, requireRole(...ROLE_ACCESS.sales), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const customerId = req.params.id as string;
@@ -267,14 +262,41 @@ router.get('/:id/wallet', customerReadRateLimit, requireRole('owner', 'manager',
       SELECT * FROM loyalty_ledger WHERE customer_id = ? ORDER BY created_at DESC LIMIT 100
     `).all(customerId);
 
-    res.json({ balance, transactions });
+    const bills = db.prepare(`
+      SELECT
+        b.id, b.bill_number, b.total, b.payment_status, b.paid_at, b.created_at,
+        COALESCE((SELECT SUM(amount) FROM loyalty_ledger WHERE bill_id = b.id AND type = 'credit'), 0) as points_earned,
+        COALESCE((SELECT SUM(amount) FROM loyalty_ledger WHERE bill_id = b.id AND type = 'debit'), 0) as points_redeemed
+      FROM bills b
+      WHERE b.customer_id = ? AND b.payment_status = 'paid'
+      ORDER BY COALESCE(b.paid_at, b.created_at) DESC
+      LIMIT 100
+    `).all(customerId);
+
+    const totals = db.prepare(`
+      SELECT
+        COALESCE((SELECT SUM(total) FROM bills WHERE customer_id = ? AND payment_status = 'paid'), 0) as total_spent,
+        COALESCE((SELECT SUM(amount) FROM loyalty_ledger WHERE customer_id = ? AND type = 'credit'), 0) as total_points_earned,
+        COALESCE((SELECT SUM(amount) FROM loyalty_ledger WHERE customer_id = ? AND type = 'debit'), 0) as total_points_redeemed
+    `).get(customerId, customerId, customerId) as { total_spent: number; total_points_earned: number; total_points_redeemed: number };
+
+    res.json({
+      balance,
+      transactions,
+      bills,
+      summary: {
+        totalSpent: totals.total_spent,
+        totalPointsEarned: totals.total_points_earned,
+        totalPointsRedeemed: totals.total_points_redeemed,
+      },
+    });
   } catch (error: any) {
     console.error("[API] Internal error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-router.post('/', customerWriteRateLimit, requireRole('owner', 'manager', 'cashier', 'server'), (req: Request, res: Response) => {
+router.post('/', customerWriteRateLimit, requireRole(...ROLE_ACCESS.sales), (req: Request, res: Response) => {
   try {
     const { phone, name, email, address, notes, country_code } = req.body;
 
@@ -354,7 +376,7 @@ router.post('/', customerWriteRateLimit, requireRole('owner', 'manager', 'cashie
   }
 });
 
-router.put('/:id', customerWriteRateLimit, requireRole('owner', 'manager', 'cashier'), (req: Request, res: Response) => {
+router.put('/:id', customerWriteRateLimit, requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, res: Response) => {
   try {
     const {
       phone, name, email, address, notes, country_code
@@ -427,9 +449,5 @@ router.put('/:id', customerWriteRateLimit, requireRole('owner', 'manager', 'cash
   }
 });
 
-// Customers are never deletable — not even soft-deleted — by design: every
-// row is permanently referenced by orders/bills/loyalty_ledger with no FK,
-// and losing a customer's history/loyalty standing is worse than a stale
-// record. There is intentionally no DELETE /:id route.
-
+// Customers are never deleted to preserve historical order, bill, and loyalty references.
 export const customerRoutes = router;

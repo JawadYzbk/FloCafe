@@ -1,4 +1,5 @@
-import { ipcMain, dialog, app, BrowserWindow } from 'electron';
+import { ipcMain, dialog, app, BrowserWindow, shell } from 'electron';
+import { randomUUID } from 'node:crypto';
 import * as path from 'path';
 import * as fs from 'fs';
 import { getDatabase, createBackup, restoreBackup, now, getCurrentSchemaVersion, getSchemaVersionFromBackup, resetDatabaseWithBackup, withDatabaseMaintenanceLock, withDatabaseRequest, isManagedBackupFile } from './db';
@@ -8,11 +9,23 @@ import { clearJWTSecretCache } from './routes/auth';
 import { getKdsPort } from './kds-server';
 import { authorizeMasterPin, isMasterPinAvailable, isMasterPinSet } from './services/master-pin';
 import { runHealthCheck, applySafeFixes } from './services/schema-health';
-import { getStatus as getWhatsAppStatus } from './services/whatsapp';
+import { getStatus as getWhatsAppStatus, sanitizeLogText } from './services/whatsapp';
+import { createKdsWindow, applyWindowControlAction } from './window-options';
+import {
+  isCurrentRendererFrame,
+  markWindowRendererReady,
+  registerRendererDocument,
+} from './window-readiness';
+import { isThemeMode, appendThemeQueryParam } from './title-bar-theme';
+import { getTenantCurrency } from './services/refund';
+import { getCurrencyMinorUnitFactor } from './countries';
+import { rasterizeKotDocumentForWebUsb, rasterizePrintDocumentForWebUsb } from './printers/thermal';
+import { isKotDocument, isPrintDocument } from '../shared/print/document';
+import { sendEvent as sendTelemetryEvent } from './services/telemetry';
+import { isSafeWhatsAppShareUrl } from './security/url-allowlist';
 
 // Settings keys the renderer is allowed to write via IPC.
 // Must stay in sync with routes/settings.ts ALLOWED_WILDCARD_KEYS.
-// Sensitive keys (jwt_secret, cloud_api_key, cloud_*, tax_registration_number, etc.) are excluded.
 const ALLOWED_IPC_KEYS = new Set([
   'business_name', 'timezone', 'currency', 'country',
   'state_code', 'business_address', 'business_phone',
@@ -23,6 +36,7 @@ const ALLOWED_IPC_KEYS = new Set([
   'loyalty_enabled',
   'printer_method', 'paper_size', 'bill_template', 'bill_footer_message',
   'telemetry_enabled',
+  'theme_mode',
 ]);
 
 const SENSITIVE_SETTING_KEYS = new Set([
@@ -39,29 +53,98 @@ function maskSetting(key: string, value: string): string {
   return value ? `****${value.slice(-4)}` : '';
 }
 
-/**
- * The only window permitted to invoke privileged IPC is the main POS renderer,
- * which the embedded server serves from localhost/127.0.0.1. The KDS window is
- * LAN-served HTTP content and must not reach these handlers, so non-PIN-gated
- * handlers verify the sender's origin before doing anything.
- */
-function isTrustedSender(event: Electron.IpcMainInvokeEvent): boolean {
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+const MIN_RASTER_COLUMNS = 32;
+const MAX_RASTER_COLUMNS = 48;
+
+function isValidRasterColumns(value: unknown): value is number {
+  return typeof value === 'number'
+    && Number.isSafeInteger(value)
+    && value >= MIN_RASTER_COLUMNS
+    && value <= MAX_RASTER_COLUMNS;
+}
+
+/** Verifies that IPC sender origin is the localhost-served POS renderer. */
+export function isTrustedSender(event: Pick<Electron.IpcMainInvokeEvent, 'sender'>): boolean {
   try {
-    const url = event.sender?.getURL?.() ?? '';
-    return url.startsWith('http://localhost:') || url.startsWith('http://127.0.0.1:');
+    const url = new URL(event.sender?.getURL?.() ?? '');
+    if (url.protocol !== 'http:' || url.username || url.password) return false;
+    return url.hostname === 'localhost' || url.hostname === '127.0.0.1';
   } catch {
     return false;
   }
 }
 
-function handle(channel: string, listener: (...args: any[]) => any): void {
-  ipcMain.handle(channel, (event: Electron.IpcMainInvokeEvent, ...args: any[]) => {
+type MainWindowGetter = () => BrowserWindow | null;
+type IpcHandler<Args extends unknown[] = unknown[]> =
+  (event: Electron.IpcMainInvokeEvent, ...args: Args) => unknown | Promise<unknown>;
+
+interface IpcPrinterInput {
+  id?: string;
+  name: string;
+  connection_type: 'network' | 'usb' | 'webusb';
+  ip_address?: string | null;
+  port?: number | null;
+  is_default?: boolean | number;
+}
+
+/** Preload origin check before Chromium has committed localhost URL. */
+function isEarlyMainWindowSender(
+  event: Pick<Electron.IpcMainEvent, 'sender'>,
+  getMainWindow?: MainWindowGetter,
+): boolean {
+  if (!getMainWindow) return false;
+  try {
+    const url = event.sender?.getURL?.() ?? '';
+    if (url !== '' && url !== 'about:blank') return false;
+    const expectedWindow = getMainWindow();
+    return Boolean(
+      expectedWindow
+      && !expectedWindow.isDestroyed()
+      && BrowserWindow.fromWebContents(event.sender) === expectedWindow,
+    );
+  } catch {
+    return false;
+  }
+}
+
+function handle<Args extends unknown[]>(channel: string, listener: IpcHandler<Args>): void {
+  ipcMain.handle(channel, (event: Electron.IpcMainInvokeEvent, ...args: Args) => {
     if (!isTrustedSender(event)) return { error: 'Unauthorized sender' };
     return listener(event, ...args);
   });
 }
 
-export function registerIpcHandlers(shutdownSignal?: AbortSignal): void {
+export function registerIpcHandlers(
+  shutdownSignal?: AbortSignal,
+  getMainWindow?: MainWindowGetter,
+  showMainWindow: (window: BrowserWindow) => boolean = () => false,
+  getCurrentEffectiveIsDark?: () => boolean,
+): void {
+  ipcMain.on('window-document', (event, documentNonce: unknown) => {
+    let currentFrame: Electron.WebFrameMain | null = null;
+    try {
+      currentFrame = event.sender.mainFrame;
+    } catch {
+      event.returnValue = { success: false, error: 'Invalid document registration' };
+      return;
+    }
+    if (!isCurrentRendererFrame(event.senderFrame, currentFrame)) {
+      event.returnValue = { success: false, error: 'Invalid document registration' };
+      return;
+    }
+    if (!isTrustedSender(event) && !isEarlyMainWindowSender(event, getMainWindow)) {
+      event.returnValue = { error: 'Unauthorized sender' };
+      return;
+    }
+    event.returnValue = registerRendererDocument(documentNonce)
+      ? { success: true }
+      : { success: false, error: 'Invalid document nonce' };
+  });
+
   // Database backup/restore
   ipcMain.handle('backup-database', async (event, pin?: string) => {
     const auth = authorizeMasterPin(pin, 'ipc:backup');
@@ -89,9 +172,9 @@ export function registerIpcHandlers(shutdownSignal?: AbortSignal): void {
         schemaVersion,
         message: `Backup saved (Schema v${schemaVersion})`
       };
-    } catch (error: any) {
+    } catch (error: unknown) {
       console.error('[IPC] backup-database: Error:', error);
-      return { success: false, error: error.message };
+      return { success: false, error: getErrorMessage(error) };
     }
   });
 
@@ -180,9 +263,9 @@ export function registerIpcHandlers(shutdownSignal?: AbortSignal): void {
         message: restoreResult.success ? 'Database restored successfully' : `Restore failed: ${restoreResult.error}`,
         error: restoreResult.error
       };
-    } catch (error: any) {
+    } catch (error: unknown) {
       console.error('[IPC] restore-backup: Error:', error);
-      return { success: false, error: error.message };
+      return { success: false, error: getErrorMessage(error) };
     }
   });
 
@@ -191,8 +274,8 @@ export function registerIpcHandlers(shutdownSignal?: AbortSignal): void {
     return withDatabaseRequest(async () => {
     try {
       return runHealthCheck();
-    } catch (error: any) {
-      return { error: error.message };
+    } catch (error: unknown) {
+      return { error: getErrorMessage(error) };
     }
     });
   });
@@ -201,8 +284,8 @@ export function registerIpcHandlers(shutdownSignal?: AbortSignal): void {
     return withDatabaseRequest(async () => {
     try {
       return applySafeFixes(findingIds);
-    } catch (error: any) {
-      return { applied: [], skipped: [], errors: [{ id: 'all', error: error.message }] };
+    } catch (error: unknown) {
+      return { applied: [], skipped: [], errors: [{ id: 'all', error: getErrorMessage(error) }] };
     }
     });
   });
@@ -224,10 +307,47 @@ export function registerIpcHandlers(shutdownSignal?: AbortSignal): void {
       clearInMemoryRevokedTokens();
       clearJWTSecretCache();
       return { success: true, backupPath };
-    } catch (error: any) {
+    } catch (error: unknown) {
       console.error('[IPC] db-initialize: Error:', error);
-      return { success: false, error: error.message };
+      return { success: false, error: getErrorMessage(error) };
     }
+  });
+
+  // Window-control surface for renderer title bar HTML fallback controls.
+  handle('window-action', (event, action: unknown) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win || win.isDestroyed()) return { error: 'Window unavailable' };
+    return applyWindowControlAction(win, action);
+  });
+
+  handle('get-window-state', (event) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win || win.isDestroyed()) return { isMaximized: false, isFullScreen: false };
+    return {
+      isMaximized: win.isMaximized(),
+      isFullScreen: win.isFullScreen(),
+    };
+  });
+
+  handle('window-ready', (event, payload: unknown) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win || win.isDestroyed()) return { error: 'Window unavailable' };
+    let currentFrame: Electron.WebFrameMain | null = null;
+    try {
+      currentFrame = event.sender.mainFrame;
+    } catch {
+      return { success: false, error: 'Stale or invalid readiness report' };
+    }
+    if (!isCurrentRendererFrame(event.senderFrame, currentFrame)) {
+      return { success: false, error: 'Stale or invalid readiness report' };
+    }
+    // Verify readiness report epoch/nonce before showing window.
+    const reported = payload as { epoch?: unknown; documentNonce?: unknown } | null | undefined;
+    if (!markWindowRendererReady(reported?.epoch, reported?.documentNonce)) {
+      return { success: false, error: 'Stale or invalid readiness report' };
+    }
+    showMainWindow(win);
+    return { success: true };
   });
 
   // Settings
@@ -241,8 +361,8 @@ export function registerIpcHandlers(shutdownSignal?: AbortSignal): void {
         settings[row.key] = maskSetting(row.key, row.value);
       });
       return settings;
-    } catch (error: any) {
-      return { error: error.message };
+    } catch (error: unknown) {
+      return { error: getErrorMessage(error) };
     }
     });
   });
@@ -256,12 +376,15 @@ export function registerIpcHandlers(shutdownSignal?: AbortSignal): void {
       if (!ALLOWED_IPC_KEYS.has(key)) {
         return { success: false, error: 'Setting not allowed via IPC' };
       }
+      if (key === 'theme_mode' && !isThemeMode(value)) {
+        return { success: false, error: 'Invalid theme_mode value' };
+      }
       const db = getDatabase();
       db.prepare('INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)')
         .run(key, value, now());
       return { success: true };
-    } catch (error: any) {
-      return { success: false, error: error.message };
+    } catch (error: unknown) {
+      return { success: false, error: getErrorMessage(error) };
     }
     });
   });
@@ -270,10 +393,23 @@ export function registerIpcHandlers(shutdownSignal?: AbortSignal): void {
   handle('whatsapp-get-status', async () => withDatabaseRequest(async () => {
     try {
       return getWhatsAppStatus();
-    } catch (err: any) {
-      return { error: err.message };
+    } catch (err: unknown) {
+      return { error: getErrorMessage(err) };
     }
   }));
+
+  handle('whatsapp-open-share', async (_event, rawUrl: unknown) => {
+    if (typeof rawUrl !== 'string' || !isSafeWhatsAppShareUrl(rawUrl)) {
+      return { success: false, error: 'Invalid WhatsApp share URL' };
+    }
+    try {
+      await shell.openExternal(rawUrl);
+      return { success: true };
+    } catch (error: unknown) {
+      console.error('[IPC] WhatsApp share open failed:', sanitizeLogText(error));
+      return { success: false, error: 'Failed to open WhatsApp' };
+    }
+  });
 
   // Module-level reference to ensure single instance
   let activeKdsWindow: BrowserWindow | null = null;
@@ -301,26 +437,13 @@ export function registerIpcHandlers(shutdownSignal?: AbortSignal): void {
     const localIP = getLocalIP();
     const kdsOrigin = `http://${localIP}:${port}`;
 
-    activeKdsWindow = new BrowserWindow({
-      width: 1200,
-      height: 800,
-      title: 'Flo - Kitchen Display',
-      webPreferences: {
-        // The KDS page is LAN-served HTTP and uses only the HTTP API +
-        // WebSocket, so it must not receive the privileged POS renderer
-        // bridge (preload.js). See GHSA-jmmq-fjg5-g6px.
-        contextIsolation: true,
-        nodeIntegration: false,
-      },
-    });
+    activeKdsWindow = createKdsWindow(BrowserWindow);
 
     activeKdsWindow.on('closed', () => {
       activeKdsWindow = null;
     });
 
-    // Confine the KDS window to its own origin and deny new windows so a
-    // modified or unexpected document cannot navigate away and reach other
-    // local services or content.
+    // Confine KDS window to its own origin and deny external navigation/windows.
     activeKdsWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
     activeKdsWindow.webContents.on('will-navigate', (event, url) => {
       let allowed = false;
@@ -332,7 +455,12 @@ export function registerIpcHandlers(shutdownSignal?: AbortSignal): void {
       if (!allowed) event.preventDefault();
     });
 
-    activeKdsWindow.loadURL(`${kdsOrigin}/kds`);
+    // KDS window has no preload; learns palette from URL param.
+    const kdsUrl = appendThemeQueryParam(
+      `${kdsOrigin}/kds`,
+      getCurrentEffectiveIsDark ? getCurrentEffectiveIsDark() : false,
+    );
+    activeKdsWindow.loadURL(kdsUrl);
   });
 
   handle('get-app-info', async () => {
@@ -345,6 +473,20 @@ export function registerIpcHandlers(shutdownSignal?: AbortSignal): void {
     };
   });
 
+  // Reports a caught renderer-side exception via anonymous telemetry.
+  handle('report-renderer-error', async (event, report: unknown) => {
+    const r = report as { message?: unknown; stack?: unknown; digest?: unknown; route?: unknown } | null;
+    const clamp = (value: unknown, max: number): string | undefined =>
+      typeof value === 'string' ? value.slice(0, max) : undefined;
+    const sent = await sendTelemetryEvent('renderer_error', {
+      message: clamp(r?.message, 500),
+      stack: clamp(r?.stack, 4000),
+      digest: clamp(r?.digest, 200),
+      route: clamp(r?.route, 200),
+    });
+    return { success: sent };
+  });
+
   // Printers
   handle('get-printers', async () => {
     return withDatabaseRequest(async () => {
@@ -352,13 +494,13 @@ export function registerIpcHandlers(shutdownSignal?: AbortSignal): void {
       const db = getDatabase();
       const printers = db.prepare('SELECT * FROM printers ORDER BY name').all();
       return printers;
-    } catch (error: any) {
-      return { error: error.message };
+    } catch (error: unknown) {
+      return { error: getErrorMessage(error) };
     }
     });
   });
 
-  handle('save-printer', async (event, printer: any) => {
+  handle('save-printer', async (event, printer: IpcPrinterInput) => {
     return withDatabaseRequest(async () => {
     try {
       // Validate printer name — reject names with shell metacharacters (command injection defense)
@@ -367,27 +509,91 @@ export function registerIpcHandlers(shutdownSignal?: AbortSignal): void {
         return { success: false, error: 'Printer name contains invalid characters' };
       }
       const db = getDatabase();
+      const port = printer.port === null ? null : (printer.port || 9100);
       if (printer.id) {
         db.prepare(`
-          UPDATE printers SET name = ?, type = ?, connection_type = ?, ip_address = ?,
-            port = ?, usb_vendor_id = ?, usb_product_id = ?, is_default = ?, updated_at = ?
+          UPDATE printers SET name = ?, connection_type = ?, ip_address = ?,
+            port = ?, is_default = ?, updated_at = ?
           WHERE id = ?
-        `).run(printer.name, printer.type, printer.connection_type, printer.ip_address,
-          printer.port || 9100, printer.usb_vendor_id, printer.usb_product_id,
-          printer.is_default ? 1 : 0, now(), printer.id);
+        `).run(printer.name, printer.connection_type, printer.ip_address ?? null,
+          port, printer.is_default ? 1 : 0, now(), printer.id);
       } else {
         db.prepare(`
-          INSERT INTO printers (name, type, connection_type, ip_address, port, usb_vendor_id, usb_product_id, is_default, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(printer.name, printer.type, printer.connection_type, printer.ip_address,
-          printer.port || 9100, printer.usb_vendor_id, printer.usb_product_id,
-          printer.is_default ? 1 : 0, now(), now());
+          INSERT INTO printers (id, name, connection_type, ip_address, port, is_default, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(randomUUID(), printer.name, printer.connection_type, printer.ip_address ?? null,
+          port, printer.is_default ? 1 : 0, now(), now());
       }
       return { success: true };
-    } catch (error: any) {
-      return { success: false, error: error.message };
+    } catch (error: unknown) {
+      return { success: false, error: getErrorMessage(error) };
     }
     });
+  });
+
+  handle('rasterize-print-document', async (_event, payload: unknown) => {
+    if (!payload || typeof payload !== 'object') return { ok: false, error: 'Invalid raster document request' };
+    const request = payload as {
+      document?: unknown;
+      template?: unknown;
+      profileId?: unknown;
+      options?: unknown;
+    };
+    if (!isPrintDocument(request.document)
+      || (request.template !== 'classic' && request.template !== 'compact')
+      || typeof request.profileId !== 'string' || request.profileId.length === 0
+      || !request.options || typeof request.options !== 'object') {
+      return { ok: false, error: 'Invalid raster document request' };
+    }
+    const options = request.options as Record<string, unknown>;
+    if (!isValidRasterColumns(options.columns)
+      || typeof options.language !== 'string' || typeof options.locale !== 'string'
+      || typeof options.currency !== 'string' || typeof options.currencySymbol !== 'string'
+      || typeof options.trimDecimals !== 'boolean' || typeof options.useUnicode !== 'boolean'
+      || typeof options.arabicShaping !== 'boolean'
+      || (options.timezone !== undefined && typeof options.timezone !== 'string')) {
+      return { ok: false, error: 'Invalid raster document options' };
+    }
+    try {
+      return await rasterizePrintDocumentForWebUsb(
+        request.document as Parameters<typeof rasterizePrintDocumentForWebUsb>[0],
+        request.template,
+        request.profileId,
+        options as Parameters<typeof rasterizePrintDocumentForWebUsb>[3],
+      );
+    } catch (error: unknown) {
+      return { ok: false, error: getErrorMessage(error) };
+    }
+  });
+
+  handle('rasterize-kot-document', async (_event, payload: unknown) => {
+    if (!payload || typeof payload !== 'object') return { ok: false, error: 'Invalid raster KOT request' };
+    const request = payload as {
+      document?: unknown;
+      profileId?: unknown;
+      options?: unknown;
+    };
+    if (!isKotDocument(request.document)
+      || typeof request.profileId !== 'string'
+      || request.profileId.length === 0 || !request.options || typeof request.options !== 'object') {
+      return { ok: false, error: 'Invalid raster KOT request' };
+    }
+    const options = request.options as Record<string, unknown>;
+    if (!isValidRasterColumns(options.columns)
+      || typeof options.language !== 'string' || typeof options.locale !== 'string'
+      || (options.timezone !== undefined && typeof options.timezone !== 'string')
+      || typeof options.useUnicode !== 'boolean' || typeof options.arabicShaping !== 'boolean') {
+      return { ok: false, error: 'Invalid raster KOT options' };
+    }
+    try {
+      return await rasterizeKotDocumentForWebUsb(
+        request.document,
+        request.profileId,
+        options as Parameters<typeof rasterizeKotDocumentForWebUsb>[2],
+      );
+    } catch (error: unknown) {
+      return { ok: false, error: getErrorMessage(error) };
+    }
   });
 
   // Reports
@@ -396,11 +602,14 @@ export function registerIpcHandlers(shutdownSignal?: AbortSignal): void {
     try {
       const db = getDatabase();
       const today = new Date().toISOString().slice(0, 10);
+      const minorFactor = getCurrencyMinorUnitFactor(getTenantCurrency(db));
 
       const bills = db.prepare(`
-        SELECT COUNT(*) as bill_count, COALESCE(SUM(total), 0) as revenue
-        FROM bills WHERE date(created_at) = date(?) AND payment_status = 'paid'
-      `).get(today) as { bill_count: number; revenue: number };
+        SELECT
+          (SELECT COUNT(*) FROM bills WHERE date(paid_at) = date(?)) as bill_count,
+          COALESCE((SELECT SUM(paid_amount) FROM bills WHERE date(paid_at) = date(?)), 0)
+          - COALESCE((SELECT SUM(CAST(amount_cents AS REAL)) / ? FROM refunds WHERE date(created_at) = date(?)), 0) as revenue
+      `).get(today, today, minorFactor, today) as { bill_count: number; revenue: number };
 
       const covers = db.prepare(`
         SELECT COALESCE(SUM(guest_count), 0) as covers FROM orders
@@ -418,8 +627,8 @@ export function registerIpcHandlers(shutdownSignal?: AbortSignal): void {
         covers: covers.covers,
         pending_orders: pendingOrders.count,
       };
-    } catch (error: any) {
-      return { error: error.message };
+    } catch (error: unknown) {
+      return { error: getErrorMessage(error) };
     }
     });
   });

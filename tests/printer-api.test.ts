@@ -9,6 +9,7 @@
  */
 
 import * as fs from 'node:fs';
+import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -32,7 +33,8 @@ const request = require('supertest');
 const { initDatabase, getDatabase, closeDatabase, now } = require('../main/db');
 const { printerRoutes } = require('../main/routes/printers');
 const { kitchenStationRoutes } = require('../main/routes/kitchen-stations');
-const { printReceipt } = require('../main/printers/thermal');
+const { printReceipt, printReceiptDetailed } = require('../main/printers/thermal');
+const { cloudSync } = require('../main/services/cloud-sync');
 
 let passed = 0;
 let failed = 0;
@@ -92,15 +94,17 @@ async function runTests() {
     const res = await request(app).post('/api/printers').send({ name: 'Kitchen Printer', connection_type: 'usb' });
     assert(res.status === 201, `creating the first printer returns 201 (got ${res.status})`);
     assert(res.body.printer?.is_default === 1, 'the first printer is automatically the default');
+    assert(res.body.printer?.cash_drawer_pulse_enabled === 0, 'cash drawer pulse defaults off');
     assert(defaultCount() === 1, 'exactly one default printer exists');
   }
 
   // ── Test 2: creating a second default clears the previous default ───────
   console.log('\nTest 2: a second default replaces the first');
   {
-    const res = await request(app).post('/api/printers').send({ name: 'Receipt Printer', connection_type: 'usb', is_default: true });
+    const res = await request(app).post('/api/printers').send({ name: 'Receipt Printer', connection_type: 'usb', is_default: true, cash_drawer_pulse_enabled: true });
     assert(res.status === 201, `creating a second printer returns 201 (got ${res.status})`);
     assert(res.body.printer?.is_default === 1, 'the explicitly-default printer is default');
+    assert(res.body.printer?.cash_drawer_pulse_enabled === 1, 'cash drawer pulse can be enabled on create');
     assert(defaultCount() === 1, 'exactly one default printer remains after a new default is created');
   }
 
@@ -128,12 +132,16 @@ async function runTests() {
 
     const badDefault = await request(app).put(`/api/printers/${printerId}`).send({ is_default: 'yes' });
     assert(badDefault.status === 400, `non-boolean is_default returns 400 (got ${badDefault.status})`);
+
+    const badDrawerPulse = await request(app).put(`/api/printers/${printerId}`).send({ cash_drawer_pulse_enabled: 'yes' });
+    assert(badDrawerPulse.status === 400, `non-boolean cash_drawer_pulse_enabled returns 400 (got ${badDrawerPulse.status})`);
   }
 
   // ── Test 4: PUT keeps omitted fields, applies explicit values ───────────
   console.log('\nTest 4: PUT distinguishes omitted from explicit fields');
   {
     const printerId = defaultId();
+    await request(app).put(`/api/printers/${printerId}`).send({ cash_drawer_pulse_enabled: true });
     const before = db.prepare('SELECT * FROM printers WHERE id = ?').get(printerId) as any;
     const res = await request(app).put(`/api/printers/${printerId}`).send({ name: 'Renamed Printer' });
     assert(res.status === 200, `updating only the name returns 200 (got ${res.status})`);
@@ -141,11 +149,17 @@ async function runTests() {
     assert(after.name === 'Renamed Printer', 'the explicit name is applied');
     assert(after.connection_type === before.connection_type, 'omitted connection_type keeps the existing value');
     assert(after.port === before.port, 'omitted port keeps the existing value');
+    assert(after.cash_drawer_pulse_enabled === 1, 'omitted cash drawer pulse keeps the existing value');
 
     const clearIp = await request(app).put(`/api/printers/${printerId}`).send({ ip_address: null });
     assert(clearIp.status === 200, `explicit null ip_address is accepted (got ${clearIp.status})`);
     const afterClear = db.prepare('SELECT * FROM printers WHERE id = ?').get(printerId) as any;
     assert(afterClear.ip_address === null, 'explicit null ip_address clears the stored value');
+
+    const disablePulse = await request(app).put(`/api/printers/${printerId}`).send({ cash_drawer_pulse_enabled: false });
+    assert(disablePulse.status === 200, `explicit false cash drawer pulse is accepted (got ${disablePulse.status})`);
+    const afterDisable = db.prepare('SELECT * FROM printers WHERE id = ?').get(printerId) as any;
+    assert(afterDisable.cash_drawer_pulse_enabled === 0, 'explicit false disables cash drawer pulse');
   }
 
   // ── Test 5: unsetting the default picks a replacement ───────────────────
@@ -230,6 +244,12 @@ async function runTests() {
     assert(previewRes.body.columns === 42 || previewRes.body.columns === 48, `preview generation returns valid 80mm columns (got ${previewRes.body.columns})`);
     assert(typeof previewRes.body.text === 'string' && previewRes.body.text.length > 0, 'preview contains formatted receipt text');
 
+    db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('currency', 'xxx', ?)").run(now());
+    const arbitraryCurrencyPreview = await request(app).post('/api/printers/print-bill').send({ billId, preview: true });
+    assert(arbitraryCurrencyPreview.status === 200, `preview accepts a syntactically valid arbitrary currency code (got ${arbitraryCurrencyPreview.status})`);
+    assert(arbitraryCurrencyPreview.body.text.includes('XXX'), 'route preview emits the arbitrary currency code as ASCII');
+    db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('currency', 'INR', ?)").run(now());
+
     // Real hardware print request without preview should still reject with 400
     const realPrintRes = await request(app).post('/api/printers/print-bill').send({ billId, preview: false });
     assert(realPrintRes.status === 400, `direct hardware print with 0 printers fails with 400 (got ${realPrintRes.status})`);
@@ -238,6 +258,69 @@ async function runTests() {
     // Direct call to printReceipt with 0 printers should fail fast without attempting dispatch
     const directPrintRes = await printReceipt({ order_number: 'ORD-PREVIEW-1', items: [] }, { bill_number: 'BILL-PREVIEW-1' });
     assert(directPrintRes.ok === false && directPrintRes.detail === 'No printer configured', 'direct printReceipt without printers fails fast');
+  }
+
+  // ── Test 9: unsupported financial rows refuse before transport ──────────
+  console.log('\nTest 9: unsupported financial rows refuse before transport');
+  {
+    let transportConnections = 0;
+    let transportBytes = 0;
+    const transportServer = net.createServer((socket) => {
+      transportConnections++;
+      socket.on('data', (chunk) => { transportBytes += chunk.length; });
+    });
+    await new Promise<void>((resolve, reject) => {
+      transportServer.once('error', reject);
+      transportServer.listen(0, '127.0.0.1', () => resolve());
+    });
+    const transportAddress = transportServer.address();
+    const transportPort = typeof transportAddress === 'object' && transportAddress ? transportAddress.port : 0;
+    const printerRes = await request(app).post('/api/printers').send({
+      name: 'Safety Network Printer',
+      connection_type: 'network',
+      ip_address: '127.0.0.1',
+      port: transportPort,
+    });
+    assert(printerRes.status === 201, `safety printer fixture is created (got ${printerRes.status})`);
+
+    const printArgs = [
+      {
+        order_number: 'ORD-UNSUPPORTED-FINANCIAL',
+        created_at: '2026-01-01 12:00:00',
+        items: [{ product_name: 'کافه', quantity: 1, total: 10 }],
+      },
+      {
+        bill_number: 'INV-UNSUPPORTED-FINANCIAL',
+        subtotal: 10,
+        discount_amount: 0,
+        tax_amount: 1,
+        total: 11,
+        payment_details: JSON.stringify([{ method: 'cash', amount: 11 }]),
+      },
+      { name: 'Cafe', country: 'IR', currency_symbol: 'ریال', show_tax_breakdown: false },
+      'compact',
+      false,
+      false,
+      undefined,
+      false,
+      'fa',
+    ] as const;
+    const result = await printReceipt(...printArgs);
+    assert(result.ok === false, 'unsupported financial receipt is refused');
+    assert(result.failureClass === 'unsupported', 'refusal is classified as unsupported');
+    assert(result.detail?.startsWith('Receipt not printed: a financial row'), 'refusal gives an explicit operator warning');
+    assert(result.warnings?.some((warning: any) => warning.kind === 'financial'), 'refusal returns the financial warning');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert(transportConnections === 0 && transportBytes === 0, 'unsupported financial refusal opens no transport or sends bytes');
+
+    const originalReportDiagnostic = cloudSync.reportDiagnostic;
+    let diagnostic: any;
+    cloudSync.reportDiagnostic = (input: any) => { diagnostic = input; };
+    const detailed = await printReceiptDetailed(...printArgs);
+    cloudSync.reportDiagnostic = originalReportDiagnostic;
+    assert(detailed.stage === 'prepare', 'unsupported financial refusal is reported at prepare stage');
+    assert(diagnostic?.message === 'Receipt not printed: unsupported financial row', 'diagnostic message omits receipt row text');
+    await new Promise<void>((resolve, reject) => transportServer.close((error) => error ? reject(error) : resolve()));
   }
 
   console.log('\n' + '='.repeat(50));

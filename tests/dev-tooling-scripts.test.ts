@@ -377,6 +377,12 @@ exit 0
 
   assert.ok(ciConfig?.jobs?.['linux-tests'], 'ci.yml must define a "linux-tests" job');
   const linuxTestsJob = ciConfig.jobs['linux-tests'];
+  for (const jobName of ['dependency-review', 'changes', 'tax-category-invariant', 'linux-baseline', 'linux-tests', 'e2e-playwright', 'native-e2e-playwright']) {
+    assert.strictEqual(ciConfig.jobs[jobName]?.['runs-on'], 'ubuntu-24.04', `${jobName} must use the pinned Ubuntu image`);
+  }
+  assert.strictEqual(ciConfig.jobs['linux-baseline']?.['timeout-minutes'], 25);
+  assert.strictEqual(linuxTestsJob['runs-on'], 'ubuntu-24.04');
+  assert.strictEqual(linuxTestsJob['timeout-minutes'], 25);
   assert.strictEqual(
     linuxTestsJob.name,
     'Core Test Suite (Shard ${{ matrix.shard_number }}/2)',
@@ -392,7 +398,10 @@ exit 0
 
   const shardRunStep = linuxTestsJob.steps.find((step: any) => step.name === 'Core test suite (shard ${{ matrix.shard }})');
   assert.ok(shardRunStep, 'linux-tests must define its core test suite step');
-  assert.strictEqual(shardRunStep.run.trim(), 'SHARD_TOTAL=2 SHARD_INDEX=${{ matrix.shard }} node scripts/ci/run-test-shard.cjs');
+  assert.strictEqual(
+    shardRunStep.run.trim(),
+    "xvfb-run -a --server-args='-screen 0 1280x800x24' env SHARD_TOTAL=2 SHARD_INDEX=${{ matrix.shard }} node scripts/ci/run-test-shard.cjs",
+  );
   assert.ok(
     linuxTestsJob.steps.some((step: any) => step.if === 'matrix.shard == 0'),
     'Payment method split check must run only on shard 0',
@@ -400,6 +409,14 @@ exit 0
   assert.ok(
     linuxTestsJob.steps.some((step: any) => step.name === 'Install frontend dependencies' && step['working-directory'] === 'frontend'),
     'linux-tests must include frontend dependencies installation step',
+  );
+
+  const linuxBaselineJob = ciConfig.jobs['linux-baseline'];
+  const baselineBuildStep = linuxBaselineJob.steps.find((step: any) => step.name === 'Build frontend');
+  assert.strictEqual(
+    baselineBuildStep.run.trim(),
+    'cd frontend && npx cross-env NEXT_BUILD_MODE=desktop npm run build',
+    'linux-baseline must reuse its installed frontend dependencies for the build',
   );
 
   console.log('✓ CI workflow linux-tests matrix and sharding configuration verified');
@@ -464,6 +481,23 @@ exit 0
   assert.doesNotMatch(windowsRunCommands, /install-electron|electron-builder install-app-deps|verify:electron/);
 
   console.log('✓ Windows uninstaller CI boundary avoids application postinstall');
+
+  // Validate nightly-release.yml full matrix workflow configuration
+  const nightlyPath = path.join(rootDir, '.github/workflows/nightly-release.yml');
+  const nightlyConfig = YAML.load(fs.readFileSync(nightlyPath, 'utf8')) as any;
+  const buildMatrixJob = nightlyConfig.jobs['build-matrix'];
+  assert.ok(buildMatrixJob, 'nightly-release.yml must define build-matrix job');
+  const linuxRow = buildMatrixJob.strategy?.matrix?.include?.find((entry: any) => entry.name === 'linux-x64');
+  assert.ok(linuxRow, 'nightly-release.yml matrix must define linux-x64 row');
+  assert.match(linuxRow['extra-deps'], /apt-get\s+install(?:-[a-z]+)*\s+.*?\bxvfb\b/, 'linux-x64 matrix row must install xvfb via apt-get in extra-deps');
+  const testStep = buildMatrixJob.steps.find((step: any) => step.name === 'Run full platform test suite');
+  assert.ok(testStep, 'nightly-release.yml must define full platform test suite step');
+  assert.strictEqual(testStep.shell, 'bash', 'Run full platform test suite step must explicitly use bash shell for cross-platform compatibility');
+  assert.match(testStep.run, /if\s+\[\s*"\${{\s*runner\.os\s*}}"\s*=\s*"Linux"\s*\];\s*then/, 'test step must check for Linux runner OS');
+  assert.match(testStep.run, /xvfb-run\s+-a\s+--server-args='-screen 0 1280x800x24'\s+npm test/, 'test step must execute npm test under xvfb-run on Linux');
+  assert.match(testStep.run, /else\s+npm test\s+fi/, 'test step must execute direct npm test fallback on non-Linux');
+
+  console.log('✓ Nightly full cross-platform matrix Linux xvfb configuration verified');
 
   console.log('All dev tooling script tests passed cleanly!');
 }

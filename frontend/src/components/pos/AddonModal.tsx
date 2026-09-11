@@ -121,7 +121,7 @@ export default function AddonModal({
             return (
               <div key={group.id}>
                 <div className="flex items-center justify-between mb-2">
-                  <h3 className="font-semibold text-sm text-gray-900">{group.name}</h3>
+                  <h3 className="font-semibold text-sm text-foreground">{group.name}</h3>
                   <span className="flex items-center gap-2">
                     {Boolean(group.is_required) && (
                       <span className="text-xs text-red-500 font-medium">{t('required')}</span>
@@ -141,7 +141,7 @@ export default function AddonModal({
                     })() : null}
                   </span>
                 </div>
-                {group.description && <p className="text-xs text-gray-400 mb-2">{group.description}</p>}
+                {group.description && <p className="text-xs text-muted-foreground mb-2">{group.description}</p>}
                 <div className="space-y-1">
                   {activeAddons.map((addon) => {
                     const addonQty = getAddonQuantity(group.id, addon.id);
@@ -151,33 +151,33 @@ export default function AddonModal({
                       return (
                         <div
                           key={addon.id}
-                          className={`w-full flex items-center justify-between px-3 py-2.5 rounded-lg border text-sm transition-colors ${
+                          className={`w-full min-h-14 flex items-center justify-between gap-3 px-3 py-2.5 rounded-lg border text-sm transition-colors ${
                             isSel
-                              ? 'border-brand bg-brand-light text-brand'
-                              : 'border-gray-200 hover:border-gray-300'
+                              ? 'border-brand bg-[var(--color-brand-light)] text-brand dark:text-indigo-300'
+                              : 'border-border hover:border-gray-300 dark:hover:border-border dark:border-border'
                           }`}
                         >
                           <div className="flex items-center gap-2">
                             <span className="font-medium">{addon.name}</span>
-                            <span className={`text-xs ${isSel ? 'text-brand font-semibold' : 'text-gray-500'}`}>
+                            <span className={`text-xs ${isSel ? 'text-brand dark:text-indigo-300 font-semibold' : 'text-muted-foreground'}`}>
                               {Number(addon.price) === 0 ? t('freeAddon') : `+${fmt(Number(addon.price))}`}
                             </span>
                           </div>
                           <div className="flex items-center gap-2">
                             {isSel ? (
-                              <div className="flex items-center gap-1.5 bg-white border border-brand rounded-lg p-0.5">
+                              <div className="flex items-center gap-1.5 bg-card border border-brand rounded-lg p-0.5">
                                 <button
                                   type="button"
                                   onClick={() => updateAddonQuantity(group, addon, -1)}
-                                  className="w-6 h-6 rounded flex items-center justify-center text-brand hover:bg-brand-light"
+                                  className="touch-target rounded flex items-center justify-center text-brand dark:text-indigo-300 hover:bg-brand-light dark:hover:bg-[var(--color-brand-light)] active:bg-brand-light dark:active:bg-[var(--color-brand-light)]"
                                 >
                                   <Minus size={14} />
                                 </button>
-                                <span className="text-xs font-bold w-4 text-center text-brand">{addonQty}</span>
+                                <span className="text-sm font-bold w-5 text-center text-brand dark:text-indigo-300 tabular-nums">{addonQty}</span>
                                 <button
                                   type="button"
                                   onClick={() => updateAddonQuantity(group, addon, 1)}
-                                  className="w-6 h-6 rounded flex items-center justify-center text-brand hover:bg-brand-light"
+                                  className="touch-target rounded flex items-center justify-center text-brand dark:text-indigo-300 hover:bg-brand-light dark:hover:bg-[var(--color-brand-light)] active:bg-brand-light dark:active:bg-[var(--color-brand-light)]"
                                 >
                                   <Plus size={14} />
                                 </button>
@@ -186,7 +186,7 @@ export default function AddonModal({
                               <button
                                 type="button"
                                 onClick={() => updateAddonQuantity(group, addon, 1)}
-                                className="w-6 h-6 rounded-full bg-gray-100 flex items-center justify-center text-gray-600 hover:bg-gray-200"
+                                className="touch-target rounded-full bg-muted flex items-center justify-center text-muted-foreground hover:bg-muted active:bg-muted"
                               >
                                 <Plus size={14} />
                               </button>
@@ -199,33 +199,33 @@ export default function AddonModal({
                     return (
                       <div
                         key={addon.id}
-                        className={`w-full flex items-center justify-between px-3 py-2.5 rounded-lg border text-sm transition-colors ${
+                        className={`w-full min-h-14 flex items-center justify-between gap-3 px-3 py-2.5 rounded-lg border text-sm transition-colors ${
                           isSel
-                            ? 'border-brand bg-brand-light text-brand'
-                            : 'border-gray-200 hover:border-gray-300'
+                            ? 'border-brand bg-[var(--color-brand-light)] text-brand dark:text-indigo-300'
+                            : 'border-border hover:border-gray-300 dark:hover:border-border dark:border-border'
                         }`}
                       >
                         <div className="flex items-center gap-2">
                           <span className="font-medium">{addon.name}</span>
-                          <span className={`text-xs ${isSel ? 'text-brand font-semibold' : 'text-gray-500'}`}>
+                          <span className={`text-xs ${isSel ? 'text-brand dark:text-indigo-300 font-semibold' : 'text-muted-foreground'}`}>
                             {Number(addon.price) === 0 ? t('freeAddon') : `+${fmt(Number(addon.price))}`}
                           </span>
                         </div>
                         <div className="flex items-center gap-2">
                           {isSel ? (
-                            <div className="flex items-center gap-1.5 bg-white border border-brand rounded-lg p-0.5">
+                            <div className="flex items-center gap-1.5 bg-card border border-brand rounded-lg p-0.5">
                               <button
                                 type="button"
                                 onClick={() => toggleAddonCheckbox(group, addon)}
-                                className="w-6 h-6 rounded flex items-center justify-center text-brand hover:bg-brand-light"
+                                className="touch-target rounded flex items-center justify-center text-brand dark:text-indigo-300 hover:bg-brand-light dark:hover:bg-[var(--color-brand-light)] active:bg-brand-light dark:active:bg-[var(--color-brand-light)]"
                               >
                                 <Minus size={14} />
                               </button>
-                              <span className="text-xs font-bold w-4 text-center text-brand">1</span>
+                              <span className="text-sm font-bold w-5 text-center text-brand dark:text-indigo-300 tabular-nums">1</span>
                               <button
                                 type="button"
                                 disabled
-                                className="w-6 h-6 rounded flex items-center justify-center text-gray-300 cursor-not-allowed opacity-50"
+                                className="touch-target rounded flex items-center justify-center text-gray-300 cursor-not-allowed opacity-50"
                               >
                                 <Plus size={14} />
                               </button>
@@ -234,7 +234,7 @@ export default function AddonModal({
                             <button
                               type="button"
                               onClick={() => toggleAddonCheckbox(group, addon)}
-                              className="w-6 h-6 rounded-full bg-gray-100 flex items-center justify-center text-gray-600 hover:bg-gray-200"
+                              className="touch-target rounded-full bg-muted flex items-center justify-center text-muted-foreground hover:bg-muted active:bg-muted"
                             >
                               <Plus size={14} />
                             </button>
@@ -258,33 +258,49 @@ export default function AddonModal({
           })}
 
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">{t('specialInstructions')}</label>
+            <label className="block text-sm font-medium text-foreground mb-1">{t('specialInstructions')}</label>
             <input
               type="text"
               value={instructions}
               onChange={(e) => setInstructions(e.target.value.slice(0, 100))}
               placeholder={t('specialInstructionsPlaceholder')}
               maxLength={100}
-              className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand"
+              className="w-full min-h-11 px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand"
             />
-            <p className="text-xs text-gray-400 text-end mt-0.5">{instructions.length}/100</p>
+            <p className="text-xs text-muted-foreground text-end mt-0.5">{instructions.length}/100</p>
           </div>
         </div>
 
-        <div className="p-5 border-t border-gray-100">
+        <div className="p-5 border-t border-border">
           <div className="flex items-center justify-center gap-4 mb-4">
             <button
               onClick={() => setQuantity(Math.max(1, quantity - 1))}
-              className="w-8 h-8 rounded-full bg-gray-100 flex items-center justify-center hover:bg-gray-200"
+              className="touch-target rounded-full bg-muted flex items-center justify-center hover:bg-muted active:bg-muted"
+              aria-label={t('remove')}
             >
-              <Minus size={16} />
+              <Minus size={18} />
             </button>
-            <span className="text-lg font-bold w-8 text-center">{quantity}</span>
+            <div className="grid grid-cols-3 gap-2">
+              {[1, 2, 3].map((quickQty) => (
+                <button
+                  key={quickQty}
+                  type="button"
+                  onClick={() => setQuantity(quickQty)}
+                  className={`touch-target rounded-lg border px-3 text-sm font-bold tabular-nums ${
+                    quantity === quickQty ? 'border-brand bg-brand text-white' : 'border-border bg-card text-foreground'
+                  }`}
+                >
+                  {quickQty}
+                </button>
+              ))}
+            </div>
+            <span className="text-lg font-bold w-10 text-center tabular-nums">{quantity}</span>
             <button
               onClick={() => setQuantity(quantity + 1)}
-              className="w-8 h-8 rounded-full bg-gray-100 flex items-center justify-center hover:bg-gray-200"
+              className="touch-target rounded-full bg-muted flex items-center justify-center hover:bg-muted active:bg-muted"
+              aria-label={t('addItems')}
             >
-              <Plus size={16} />
+              <Plus size={18} />
             </button>
           </div>
           <Button onClick={handleAdd} disabled={!isValid} className="w-full" size="lg">

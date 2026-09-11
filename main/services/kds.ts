@@ -3,6 +3,7 @@ import { getDatabase, getKdsStationCategoryIds, getKdsStationRoutingScope, getUs
 import * as jwt from 'jsonwebtoken';
 import { getJWTSecret, parseCategoryIds } from '../routes/auth';
 import { getUserAuthStatus, isTokenRevoked, isTokenStale } from '../middleware/security';
+import { ROLE_ACCESS, hasRole } from '../../shared/role-permissions';
 
 interface KdsClient {
   ws: WebSocket;
@@ -81,14 +82,14 @@ function isKdsClientAuthorized(client: KdsClient): boolean {
     if (
       decoded.userId !== client.userId ||
       !status?.isActive ||
-      !['chef', 'owner', 'manager'].includes(status.role) ||
+      !hasRole(status.role, ROLE_ACCESS.kitchen) ||
       isTokenStale(decoded.iat, status.tokensValidAfter)
     ) return false;
     const currentUser = getDatabase()
       .prepare('SELECT category_ids FROM users WHERE id = ? AND is_active = 1')
       .get(client.userId) as { category_ids: string | null } | undefined;
     if (!currentUser) return false;
-    const nextCategoryIds = ['manager', 'owner'].includes(status.role)
+    const nextCategoryIds = hasRole(status.role, ROLE_ACCESS.ownerManager)
       ? []
       : parseCategoryIds(currentUser.category_ids);
     const nextStationIds = getUserKdsStationIds(getDatabase(), client.userId);
@@ -185,9 +186,7 @@ export function setupKdsWebSocket(wss: WebSocketServer): void {
   activeWebSocketServers += 1;
   if (!heartbeat) {
     heartbeat = setInterval(() => {
-      // The voided-item expiry marker is a global value, not per-client —
-      // compute it once per tick instead of repeating the query for every
-      // connected kitchen terminal.
+      // Compute voided-item expiry marker once per tick for all connected clients.
       const sharedExpiredVoidMarker = getExpiredVoidMarker();
       clients.forEach((client, ws) => {
         if (isDatabaseMaintenanceActive()) {
@@ -308,12 +307,12 @@ function handleAuth(ws: WebSocket, client: KdsClient, message: any): void {
       return;
     }
 
-    if (user.role !== 'chef' && user.role !== 'owner' && user.role !== 'manager') {
+    if (!hasRole(user.role, ROLE_ACCESS.kitchen)) {
       closeKdsClient(client, 'Only kitchen staff can access KDS');
       return;
     }
 
-    const categoryIds = ['manager', 'owner'].includes(user.role)
+    const categoryIds = hasRole(user.role, ROLE_ACCESS.ownerManager)
       ? []
       : parseCategoryIds(user.category_ids);
     const stationIds = getUserKdsStationIds(getDatabase(), user.id);
@@ -405,7 +404,7 @@ function handleStatusUpdate(client: KdsClient, message: any): void {
       if (existingItem.status === 'void_adjustment') {
         return { error: 'This bill adjustment cannot be updated from KDS' };
       }
-      if (existingItem.status === 'completed' || existingItem.status === 'cancelled') {
+      if (existingItem.status === 'completed' || existingItem.status === 'cancelled' || existingItem.status === 'refunded') {
         return { error: 'This terminal item cannot be updated from KDS' };
       }
 
@@ -428,7 +427,7 @@ function handleStatusUpdate(client: KdsClient, message: any): void {
       }
 
       const updateResult = expectedStatus === undefined
-        ? db.prepare("UPDATE order_items SET status = ?, updated_at = ? WHERE id = ? AND status NOT IN ('voided', 'void_adjustment', 'completed', 'cancelled')").run(status, now(), order_item_id)
+        ? db.prepare("UPDATE order_items SET status = ?, updated_at = ? WHERE id = ? AND status NOT IN ('voided', 'void_adjustment', 'completed', 'cancelled', 'refunded')").run(status, now(), order_item_id)
         : db.prepare('UPDATE order_items SET status = ?, updated_at = ? WHERE id = ? AND status = ?').run(status, now(), order_item_id, expectedStatus);
       if (updateResult.changes !== 1) {
         return { error: 'Item status changed; refresh and try again' };
@@ -455,21 +454,10 @@ function handleStatusUpdate(client: KdsClient, message: any): void {
   }
 }
 
-/**
- * An order can be marked 'completed' the moment its bill is fully paid
- * (see bills.ts), which for a prepaid order happens before the kitchen has
- * even started — payment and kitchen fulfillment are independent and can
- * finish in either order. So "still needs the kitchen's attention" isn't
- * just `status NOT IN ('completed','cancelled')`: a completed-by-payment
- * order still belongs on KDS as long as it has items the kitchen hasn't
- * served yet. Non-completed orders (pending/preparing/ready/served) are
- * always included, matching the original behavior for the normal flow.
- */
+/** Returns SQL condition for orders needing kitchen attention or unserved items. */
 function activeOrdersCondition(): string {
   if (!isKdsEnabled()) return `o.status NOT IN ('completed', 'cancelled')`;
-  // #208: replace the OR EXISTS scan with a CTE anchored on the status and
-  // item-status indexes — keeps the active-orders payload fast as the
-  // orders table grows past ~100k rows.
+  // Fast indexed CTE query matching active orders or unserved items.
   return `o.id IN (
     SELECT id FROM orders WHERE status IN ('pending','preparing','ready','served')
     UNION
@@ -497,9 +485,9 @@ function sendActiveOrders(ws: WebSocket, categoryIds: string[], stationIds: stri
   if (stationIds.length > 0) {
     const stationPlaceholders = stationIds.map(() => '?').join(',');
     const categoryRoute = stationRoutingCategoryIds.length > 0
-      ? ` OR EXISTS (SELECT 1 FROM order_items routed_oi JOIN products routed_p ON routed_p.id = routed_oi.product_id WHERE routed_oi.order_id = o.id AND o.table_id IS NULL AND routed_p.category_id IN (${stationRoutingCategoryIds.map(() => '?').join(',')}))`
+      ? ` OR EXISTS (SELECT 1 FROM order_items routed_oi JOIN products routed_p ON routed_p.id = routed_oi.product_id WHERE routed_oi.order_id = o.id AND t.kitchen_station_id IS NULL AND routed_p.category_id IN (${stationRoutingCategoryIds.map(() => '?').join(',')}))`
       : '';
-    query += ` AND (t.kitchen_station_id IN (${stationPlaceholders})${categoryRoute}${stationScope.hasUnrestrictedStation ? ' OR o.table_id IS NULL' : ''})`;
+    query += ` AND (t.kitchen_station_id IN (${stationPlaceholders})${categoryRoute}${stationScope.hasUnrestrictedStation ? ' OR t.kitchen_station_id IS NULL' : ''})`;
     orderParams.push(...stationIds, ...stationRoutingCategoryIds);
   }
   query += ' ORDER BY o.created_at ASC';
@@ -535,7 +523,7 @@ function sendActiveOrders(ws: WebSocket, categoryIds: string[], stationIds: stri
   const allVisibleItems = (orders as any[])
     .flatMap((o: any) => itemsByOrder[o.id] || [])
     .filter((i: any) => i.status !== 'void_adjustment'
-      && !['completed', 'cancelled'].includes(i.status)
+      && !['completed', 'cancelled', 'refunded'].includes(i.status)
       && (i.status !== 'voided' || isVoidedItemKdsVisible(i.voided_at))
       && isKdsStationItemAllowed(stationIds, stationRoutingCategoryIds, (orders as any[]).find((order) => order.id === i.order_id)?.kitchen_station_id, i.category_id, (orders as any[]).find((order) => order.id === i.order_id)?.kitchen_station_id ? stationScope.categoryIdsByStation[String((orders as any[]).find((order) => order.id === i.order_id)?.kitchen_station_id)] : undefined, stationScope.hasUnrestrictedStation));
   const itemsWithAddons = attachEffectiveAddons(db, allVisibleItems.map(parseItemJson) as any[]);
@@ -546,7 +534,7 @@ function sendActiveOrders(ws: WebSocket, categoryIds: string[], stationIds: stri
     // item) and age voided items off the board after their grace period.
     const visibleItems = (itemsByOrder[order.id] || [])
       .filter((i: any) => i.status !== 'void_adjustment'
-        && !['completed', 'cancelled'].includes(i.status)
+        && !['completed', 'cancelled', 'refunded'].includes(i.status)
         && (i.status !== 'voided' || isVoidedItemKdsVisible(i.voided_at))
         && isKdsStationItemAllowed(stationIds, stationRoutingCategoryIds, order.kitchen_station_id, i.category_id, order.kitchen_station_id ? stationScope.categoryIdsByStation[String(order.kitchen_station_id)] : undefined, stationScope.hasUnrestrictedStation))
       .map((i: any) => addonsByItemId.get(i.id) || i);
@@ -571,7 +559,7 @@ function sendActiveOrders(ws: WebSocket, categoryIds: string[], stationIds: stri
     JOIN orders o ON oi.order_id = o.id
     LEFT JOIN tables t ON o.table_id = t.id
     WHERE ${activeOrdersCondition()}
-      AND oi.status NOT IN ('completed', 'cancelled', 'void_adjustment')
+      AND oi.status NOT IN ('completed', 'cancelled', 'void_adjustment', 'refunded')
       AND (oi.status != 'voided' OR oi.voided_at IS NULL OR oi.voided_at > ?)
   `;
   const countParams: any[] = [voidedCutoff];
@@ -589,10 +577,10 @@ function sendActiveOrders(ws: WebSocket, categoryIds: string[], stationIds: stri
       }
     }
     if (stationRoutingCategoryIds.length > 0) {
-      stationRoutes.push(`(o.table_id IS NULL AND p.category_id IN (${stationRoutingCategoryIds.map(() => '?').join(',')}))`);
+      stationRoutes.push(`(t.kitchen_station_id IS NULL AND p.category_id IN (${stationRoutingCategoryIds.map(() => '?').join(',')}))`);
       countParams.push(...stationRoutingCategoryIds);
     }
-    if (stationScope.hasUnrestrictedStation) stationRoutes.push('o.table_id IS NULL');
+    if (stationScope.hasUnrestrictedStation) stationRoutes.push('t.kitchen_station_id IS NULL');
     countsQuery += ` AND (${stationRoutes.length > 0 ? stationRoutes.join(' OR ') : '0'})`;
   }
   if (categoryIds.length > 0) {

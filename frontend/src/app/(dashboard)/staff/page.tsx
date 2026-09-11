@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
+import axios from 'axios';
 import api from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
@@ -8,18 +9,14 @@ import toast from 'react-hot-toast';
 import { Plus, X, Edit, RotateCcw, Eye, EyeOff } from 'lucide-react';
 import type { Staff } from '@/lib/types';
 import { useTranslations, type AppConfig } from 'use-intl';
+import { useAuthStore } from '@/store/auth';
+import { PermissionMatrix } from '@/components/settings/PermissionMatrix';
+import { ROLE_ACCESS, ROLE_KEYS, hasRole } from '@shared/role-permissions';
+import { ROLE_LABEL_KEYS } from '@/lib/i18n-enums';
 
-const VALID_ROLES = ['owner', 'manager', 'cashier', 'server', 'chef'];
+const VALID_ROLES = ROLE_KEYS;
 
 type StaffKey = keyof AppConfig['Messages']['staff'];
-
-const roleColorKey = {
-  owner: 'roleOwner',
-  manager: 'roleManager',
-  cashier: 'roleCashier',
-  server: 'roleServer',
-  chef: 'roleChef',
-} as const satisfies Record<'owner' | 'manager' | 'cashier' | 'server' | 'chef', StaffKey>;
 
 const roleColors: Record<string, string> = {
   owner: 'bg-red-100 text-red-800',
@@ -30,8 +27,16 @@ const roleColors: Record<string, string> = {
 };
 
 function roleLabel(role: string, t: (key: StaffKey) => string): string {
-  const key = (roleColorKey as Record<string, StaffKey | undefined>)[role];
+  const key = ROLE_LABEL_KEYS[role];
   return key ? t(key) : role;
+}
+
+function extractErrorMessage(error: unknown, fallback: string): string {
+  if (axios.isAxiosError(error)) {
+    const apiError = error.response?.data?.error;
+    if (typeof apiError === 'string' && apiError.trim()) return apiError;
+  }
+  return fallback;
 }
 
 export default function StaffPage() {
@@ -39,6 +44,8 @@ export default function StaffPage() {
   const tCommon = useTranslations('common');
   const tAuth = useTranslations('auth');
   const tSetup = useTranslations('setup');
+  const { currentTenant } = useAuthStore();
+  const canViewPermissionMatrix = hasRole(currentTenant?.role, ROLE_ACCESS.ownerManager);
   const [staff, setStaff] = useState<Staff[]>([]);
   const [, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
@@ -112,7 +119,7 @@ export default function StaffPage() {
       if (editingStaff) {
         await api.put(`/staff/${editingStaff.id}`, {
           name: form.name,
-          email: form.email || null,
+          email: form.email,
           role: form.role,
           ...(form.password ? { password: form.password } : {}),
           ...(form.pin ? { pin: form.pin } : {}),
@@ -121,7 +128,7 @@ export default function StaffPage() {
       } else {
         await api.post('/staff', {
           name: form.name,
-          email: form.email || null,
+          email: form.email,
           password: form.password,
           role: form.role,
           ...(form.pin ? { pin: form.pin } : {}),
@@ -130,8 +137,8 @@ export default function StaffPage() {
       }
       closeForm();
       fetchStaff();
-    } catch {
-      toast.error(t('failedToSave'));
+    } catch (error: unknown) {
+      toast.error(extractErrorMessage(error, t('failedToSave')));
     }
   };
 
@@ -145,8 +152,8 @@ export default function StaffPage() {
       await api.put(`/staff/${resetPwStaff.id}`, { password: newPassword });
       toast.success(t('resetPasswordToast'));
       closeResetPassword();
-    } catch {
-      toast.error(t('failedToReset'));
+    } catch (error: unknown) {
+      toast.error(extractErrorMessage(error, t('failedToReset')));
     }
   };
 
@@ -177,22 +184,22 @@ export default function StaffPage() {
   return (
     <div>
       <div className="flex justify-between items-center mb-6">
-        <h1 className="text-2xl font-bold text-gray-900">{t('title')}</h1>
+        <h1 className="text-2xl font-bold text-foreground">{t('title')}</h1>
         <Button onClick={openAdd}><Plus size={16} className="me-1" /> {t('addButton')}</Button>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
         {staff.map((s) => (
-          <div key={s.id} className={`bg-white rounded-xl p-5 border ${s.is_active ? 'border-gray-100' : 'border-gray-200 opacity-60'}`}>
+          <div key={s.id} className={`bg-card rounded-xl p-5 border ${s.is_active ? 'border-border' : 'border-border opacity-60'}`}>
             <div className="flex justify-between items-start mb-3">
               <div>
-                <p className="font-bold text-gray-900">{s.name}</p>
-                <p className="text-xs text-gray-500">{s.email || '—'}</p>
+                <p className="font-bold text-foreground">{s.name}</p>
+                <p className="text-xs text-muted-foreground">{s.email || '—'}</p>
                 {Boolean(s.has_pin) && (
                   <p className="text-xs text-green-600 mt-1">{t('pinSet')}</p>
                 )}
               </div>
-              <span className={`inline-block px-2.5 py-0.5 rounded-full text-xs font-medium capitalize ${roleColors[s.role] || 'bg-gray-100 text-gray-800'}`}>
+              <span className={`inline-block px-2.5 py-0.5 rounded-full text-xs font-medium capitalize ${roleColors[s.role] || 'bg-muted text-foreground'}`}>
                 {roleLabel(s.role, t)}
               </span>
             </div>
@@ -216,11 +223,13 @@ export default function StaffPage() {
         ))}
       </div>
 
-      {staff.length === 0 && <p className="text-center text-gray-500 py-12">{t('empty')}</p>}
+      {staff.length === 0 && <p className="text-center text-muted-foreground py-12">{t('empty')}</p>}
+
+      {canViewPermissionMatrix && <PermissionMatrix />}
 
       {showForm && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-2xl p-6 w-full max-w-sm">
+          <div className="bg-card rounded-2xl p-6 w-full max-w-sm">
             <div className="flex justify-between items-center mb-4">
               <h2 className="text-lg font-bold">{editingStaff ? t('modalTitleEdit') : t('modalTitleAdd')}</h2>
               <button type="button" onClick={closeForm}><X size={20} className="text-gray-400" /></button>
@@ -232,9 +241,12 @@ export default function StaffPage() {
                 className="w-full px-3 py-2 border rounded-lg outline-none focus:ring-2 focus:ring-brand" required
               />
               <input
-                type="email" placeholder={`${tAuth('email')} (${tCommon('optional')})`} value={form.email}
+                type="email" placeholder={tAuth('email')} value={form.email}
                 onChange={(e) => setForm({ ...form, email: e.target.value })}
                 className="w-full px-3 py-2 border rounded-lg outline-none focus:ring-2 focus:ring-brand"
+                autoComplete="email"
+                dir="ltr"
+                required
               />
               <div className="relative">
                 <input
@@ -244,7 +256,7 @@ export default function StaffPage() {
                   className="w-full px-3 py-2 pe-10 border rounded-lg outline-none focus:ring-2 focus:ring-brand"
                   required={!editingStaff}
                 />
-                <button type="button" aria-label="Toggle password visibility" title="Toggle password visibility" onClick={() => setShowPassword(!showPassword)} className="absolute end-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-700">
+                <button type="button" aria-label="Toggle password visibility" title="Toggle password visibility" onClick={() => setShowPassword(!showPassword)} className="absolute end-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
                   {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
                 </button>
               </div>
@@ -257,7 +269,7 @@ export default function StaffPage() {
               />
               <Select
                 value={form.role}
-                onValueChange={(role) => setForm({ ...form, role, pin: ['owner', 'manager'].includes(role) ? form.pin : '' })}
+                onValueChange={(role) => setForm({ ...form, role, pin: hasRole(role, ROLE_ACCESS.ownerManager) ? form.pin : '' })}
               >
                 <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
                 <SelectContent>
@@ -266,7 +278,7 @@ export default function StaffPage() {
                   ))}
                 </SelectContent>
               </Select>
-              {['owner', 'manager'].includes(form.role) && (
+              {hasRole(form.role, ROLE_ACCESS.ownerManager) && (
                 <div>
                   <div className="relative">
                     <input
@@ -278,11 +290,11 @@ export default function StaffPage() {
                       pattern="[0-9]*"
                       inputMode="numeric"
                     />
-                    <button type="button" aria-label="Toggle PIN visibility" title="Toggle PIN visibility" onClick={() => setShowPin(!showPin)} className="absolute end-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-700">
+                    <button type="button" aria-label="Toggle PIN visibility" title="Toggle PIN visibility" onClick={() => setShowPin(!showPin)} className="absolute end-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
                       {showPin ? <EyeOff size={16} /> : <Eye size={16} />}
                     </button>
                   </div>
-                  <p className="text-xs text-gray-500 mt-1">{t('pinHint')}</p>
+                  <p className="text-xs text-muted-foreground mt-1">{t('pinHint')}</p>
                 </div>
               )}
               <Button type="submit" className="w-full">{editingStaff ? t('updateButton') : t('addButton')}</Button>
@@ -293,12 +305,12 @@ export default function StaffPage() {
 
       {showResetPw && resetPwStaff && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-2xl p-6 w-full max-w-sm">
+          <div className="bg-card rounded-2xl p-6 w-full max-w-sm">
             <div className="flex justify-between items-center mb-4">
               <h2 className="text-lg font-bold">{t('resetPasswordTitle')}</h2>
               <button type="button" onClick={closeResetPassword}><X size={20} className="text-gray-400" /></button>
             </div>
-            <p className="text-sm text-gray-600 mb-4">{t('resetPasswordBody', { name: resetPwStaff.name })}</p>
+            <p className="text-sm text-muted-foreground mb-4">{t('resetPasswordBody', { name: resetPwStaff.name })}</p>
             <div className="space-y-4">
               <div className="relative">
                 <input
@@ -306,7 +318,7 @@ export default function StaffPage() {
                   onChange={(e) => setNewPassword(e.target.value)}
                   className="w-full px-3 py-2 pe-10 border rounded-lg outline-none focus:ring-2 focus:ring-brand"
                 />
-                <button type="button" aria-label="Toggle password visibility" title="Toggle password visibility" onClick={() => setShowResetPassword(!showResetPassword)} className="absolute end-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-700">
+                <button type="button" aria-label="Toggle password visibility" title="Toggle password visibility" onClick={() => setShowResetPassword(!showResetPassword)} className="absolute end-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
                   {showResetPassword ? <EyeOff size={16} /> : <Eye size={16} />}
                 </button>
               </div>

@@ -70,6 +70,8 @@ describe('Issue #263: Phone Normalization, Validation, and Privacy', () => {
     if (fs.existsSync(wal)) fs.unlinkSync(wal);
     const shm = path.join(tempDir, 'flo.db-shm');
     if (fs.existsSync(shm)) fs.unlinkSync(shm);
+    const marker = path.join(tempDir, '.flo-db-initialized');
+    if (fs.existsSync(marker)) fs.unlinkSync(marker);
     initDatabase();
     ownerAuth = seedOwnerUser(getDatabase());
   });
@@ -137,6 +139,32 @@ describe('Issue #263: Phone Normalization, Validation, and Privacy', () => {
       assert.ok(c.phone.startsWith('+54'), `Argentine customer ${c.name} phone ${c.phone} must start with +54`);
       assert.equal(c.phone, '+' + c.phone_digits);
     }
+  });
+
+  test('seedDemoRestaurant in French profile seeds localized demo data', () => {
+    const db = getDatabase();
+    seedSetupProfile(db, 'demo', 'finedine', 'fr', 'FR');
+
+    assert.equal(db.prepare("SELECT name FROM categories WHERE id = 'cat-demo-starters'").get().name, 'Entrées');
+    assert.equal(db.prepare("SELECT name FROM products WHERE id = 'prod-demo-burger'").get().name, 'Burger Classique');
+    assert.equal(db.prepare("SELECT name FROM users WHERE id = 'user-demo-manager'").get().name, 'Gérant Démo');
+
+    const customer = db.prepare("SELECT phone, country_code FROM customers WHERE id = 'cust-demo-1'").get();
+    assert.equal(customer.phone, '+33145678901');
+    assert.equal(customer.country_code, '+33');
+  });
+
+  test('seedDemoRestaurant in German profile seeds localized demo data', () => {
+    const db = getDatabase();
+    seedSetupProfile(db, 'demo', 'finedine', 'de', 'DE');
+
+    assert.equal(db.prepare("SELECT name FROM categories WHERE id = 'cat-demo-beverages'").get().name, 'Getränke');
+    assert.equal(db.prepare("SELECT name FROM products WHERE id = 'prod-demo-burger'").get().name, 'Klassischer Burger');
+    assert.equal(db.prepare("SELECT name FROM users WHERE id = 'user-demo-manager'").get().name, 'Demo-Manager');
+
+    const customer = db.prepare("SELECT phone, country_code FROM customers WHERE id = 'cust-demo-1'").get();
+    assert.equal(customer.phone, '+4915123456789');
+    assert.equal(customer.country_code, '+49');
   });
 
   test('PUT /api/settings/business validates and normalizes business_phone', async () => {
@@ -359,6 +387,7 @@ describe('Issue #263: Phone Normalization, Validation, and Privacy', () => {
     const db = getDatabase();
     db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('telemetry_enabled', 'true', datetime('now'))").run();
     db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('country', 'IN', datetime('now'))").run();
+    db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('country_confirmed_at', datetime('now'), datetime('now'))").run();
     db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('business_phone', '+919876543210', datetime('now'))").run();
     db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('phone', '+919876543210', datetime('now'))").run();
 

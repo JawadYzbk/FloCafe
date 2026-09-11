@@ -1,16 +1,14 @@
 import Decimal from 'decimal.js';
 import { getDatabase, getSettingValue } from '../db';
 import { getBundledCountryPack } from '../tax-packs/bundled';
-import { getCountryByCode, type TaxIdFormat } from '../countries';
+import { getCountryByCode, getCurrencyFractionDigits, getCurrencyMinorUnitFactor, type TaxIdFormat } from '../countries';
 
 interface TenantInfo {
   country: string;
   business_type: string;
   state_code: string;
-  // Read from settings once per request by the caller (main/routes/orders.ts)
-  // and passed in explicitly, rather than read here via getSettingValue —
-  // calculateItemTax's other inputs are all explicit parameters, and isolated
-  // unit tests (tests/tax-engine.test.ts) call it directly with no database.
+  currency?: string;
+  // Passed explicitly by caller to allow isolated unit testing without a database.
   taxes_enabled: boolean;
 }
 
@@ -79,9 +77,7 @@ function round(value: number, decimals: number = 2): number {
   return Number(Math.round(Number(value + 'e' + decimals)) + 'e-' + decimals);
 }
 
-// Same country -> bundled-pack selection used by calculateItemTax below and
-// by the GET /api/tax/categories endpoint (routes/index.ts) — kept as one
-// function so the two never drift apart on which pack is "active".
+// Shared helper to retrieve the active country pack for tax calculation and categories API.
 export function getActiveCountryPack(country: string): CountryPack {
   try {
     const db = getDatabase();
@@ -95,16 +91,12 @@ export function getActiveCountryPack(country: string): CountryPack {
     `).get(country, country) as { pack_json: string } | undefined;
     if (row) return JSON.parse(row.pack_json) as CountryPack;
   } catch {
-    // Database initialization and isolated unit tests can call this before the
-    // migration runner has registered bundled packs. The immutable bundled
-    // JSON remains the required offline fallback.
+    // Fall back to immutable bundled pack JSON if DB migrations haven't run.
   }
   return getBundledCountryPack(country);
 }
 
-// "The taxation module is enabled" means an official (non-local) pack is
-// actually active for this country — the bundled/manual local pack never
-// carries a verified registration-number format, so it never gates entry.
+// Checks if taxation is enabled and backed by an official active country pack.
 export function isTaxModuleActiveForCountry(country: string): boolean {
   if (getSettingValue('taxes_enabled') !== 'true') return false;
   try {
@@ -121,13 +113,7 @@ export function resolveTaxIdFormat(country: string): TaxIdFormat | null {
     || null;
 }
 
-// check 25 (routes/tax-packs.ts) rejects the textbook nested-quantifier
-// ReDoS shape at pack-activation time, but that's a known-shape heuristic,
-// not a formal safety proof — bound the value as a backstop too. The
-// longest real registration-number scheme is 15 chars (India GSTIN), so 24
-// leaves generous headroom while keeping a worst-case pattern's
-// backtracking imperceptible (CodeQL js/polynomial-redos; same
-// bound-before-regex approach as isValidEmail in routes/auth.ts).
+// Bounds input length to 24 chars as a defense-in-depth safeguard against ReDoS backtracking.
 export const MAX_TAX_ID_LENGTH = 24;
 
 export function validateTaxRegistrationNumber(
@@ -147,19 +133,8 @@ export function validateTaxRegistrationNumber(
   return { valid: regex.test(trimmed), format };
 }
 
-// A representative rate for display only (product tax-category picker,
-// products list) — the intrastate/default rule set for this business type,
-// summing every matching percent component (e.g. Tax 1 + Tax 2). Authoritative
-// calculation always goes through TaxEngine.calculate, which also resolves
-// the interstate variant per transaction; this never feeds a checkout total.
-//
-// Rule selection here mirrors calculateRawLine (tax-engine.ts): a rule only
-// counts if the *category* declares it via category.ruleIds, not just if the
-// rule declares the category via rule.categoryIds. A well-formed pack always
-// keeps both sides in sync, but selecting only by rule.categoryIds would show
-// a rate for a rule checkout actually excludes for any pack where they've
-// drifted (e.g. a hand-edited or malformed catalog pack) — showing a price
-// the merchant never actually charges.
+// Computes a display-only preview tax rate for UI category pickers.
+// Authoritative calculation always goes through TaxEngine.calculate.
 export function previewCategoryRate(
   pack: CountryPack,
   businessType: string,
@@ -239,6 +214,7 @@ export function calculateItemTax(
     try {
       calculation = TaxEngine.calculate({
         pack,
+        currency: tenant.currency,
         country: tenant.country,
         businessType: tenant.business_type,
         storeStateCode: tenant.state_code,
@@ -260,10 +236,7 @@ export function calculateItemTax(
         }],
       });
     } catch (engineError: any) {
-      // A misconfigured category/pack is a data problem, not a server bug —
-      // checkout must block loudly on a bad tax config, never fall through
-      // to charging zero tax. statusCode lets route handlers return 400
-      // instead of a generic 500 (see orders.ts / index.ts catch blocks).
+      // Surface tax configuration errors as 400 bad request instead of 500.
       throw Object.assign(
         new Error(`Tax calculation failed: ${engineError.message}`),
         { statusCode: 400 },
@@ -283,9 +256,7 @@ export function calculateItemTax(
         rate: Number(component.rate || 0),
         amount: Number(component.amount),
       })),
-      // The engine resolves country_default against the active pack. Persist
-      // that effective behavior on the order item so every later total
-      // recomputation knows whether the tax is already included in the price.
+      // Persist resolved tax behavior on the item so subsequent recalculations know if tax is inclusive.
       tax_type: line.taxBehavior === 'exempt' ? 'none' : line.taxBehavior,
       tax_snapshot: {
         ...calculation.snapshot,
@@ -300,9 +271,7 @@ export function calculateItemTax(
     };
   }
 
-  // Tax is opt-in through a resolved category. Legacy product.tax_type and
-  // product.tax_rate columns remain in the schema only for non-destructive
-  // upgrade compatibility; they are not authoritative for new transactions.
+  // Tax is opt-in through resolved categories; legacy columns are not used for new orders.
   return { tax_amount: 0, tax_breakdown: [], tax_type: 'none', tax_snapshot: null };
 }
 
@@ -342,20 +311,31 @@ export function getConfiguredChargeTaxCategories(
   }
 }
 
+export function normalizeChargeAmount(value: unknown, kind: ChargeTaxKind): number {
+  if (value === undefined || value === null || value === '') return 0;
+  if (typeof value !== 'number' && typeof value !== 'string') {
+    throw Object.assign(new Error(`${kind} charge must be a non-negative finite amount`), { statusCode: 400 });
+  }
+  try {
+    const amount = new Decimal(value as Decimal.Value);
+    if (!amount.isFinite() || amount.isNegative()) {
+      throw new Error(`${kind} charge must be a non-negative finite amount`);
+    }
+    const numericAmount = amount.toNumber();
+    if (!Number.isFinite(numericAmount)) {
+      throw new Error(`${kind} charge must be a non-negative finite amount`);
+    }
+    return numericAmount;
+  } catch (error: any) {
+    throw Object.assign(new Error(error.message || `${kind} charge is invalid`), { statusCode: 400 });
+  }
+}
+
 function chargeAmount(context: ChargeTaxContext, kind: ChargeTaxKind): Decimal {
   const amountKey: keyof ChargeTaxContext = kind === 'service_charge'
     ? 'service_charge'
     : `${kind}_charge`;
-  const raw = context[amountKey] ?? 0;
-  try {
-    const amount = new Decimal(raw as Decimal.Value);
-    if (!amount.isFinite() || amount.isNegative()) {
-      throw new Error(`${kind} charge must be a non-negative finite amount`);
-    }
-    return amount;
-  } catch (error: any) {
-    throw Object.assign(new Error(error.message || `${kind} charge is invalid`), { statusCode: 400 });
-  }
+  return new Decimal(normalizeChargeAmount(context[amountKey], kind));
 }
 
 function chargeCategoryId(context: ChargeTaxContext, kind: ChargeTaxKind): string | null {
@@ -377,15 +357,14 @@ export function calculateConfiguredChargeTaxes(
   for (const kind of CHARGE_KINDS) {
     const amount = chargeAmount(context, kind);
     const categoryId = chargeCategoryId(context, kind);
-    // NULL means this order remains on the legacy path. Charges were
-    // previously added untaxed, so preserve that behavior until the merchant
-    // explicitly migrates this charge kind in Settings.
+    // Skip unconfigured charges to preserve untaxed legacy behavior.
     if (amount.isZero() || !categoryId) continue;
 
     let calculation;
     try {
       calculation = TaxEngine.calculate({
         pack,
+        currency: tenant.currency,
         country: tenant.country,
         businessType: tenant.business_type,
         storeStateCode: tenant.state_code,
@@ -442,7 +421,7 @@ export function calculateConfiguredChargeTaxes(
   };
 }
 
-export function aggregateTaxBreakdown(itemBreakdowns: TaxBreakdown[][]): TaxBreakdown[] {
+export function aggregateTaxBreakdown(itemBreakdowns: TaxBreakdown[][], minorFactor = 100): TaxBreakdown[] {
   const merged: Record<string, TaxBreakdown> = {};
 
   for (const breakdown of itemBreakdowns) {
@@ -459,14 +438,11 @@ export function aggregateTaxBreakdown(itemBreakdowns: TaxBreakdown[][]): TaxBrea
 
   return Object.values(merged).map((line) => ({
     ...line,
-    amount: round(line.amount, 2),
+    amount: round(line.amount, Math.log10(minorFactor)),
   }));
 }
 
-// Rolls up whichever active order_items carry a per-item engine snapshot
-// (order_items.tax_snapshot, only present for category-driven items — see
-// calculateItemTax above) into the order/bill-level tax_snapshot column.
-// Uncategorized items are tax-free and therefore have no snapshot to roll up.
+// Aggregates item-level tax snapshots into an order/bill-level snapshot array.
 export function aggregateTaxSnapshots(itemSnapshotsJson: (string | null | undefined)[]): string | null {
   const snapshots = itemSnapshotsJson
     .map((raw) => {
@@ -478,9 +454,7 @@ export function aggregateTaxSnapshots(itemSnapshotsJson: (string | null | undefi
   return snapshots.length > 0 ? JSON.stringify(snapshots) : null;
 }
 
-// A prepared-item void is represented by a new negative order_item. Mirror
-// the immutable tax evidence with signed amounts as well, otherwise the
-// order-level snapshot would still claim positive tax after the rows net to 0.
+// Inverts tax snapshot line amounts for negative void/refund adjustment rows.
 export function invertTaxSnapshot(raw: string | null | undefined): string | null {
   if (!raw) return null;
   try {
@@ -528,7 +502,9 @@ export function scaleTaxBreakdowns(
   breakdowns: any[],
   ratio: number,
   targetTaxAmount: number,
+  minorFactor = 100,
 ): any[] {
+  const decimals = Math.log10(minorFactor);
   const cloned = breakdowns.map((breakdown) => Array.isArray(breakdown)
     ? breakdown.map((component) => ({ ...component }))
     : breakdown);
@@ -545,7 +521,7 @@ export function scaleTaxBreakdowns(
     if (!Array.isArray(breakdown)) return;
     breakdown.forEach((component: any, innerIndex: number) => {
       const rawAmount = new Decimal(component.amount || 0).mul(scale);
-      const rounded = rawAmount.toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+      const rounded = rawAmount.toDecimalPlaces(decimals, Decimal.ROUND_HALF_UP);
       entries.push({
         component,
         rounded,
@@ -558,12 +534,12 @@ export function scaleTaxBreakdowns(
 
   if (entries.length === 0) return cloned;
   const roundedTotal = entries.reduce((sum, entry) => sum.plus(entry.rounded), new Decimal(0));
-  const centsDelta = new Decimal(targetTaxAmount)
+  const minorDelta = new Decimal(targetTaxAmount)
     .minus(roundedTotal)
-    .mul(100)
+    .mul(minorFactor)
     .toDecimalPlaces(0, Decimal.ROUND_HALF_UP)
     .toNumber();
-  const direction = Math.sign(centsDelta);
+  const direction = Math.sign(minorDelta);
   const allocationOrder = [...entries].sort((left, right) => {
     const remainderOrder = direction >= 0
       ? right.remainder.comparedTo(left.remainder)
@@ -574,9 +550,9 @@ export function scaleTaxBreakdowns(
     return left.outerIndex - right.outerIndex || left.innerIndex - right.innerIndex;
   });
 
-  for (let index = 0; index < Math.abs(centsDelta); index++) {
+  for (let index = 0; index < Math.abs(minorDelta); index++) {
     const entry = allocationOrder[index % allocationOrder.length];
-    entry.rounded = entry.rounded.plus(direction * 0.01);
+    entry.rounded = entry.rounded.plus(direction / minorFactor);
   }
   for (const entry of entries) entry.component.amount = entry.rounded.toNumber();
   return cloned;
@@ -585,6 +561,7 @@ export function scaleTaxBreakdowns(
 export function scaleTaxSnapshots(
   snapshotsJson: (string | null | undefined)[],
   ratio: number,
+  minorFactor = 100,
 ): string[] {
   const snapshots = snapshotsJson.flatMap((raw) => {
     if (!raw) return [];
@@ -596,6 +573,7 @@ export function scaleTaxSnapshots(
     }
   });
   const scale = new Decimal(ratio);
+  const decimals = Math.log10(minorFactor);
   const entries: Array<{
     component: any;
     line: any;
@@ -609,7 +587,7 @@ export function scaleTaxSnapshots(
       if (!Array.isArray(line.components)) continue;
       for (const component of line.components) {
         const raw = new Decimal(component.amount || 0).mul(scale);
-        const rounded = raw.toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+        const rounded = raw.toDecimalPlaces(decimals, Decimal.ROUND_HALF_UP);
         entries.push({ component, line, raw, rounded, remainder: raw.minus(rounded) });
       }
     }
@@ -619,11 +597,11 @@ export function scaleTaxSnapshots(
     const targetTaxAmount = entries.reduce(
       (sum, entry) => sum.plus(new Decimal(entry.component.amount || 0)),
       new Decimal(0),
-    ).mul(scale).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+    ).mul(scale).toDecimalPlaces(decimals, Decimal.ROUND_HALF_UP);
     const roundedTotal = entries.reduce((sum, entry) => sum.plus(entry.rounded), new Decimal(0));
     const centsDelta = targetTaxAmount
       .minus(roundedTotal)
-      .mul(100)
+      .mul(minorFactor)
       .toDecimalPlaces(0, Decimal.ROUND_HALF_UP)
       .toNumber();
     const direction = Math.sign(centsDelta);
@@ -638,10 +616,10 @@ export function scaleTaxSnapshots(
     });
     for (let index = 0; index < Math.abs(centsDelta); index += 1) {
       const entry = ordered[index % ordered.length];
-      entry.rounded = entry.rounded.plus(direction * 0.01);
+      entry.rounded = entry.rounded.plus(direction / minorFactor);
     }
     for (const entry of entries) {
-      entry.component.amount = entry.rounded.toFixed(2);
+      entry.component.amount = entry.rounded.toFixed(decimals);
       entry.component.roundingRemainder = entry.raw.minus(entry.rounded).toString();
     }
   }
@@ -650,7 +628,7 @@ export function scaleTaxSnapshots(
     for (const line of snapshot.lines) {
       const scaleValue = (value: unknown) => {
         if (typeof value !== 'string' && typeof value !== 'number') return value;
-        return new Decimal(value).mul(scale).toDecimalPlaces(2, Decimal.ROUND_HALF_UP).toFixed(2);
+        return new Decimal(value).mul(scale).toDecimalPlaces(decimals, Decimal.ROUND_HALF_UP).toFixed(decimals);
       };
       line.grossAmount = scaleValue(line.grossAmount);
       line.taxableBase = scaleValue(line.taxableBase);
@@ -658,7 +636,7 @@ export function scaleTaxSnapshots(
         line.taxAmount = line.components.reduce(
           (sum: Decimal, component: any) => sum.plus(component.amount || 0),
           new Decimal(0),
-        ).toFixed(2);
+        ).toFixed(decimals);
       } else {
         line.taxAmount = scaleValue(line.taxAmount);
       }
@@ -674,15 +652,18 @@ export function combineItemAndChargeTaxes(args: {
   itemSnapshots: (string | null | undefined)[];
   itemTaxRatio: number;
   chargeTaxes: ChargeTaxSummary;
+  minorFactor?: number;
 }): TaxRollup {
   const scaledBreakdowns = scaleTaxBreakdowns(
     args.itemBreakdowns,
     args.itemTaxRatio,
     args.itemTaxAmount,
+    args.minorFactor,
   );
   const scaledSnapshots = scaleTaxSnapshots(
     args.itemSnapshots,
     args.itemTaxRatio,
+    args.minorFactor,
   );
   const nonEmptyBreakdowns = [
     ...scaledBreakdowns,
@@ -730,6 +711,12 @@ export async function calculateTaxPreview(req: any, res: any): Promise<void> {
       state_code: settings.state_code || '',
       taxes_enabled: settings.taxes_enabled === 'true',
     };
+    const currency = settings.currency && /^[A-Z]{3}$/.test(settings.currency)
+      ? settings.currency
+      : getCountryByCode(tenantInfo.country)?.currency || 'INR';
+    tenantInfo.currency = currency;
+    const decimals = getCurrencyFractionDigits(currency);
+    const minorFactor = getCurrencyMinorUnitFactor(currency);
 
     const customer = customer_id
       ? (db.prepare('SELECT * FROM customers WHERE id = ?').get(customer_id) as Customer | undefined)
@@ -773,12 +760,12 @@ export async function calculateTaxPreview(req: any, res: any): Promise<void> {
         product_name: product.name,
         quantity,
         unit_price: unitPrice,
-        subtotal: round(subtotal, 2),
+        subtotal: round(subtotal, decimals),
         discount_amount: itemDiscount,
         tax_amount: taxResult.tax_amount,
         tax_breakdown: taxResult.tax_breakdown,
         tax_type: taxResult.tax_type,
-        total: round(subtotal + (taxResult.tax_type === 'inclusive' ? 0 : taxResult.tax_amount), 2),
+        total: round(subtotal + (taxResult.tax_type === 'inclusive' ? 0 : taxResult.tax_amount), decimals),
       });
 
       if (taxResult.tax_breakdown) {
@@ -792,13 +779,9 @@ export async function calculateTaxPreview(req: any, res: any): Promise<void> {
       }
     }
 
-    const normalizeCharge = (value: unknown): number => {
-      const parsed = Number(value);
-      return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
-    };
-    const packaging = normalizeCharge(packaging_charge);
-    const delivery = normalizeCharge(delivery_charge);
-    const service = normalizeCharge(service_charge);
+    const packaging = normalizeChargeAmount(packaging_charge, 'packaging');
+    const delivery = normalizeChargeAmount(delivery_charge, 'delivery');
+    const service = normalizeChargeAmount(service_charge, 'service_charge');
 
     let discountAmount = new Decimal(0);
     if (discount_type !== undefined || discount_value !== undefined) {
@@ -821,7 +804,7 @@ export async function calculateTaxPreview(req: any, res: any): Promise<void> {
       } else {
         discountAmount = Decimal.min(new Decimal(parsedDiscount), subtotalDecimal);
       }
-      discountAmount = discountAmount.toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+      discountAmount = discountAmount.toDecimalPlaces(decimals, Decimal.ROUND_HALF_UP);
     }
 
     const subtotalDecimal = new Decimal(totalSubtotal);
@@ -831,11 +814,11 @@ export async function calculateTaxPreview(req: any, res: any): Promise<void> {
       : new Decimal(1);
     const discountedItemTax = new Decimal(totalTax)
       .mul(taxRatio)
-      .toDecimalPlaces(2, Decimal.ROUND_HALF_UP)
+      .toDecimalPlaces(decimals, Decimal.ROUND_HALF_UP)
       .toNumber();
     const discountedExclusiveTax = new Decimal(totalExclusiveTax)
       .mul(taxRatio)
-      .toDecimalPlaces(2, Decimal.ROUND_HALF_UP)
+      .toDecimalPlaces(decimals, Decimal.ROUND_HALF_UP)
       .toNumber();
 
     const chargeCategories = getConfiguredChargeTaxCategories(tenantInfo.country);
@@ -854,25 +837,26 @@ export async function calculateTaxPreview(req: any, res: any): Promise<void> {
       itemSnapshots: allTaxSnapshots,
       itemTaxRatio: taxRatio.toNumber(),
       chargeTaxes,
+      minorFactor,
     });
-    const aggregatedBreakdown = aggregateTaxBreakdown(taxRollup.breakdowns);
+    const aggregatedBreakdown = aggregateTaxBreakdown(taxRollup.breakdowns, minorFactor);
     const exactTotal = discountedSubtotal
       .plus(taxRollup.exclusiveTaxAmount)
       .plus(packaging)
       .plus(delivery)
       .plus(service)
-      .toDecimalPlaces(2, Decimal.ROUND_HALF_UP)
+      .toDecimalPlaces(decimals, Decimal.ROUND_HALF_UP)
       .toNumber();
     const pack = getActiveCountryPack(tenantInfo.country);
-    const { total, adjustment: roundOff } = applyPayableRounding(exactTotal, pack);
+    const { total, adjustment: roundOff } = applyPayableRounding(exactTotal, pack, currency);
 
     res.json({
       items: itemResults,
       summary: {
-        subtotal: round(totalSubtotal, 2),
+        subtotal: round(totalSubtotal, decimals),
         discount_amount: discountAmount.toNumber(),
         discounted_subtotal: discountedSubtotal.toNumber(),
-        tax_amount: round(taxRollup.taxAmount, 2),
+        tax_amount: round(taxRollup.taxAmount, decimals),
         tax_breakdown: aggregatedBreakdown,
         packaging_charge: packaging,
         delivery_charge: delivery,
@@ -883,6 +867,6 @@ export async function calculateTaxPreview(req: any, res: any): Promise<void> {
     });
   } catch (error: any) {
     console.error('[Tax] Preview error:', error);
-    res.status(500).json({ error: "Internal server error" });
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Internal server error" });
   }
 }

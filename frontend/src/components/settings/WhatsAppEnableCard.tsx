@@ -9,13 +9,8 @@ import toast from 'react-hot-toast';
 import { useTranslations } from 'use-intl';
 import { usePosSettingsStore } from '@/store/pos-settings';
 
-/**
- * Opt-in card for the WhatsApp e-billing integration. Rendered on the
- * Settings → Integrations tab when `whatsappEnabled === false` and also on
- * the WhatsApp → Connection tab as a thin link to here. The card owns its
- * own ack checkbox and enable-submit state; the parent only decides
- * whether to show it.
- */
+/** Opt-in card for WhatsApp integration with acknowledgement checkbox
+ * and self-contained submit state. */
 export function WhatsAppEnableCard() {
   const t = useTranslations('whatsapp.enable');
   const tConnect = useTranslations('whatsapp.connect');
@@ -48,8 +43,8 @@ export function WhatsAppEnableCard() {
         <div className="flex items-center gap-2">
           <MessageCircle size={20} className="text-brand" />
           <div>
-            <h2 className="font-semibold text-gray-900">{t('title')}</h2>
-            <p className="text-xs text-gray-500 mt-0.5">{t('description')}</p>
+            <h2 className="font-semibold text-foreground">{t('title')}</h2>
+            <p className="text-xs text-muted-foreground mt-0.5">{t('description')}</p>
           </div>
         </div>
         <div className="rounded-md border bg-muted/40 p-4 text-sm space-y-3">

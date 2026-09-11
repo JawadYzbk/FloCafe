@@ -20,10 +20,14 @@ export interface Tenant {
   country: string;
   currency: string;
   timezone: string;
+  business_day_start_time?: string;
   plan: string;
   status: string;
   role?: string;
   language?: Language;
+  /** Raw backend-authoritative print policies included in auth bootstrap. */
+  bill_language_policy?: string | null;
+  kot_language_policy?: string | null;
   // Iran locale display preferences (Batch G, Refs #241). Display-only —
   // stored amounts stay in the tenant currency (IRR/Rial for Iran).
   currency_display?: CurrencyDisplay;
@@ -62,6 +66,9 @@ export interface Product {
   name: string;
   sku: string | null;
   barcode: string | null;
+  sale_unit: 'each' | 'kg' | 'g' | 'lb';
+  allow_fractional_quantity: boolean;
+  weight_precision: number;
   description: string | null;
   price: number;
   cost_price: number | null;
@@ -116,9 +123,12 @@ export interface Table {
   kitchen_station_id: number | null;
   floor: string | null;
   section: string | null;
+  position_x: number | null;
+  position_y: number | null;
   is_active: boolean;
   activeOrder?: Order | null;
   current_order?: Order | null;
+  seated_at?: string | null;
   reservation_customer_id?: number | null;
   reservation_customer_name?: string | null;
   reservation_customer_phone?: string | null;
@@ -154,12 +164,16 @@ export interface Order {
   discount_amount: number;
   delivery_charge: number;
   packaging_charge?: number;
+  /** Server-validated explicit per-order amount; Settings only configures tax treatment. */
+  service_charge: number;
   round_off?: number;
   tax_breakdown?: { title: string; rate: number; amount: number }[] | null;
   tax_snapshot?: TaxSnapshot[] | TaxSnapshot | null;
   total: number;
   guest_count: number | null;
   special_instructions: string | null;
+  online_platform?: string | null;
+  external_order_id?: string | null;
   created_by: number;
   created_at: string;
   items?: OrderItem[];
@@ -212,8 +226,12 @@ export interface Bill {
   tax_breakdown?: { title: string; rate: number; amount: number }[] | null;
   tax_snapshot?: TaxSnapshot[] | TaxSnapshot | null;
   order?: Order;
-  /** Loyalty points credited for this bill (sum of loyalty_ledger credits). Only populated by /orders endpoints. */
+  /** Loyalty points credited for this bill when supplied by a bill/order API. */
   points_earned?: number;
+  /** Loyalty points debited for this bill when supplied by a bill/order API. */
+  points_redeemed?: number;
+  /** Running loyalty balance when supplied by a print/order API. */
+  points_balance?: number | null;
 }
 
 export interface TaxSnapshot {

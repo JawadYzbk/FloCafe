@@ -1,9 +1,11 @@
-import { app, BrowserWindow, ipcMain, dialog, Menu, Tray, nativeImage, shell } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog, Menu, Tray, nativeImage, shell, powerMonitor, nativeTheme } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+
 import { Bonjour } from 'bonjour-service';
-import { getDatabase, initDatabase, closeDatabase, waitForDatabaseRequests, beginDatabaseShutdown, SchemaVersionMismatchError } from './db';
+import { getDatabase, initDatabase, closeDatabase, waitForDatabaseRequests, beginDatabaseShutdown, SchemaVersionMismatchError, now, withDatabaseRequest } from './db';
+import { BETA_CHANNEL_SETTING_KEY, parseStoredBetaChannelEnabled, resolveUpdateChannel } from './update-channel';
 import { computeTaxPackUpdates, fetchRemoteTaxPackCatalog } from './tax-packs/catalog';
 import { startServer, stopServer, getLocalIP, isServerRunning, getServerPort } from './server';
 import { cloudSync } from './services/cloud-sync';
@@ -13,8 +15,10 @@ import { fxRateService } from './services/fx-rate';
 import { startKdsServer, stopKdsServer, getKdsPort, isKdsServerRunning } from './kds-server';
 import { startServerApp, stopServerApp, getServerAppPort, isServerAppRunning } from './server-app';
 import { initPrinter } from './printers/thermal';
-import { registerIpcHandlers } from './ipc';
-import { initFromDb as initWhatsAppFromDb, requestShutdown as requestWhatsAppShutdown, shutdown as shutdownWhatsApp } from './services/whatsapp';
+import { destroySharedRasterRenderer } from './printers/raster-renderer';
+import { registerIpcHandlers, isTrustedSender } from './ipc';
+import { authorizeMasterPin } from './services/master-pin';
+import { requestShutdown as requestWhatsAppShutdown, shutdown as shutdownWhatsApp } from './services/whatsapp';
 import log from 'electron-log/main';
 import { autoUpdater } from 'electron-updater';
 import { isAllowedLocalWindowUrl, isSafeExternalUrl } from './security/url-allowlist';
@@ -31,7 +35,30 @@ import {
   type StoredUpdateStatus,
   type UpdateErrorPhase,
 } from './update-state';
+import { createAutoUpdaterErrorHandler, createRestartAndInstallHandler, type UpdateShutdownState } from './updater-shutdown';
 import { clearStaleRenderCachesOnVersionChange } from './startup-cache';
+import { createLocalWindowOpenHandler, createMainWindow, resolveTitleBarMode, type TitleBarMode } from './window-options';
+import { applyTitleBarOverlayTheme, resolveTitleBarOverlayColors, resolveInitialIsDark, resolveThemeMode, type ThemeMode } from './title-bar-theme';
+import {
+  beginRendererDocument,
+  getRendererDocumentNonce,
+  getRendererReadinessEpoch,
+  initWindowReadiness,
+  isRendererReadinessFailSafeShown,
+  isFullDocumentMainFrameNavigation,
+  isWindowRendererReady,
+} from './window-readiness';
+import { setupWindowLoadRetry } from './window-load-retry';
+import { registerUsbDevicePermissions } from './usb-device-permissions';
+import { probeBackendHealth } from './backend-health';
+import {
+  createRelaunchAttemptGuard,
+  createRelaunchGate,
+  decideRuntimeActivationAction,
+  hasRelaunchAttemptFlag,
+  isRuntimeHealthy,
+  type RuntimeState,
+} from './runtime-recovery';
 import {
   createShutdownCoordinator,
   createShutdownEntrypoints,
@@ -41,18 +68,7 @@ import {
   type ShutdownEntrypointProcess,
 } from './shutdown';
 
-// ── GPU compatibility ────────────────────────────────────────────────────────
-// On Windows, some systems hit "GPU process exited unexpectedly" (exit code
-// 0xC0000135 = STATUS_DLL_NOT_FOUND) because the GPU sandbox can't find
-// required DLLs (outdated drivers, missing Vulkan, etc.).  Disabling the GPU
-// sandbox lets the renderer fall back to software/Skia rendering which is
-// slower but reliable.  This is a no-op on macOS/Linux.
-//
-// Trade-off: this removes Chromium's GPU isolation for ALL Windows users,
-// not just those with the DLL crash.  For a local desktop POS app the attack
-// surface is already large (server binds 0.0.0.0), so the practical risk is
-// low.  A conditional approach (detect crash, store flag, re-launch with
-// sandbox disabled) adds complexity for minimal security gain here.
+// Disable GPU sandbox on Windows to avoid DLL crash fallback
 if (process.platform === 'win32') {
   app.commandLine.appendSwitch('disable-gpu-sandbox');
 }
@@ -63,9 +79,7 @@ const isMasBuild =
   process.env.MAS_BUILD === '1' ||
   (process as NodeJS.Process & { mas?: boolean }).mas === true;
 
-// Microsoft Store (MSIX) builds: Electron has no process.msix equivalent.
-// MSIX apps are always installed under C:\Program Files\WindowsApps\ so
-// checking the executable path is the most reliable runtime detection.
+// MSIX apps install under WindowsApps; check path for runtime detection.
 const isMsixBuild =
   process.platform === 'win32' &&
   process.execPath.toLowerCase().includes('windowsapps');
@@ -80,37 +94,60 @@ log.transports.console.level = 'debug';
 const logPath = log.transports.file.getFile().path.replace(/[^\/\\]+$/, '');
 console.log('[Log] Log files location:', logPath);
 
-// Single persisted update state (#467): every transition (including one-shot
-// startup states and failures) goes through here so a renderer reload can
-// recover the truth via get-update-status instead of racing push events.
+// Persisted update state: transitions are routed here for status recovery.
 let storedUpdateStatus: StoredUpdateStatus = initialUpdateState();
 let updaterPhase: UpdateErrorPhase = 'check';
 let stagedUpdateReady = false;
 let startupFailure = false;
+let isInstallingUpdate = false;
+let betaChannelTransitionTail: Promise<void> = Promise.resolve();
 
-function configureAutoUpdaterChannel(): void {
-  const prerelease = autoUpdater.currentVersion.prerelease[0];
-  const channel = typeof prerelease === 'string' ? prerelease : null;
-
-  // Stable installs intentionally leave channel unset. GitHub's stable
-  // provider then follows the repository's explicitly selected latest release.
-  // Beta/nightly builds opt in through their semver channel and use the
-  // corresponding beta.yml/nightly.yml manifest instead.
-  if (channel === 'beta' || channel === 'nightly') {
-    autoUpdater.channel = channel;
-    autoUpdater.allowPrerelease = true;
-    // Switching between a prerelease channel and stable can legitimately move
-    // to a lower semver value, so electron-updater must be allowed to do that.
-    autoUpdater.allowDowngrade = true;
-    log.info(`[Update] Opted into ${channel} release channel`);
-    return;
+// Beta channel opt-in stored in SQLite settings; defaults to stable on error.
+function readBetaChannelEnabled(): boolean {
+  try {
+    const row = getDatabase()
+      .prepare('SELECT value FROM settings WHERE key = ?')
+      .get(BETA_CHANNEL_SETTING_KEY) as { value: string | null } | undefined;
+    const prerelease = autoUpdater.currentVersion.prerelease[0];
+    const isBetaBuild = prerelease === 'beta';
+    return parseStoredBetaChannelEnabled(row?.value, isBetaBuild);
+  } catch (error) {
+    log.warn('[Update] Could not read beta-channel preference; using stable:', error);
+    return false;
   }
+}
 
-  // Do not let an unsupported prerelease (for example, a local alpha build)
-  // accidentally subscribe an installation to an untracked channel.
-  autoUpdater.allowPrerelease = false;
-  autoUpdater.allowDowngrade = false;
-  if (channel) log.warn(`[Update] Unsupported prerelease channel ${channel}; using stable updates only`);
+function writeBetaChannelEnabled(enabled: boolean): void {
+  getDatabase()
+    .prepare('INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)')
+    .run(BETA_CHANNEL_SETTING_KEY, enabled ? 'true' : 'false', now());
+}
+
+function enqueueBetaChannelTransition<T>(operation: () => Promise<T>): Promise<T> {
+  const transition = betaChannelTransitionTail.then(operation, operation);
+  betaChannelTransitionTail = transition.then(() => undefined, () => undefined);
+  return transition;
+}
+
+function configureAutoUpdaterChannel(betaOptInOverride?: boolean): void {
+  const prerelease = autoUpdater.currentVersion.prerelease[0];
+  const versionChannel = typeof prerelease === 'string' ? prerelease : null;
+  const resolved = resolveUpdateChannel({
+    versionPrereleaseChannel: versionChannel,
+    betaOptIn: betaOptInOverride ?? readBetaChannelEnabled(),
+  });
+
+  autoUpdater.channel = resolved.channel;
+  autoUpdater.allowPrerelease = resolved.allowPrerelease;
+  // Allow downgrade only for beta builds remaining on beta feed.
+  autoUpdater.allowDowngrade = resolved.allowDowngrade;
+
+  if (resolved.channel) {
+    log.info(`[Update] Opted into ${resolved.channel} release channel`);
+  } else if (versionChannel) {
+    // Unsupported prerelease channels fall back to stable updates.
+    log.warn(`[Update] Unsupported prerelease channel ${versionChannel}; using stable updates only`);
+  }
 }
 
 function setUpdateStatus(next: StoredUpdateStatus): void {
@@ -125,9 +162,7 @@ function setUpdateStatus(next: StoredUpdateStatus): void {
 function setupAutoUpdater(): void {
   autoUpdater.logger = log;
   configureAutoUpdaterChannel();
-  // Downloading is harmless and lets the user see a ready-to-install build,
-  // but installation must always be an explicit action. A POS may be closed
-  // while a payment, printer job, or end-of-day workflow is still in flight.
+  // Auto-download update packages silently, but require explicit user confirmation to install.
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = false;
 
@@ -176,27 +211,15 @@ function setupAutoUpdater(): void {
     });
   });
 
-  autoUpdater.on('error', (err) => {
-    // #467: classify by error code/phase — never emit up-to-date from an
-    // error path. The historical substring mask (404 / Cannot find latest /
-    // ENOENT => "up to date") hid real check failures from users.
-    const errorPhase = updaterPhase;
-    const classified = classifyUpdateError(err, errorPhase);
-    updaterPhase = 'check';
-    log.info(
-      `[Update] Updater error classified as ${classified.state}` +
-      `/${classified.reason}:`, classified.detail
-    );
-    if (isInstallReady(storedUpdateStatus, stagedUpdateReady)) {
-      log.info('[Update] Preserving ready-to-install status while staged update awaits installation');
-      return;
-    }
-    setUpdateStatus({
-      status: classified.state,
-      reason: classified.reason,
-      error: classified.detail
-    });
-  });
+  autoUpdater.on('error', createAutoUpdaterErrorHandler({
+    getPhase: () => updaterPhase,
+    setPhase: (phase) => { updaterPhase = phase; },
+    isInstallReady: () => isInstallReady(storedUpdateStatus, stagedUpdateReady),
+    isInstallingUpdate: () => isInstallingUpdate,
+    setUpdateStatus,
+    onInstallFailure: () => requestRuntimeRelaunchOnce('update-install-failed'),
+    logInfo: (message, detail) => log.info(message, detail),
+  }));
 }
 
 function checkForUpdates(): void {
@@ -210,11 +233,8 @@ function checkForUpdates(): void {
     return;
   }
 
-  // Linux: only AppImage supports self-update via electron-updater (it sets
-  // the APPIMAGE env var at launch). deb/rpm/snap are managed by their
-  // package manager / the snap daemon instead — electron-updater can't
-  // update those, so tell the renderer and stop instead of letting
-  // "Check for Updates" sit there doing nothing forever when clicked.
+  // Linux: only AppImage supports self-update via electron-updater;
+  // package manager installs are notified accordingly.
   if (process.platform === 'linux' && !process.env.APPIMAGE) {
     log.info('[Update] Linux non-AppImage install — updates managed by package manager');
     setUpdateStatus(oneShotUpdateState('linux-managed'));
@@ -278,17 +298,12 @@ function checkForUpdates(): void {
   updaterPhase = 'check';
   setUpdateStatus({ status: 'checking' });
   autoUpdater.checkForUpdates().catch((err) => {
-    // The `error` event above records the honest classified state; this
-    // catch only prevents an unhandled promise rejection.
+    // Record error state; catch prevents unhandled rejection.
     console.error('[Update] Check failed:', err);
   });
 }
 
-// Separate from the app self-updater above: tax packs are the only plugin
-// type FloCafe currently supports, installed from the FloCafe-Plugins GitHub
-// Releases catalog rather than through electron-updater. This is a
-// best-effort, network-optional check — a store must keep working offline,
-// so a failure here only logs and never blocks startup.
+// Best-effort startup check for tax pack plugin updates.
 async function checkTaxPackUpdatesOnStartup(): Promise<void> {
   try {
     const remote = await fetchRemoteTaxPackCatalog();
@@ -317,20 +332,250 @@ async function checkTaxPackUpdatesOnStartup(): Promise<void> {
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
+// Track USB device permissions registration so listeners are not duplicated across windows.
+let usbDevicePermissionsRegistered = false;
+
+// Title-bar capability reported to the renderer via get-status; updated each
+// time the main window is created.
+let resolvedTitleBarMode: TitleBarMode = 'native-overlay';
+// Injected as a getter into ipc.ts — it cannot import ./index (load-time cycle).
+let currentEffectiveIsDark = false;
 let bonjour: InstanceType<typeof Bonjour> | null = null;
 let isQuitting = false;
+let runtimeState: RuntimeState = 'starting';
+let initializationPromise: Promise<void> | null = null;
+let activationPending = false;
+let windowLoadRecoveryAttempted = false;
+let windowRecoveryInProgress = false;
+let runtimeRelaunchRequested = false;
+// Last did-fail-load detail captured for diagnostic dialog; cleared on successful load.
+let lastWindowLoadFailure: { errorCode: number; errorDescription: string; validatedURL?: string } | null = null;
+// Self-healing GPU fallback: relaunch with --disable-gpu after repeated crashes.
+let shouldDisableGpuOnRelaunch = false;
+let consecutiveRendererCrashes = 0;
+let consecutiveGpuCrashes = 0;
+const GPU_FALLBACK_CRASH_THRESHOLD = 2;
+// Reset crash counters only after a window stays up for this duration.
+const RENDERER_STABILITY_RESET_MS = 30_000;
+let rendererStabilityResetTimer: NodeJS.Timeout | null = null;
+function clearRendererStabilityResetTimer(): void {
+  if (rendererStabilityResetTimer) {
+    clearTimeout(rendererStabilityResetTimer);
+    rendererStabilityResetTimer = null;
+  }
+}
+const updateShutdownState: UpdateShutdownState = {
+  setInstallingUpdate: (value) => { isInstallingUpdate = value; },
+  setQuitting: (value) => {
+    isQuitting = value;
+    if (value) {
+      runtimeState = 'stopping';
+      log.info('[Lifecycle] Runtime is stopping');
+    }
+  },
+};
+
+function showMainWindow(expectedWindow?: BrowserWindow): boolean {
+  if (isQuitting || isShutdownRequested()) return false;
+  if (expectedWindow && mainWindow !== expectedWindow) return false;
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  if (!isRuntimeHealthy(runtimeState, getRuntimeServices(), isShutdownRequested())) {
+    void handleMainWindowActivation();
+    return false;
+  }
+  if (isFailedWindowDocument(mainWindow)) {
+    recoverFailedWindow(mainWindow);
+    return false;
+  }
+  if (
+    (!isWindowRendererReady() && !isRendererReadinessFailSafeShown())
+  ) return false;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+  mainWindow.webContents.focus();
+  return true;
+}
+
+function getRuntimeServices() {
+  return {
+    main: isServerRunning(),
+    kds: isKdsServerRunning(),
+    serverApp: isServerAppRunning(),
+  };
+}
+
+function isFailedWindowDocument(window: BrowserWindow): boolean {
+  try {
+    return window.webContents.getURL().startsWith('chrome-error://');
+  } catch {
+    return true;
+  }
+}
+
+function recoverFailedWindow(failedWindow: BrowserWindow): void {
+  if (isQuitting || isShutdownRequested() || runtimeState === 'stopping') return;
+  if (mainWindow !== failedWindow) return;
+  if (!isRuntimeHealthy(runtimeState, getRuntimeServices(), isShutdownRequested())) {
+    requestRuntimeRelaunchOnce('window-load-retry-exhausted');
+    return;
+  }
+  if (windowLoadRecoveryAttempted) {
+    requestRuntimeRelaunchOnce('window-load-recovery-failed');
+    return;
+  }
+  windowLoadRecoveryAttempted = true;
+  try {
+    createWindow();
+    if (!failedWindow.isDestroyed()) failedWindow.destroy();
+  } catch (error) {
+    log.error('[Window] Window recreation failed:', error);
+    requestRuntimeRelaunchOnce('window-load-recovery-create-failed');
+  }
+}
+
+// Flag passed in argv to prevent infinite relaunch loops across process restarts.
+const RUNTIME_RELAUNCH_ATTEMPT_FLAG = '--flo-runtime-relaunch-attempt';
+
+function hasAlreadyAttemptedRuntimeRelaunch(): boolean {
+  return hasRelaunchAttemptFlag(process.argv, RUNTIME_RELAUNCH_ATTEMPT_FLAG);
+}
+
+// Gates repeat relaunches across process restarts until runtime recovers.
+const relaunchAttemptGuard = createRelaunchAttemptGuard(hasAlreadyAttemptedRuntimeRelaunch());
+
+function performAppRelaunch(): void {
+  // Preserve --disable-gpu flag on relaunch if GPU fallback was triggered.
+  const wantsGpuDisabled = shouldDisableGpuOnRelaunch || app.commandLine.hasSwitch('disable-gpu');
+  if (process.defaultApp || !app.isPackaged) {
+    const relaunchArgs = process.argv.slice(1).map((arg) => (arg === '.' ? process.cwd() : arg));
+    // Retain sandbox and display flags required under Playwright/CI.
+    if (app.commandLine.hasSwitch('no-sandbox') && !relaunchArgs.includes('--no-sandbox')) {
+      relaunchArgs.push('--no-sandbox');
+    }
+    if (wantsGpuDisabled && !relaunchArgs.includes('--disable-gpu')) {
+      relaunchArgs.push('--disable-gpu');
+    }
+    if (app.commandLine.hasSwitch('disable-dev-shm-usage') && !relaunchArgs.includes('--disable-dev-shm-usage')) {
+      relaunchArgs.push('--disable-dev-shm-usage');
+    }
+    if (!relaunchArgs.includes(RUNTIME_RELAUNCH_ATTEMPT_FLAG)) relaunchArgs.push(RUNTIME_RELAUNCH_ATTEMPT_FLAG);
+    app.relaunch({ execPath: process.execPath, args: relaunchArgs });
+  } else {
+    const relaunchArgs = process.argv.slice(1);
+    if (wantsGpuDisabled && !relaunchArgs.includes('--disable-gpu')) {
+      relaunchArgs.push('--disable-gpu');
+    }
+    if (!relaunchArgs.includes(RUNTIME_RELAUNCH_ATTEMPT_FLAG)) relaunchArgs.push(RUNTIME_RELAUNCH_ATTEMPT_FLAG);
+    app.relaunch({ args: relaunchArgs });
+  }
+}
+
+// Dialog shown when runtime repeatedly fails after a restart.
+async function showRuntimeStuckDialog(reason: string): Promise<void> {
+  const services = getRuntimeServices();
+  const detailLines = [
+    `Reason: ${reason}`,
+    `Server: ${services.main ? 'running' : 'stopped'} | KDS: ${services.kds ? 'running' : 'stopped'} | Server App: ${services.serverApp ? 'running' : 'stopped'}`,
+  ];
+  if (lastWindowLoadFailure) {
+    detailLines.push(
+      `Load error: ${lastWindowLoadFailure.errorDescription} (${lastWindowLoadFailure.errorCode})`,
+      `URL: ${lastWindowLoadFailure.validatedURL ?? `http://localhost:${getServerPort()}`}`,
+    );
+  }
+  detailLines.push(`Platform: ${process.platform} | Flo: ${app.getVersion()}`);
+
+  const { response } = await dialog.showMessageBox({
+    type: 'error',
+    title: 'Flo needs to restart',
+    message: 'Flo could not recover automatically. This usually means another program '
+      + '(antivirus, firewall, or a leftover Flo process) is blocking its local server.\n\n'
+      + 'Please quit and reopen the app. If this keeps happening, sending a diagnostic '
+      + 'report helps us fix it — it contains no order, customer, or business data.',
+    detail: detailLines.join('\n'),
+    buttons: ['Send Diagnostic Report', 'Quit'],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true,
+  });
+
+  if (response !== 0) return;
+
+  const sent = await sendTelemetryEvent('runtime_relaunch_exhausted', {
+    reason,
+    services,
+    errorCode: lastWindowLoadFailure?.errorCode,
+    errorDescription: lastWindowLoadFailure?.errorDescription,
+    validatedURL: lastWindowLoadFailure?.validatedURL,
+  }).catch(() => false);
+
+  await dialog.showMessageBox({
+    type: sent ? 'info' : 'warning',
+    title: 'Flo',
+    message: sent
+      ? 'Diagnostic report sent. Thank you.'
+      : 'Could not send the diagnostic report (diagnostics may be disabled in '
+        + 'Settings > Privacy, or there is no internet connection).',
+    buttons: ['Quit'],
+  });
+}
+
+function requestRuntimeRelaunch(reason: string): void {
+  runtimeState = 'stopping';
+  isQuitting = true;
+  runtimeRelaunchRequested = true;
+  log.error(`[Lifecycle] Runtime recovery relaunch requested: ${reason}`);
+  if (process.env.FLO_E2E_PID_FILE) console.log('[Native E2E] runtime relaunch requested');
+
+  const alreadyAttempted = relaunchAttemptGuard.hasExhaustedAttempt();
+
+  const finishRelaunch = (): void => {
+    if (alreadyAttempted) {
+      log.error(`[Lifecycle] Runtime already relaunched once and failed again (${reason}); not relaunching again.`);
+      void showRuntimeStuckDialog(reason)
+        .catch((error) => log.error('[Lifecycle] Runtime-stuck dialog failed:', error))
+        .finally(() => {
+          try {
+            app.exit(0);
+          } catch (error) {
+            log.error('[Lifecycle] Exit after runtime-stuck dialog failed:', error);
+            app.exit(1);
+          }
+        });
+      return;
+    }
+    try {
+      log.info('[Lifecycle] Runtime cleanup finished; relaunching Flo');
+      performAppRelaunch();
+      app.exit(0);
+    } catch (error) {
+      log.error('[Lifecycle] Runtime relaunch failed after cleanup:', error);
+      app.exit(1);
+    }
+  };
+
+  void runCleanup().then(
+    finishRelaunch,
+    (error) => {
+      log.error('[Lifecycle] Runtime recovery cleanup failed; proceeding anyway:', error);
+      finishRelaunch();
+    },
+  );
+}
+
+const requestRuntimeRelaunchOnce = createRelaunchGate(requestRuntimeRelaunch);
 
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged;
 
 let gotSingleInstanceLock = false;
 
-// ── Single-instance lock ──────────────────────────────────────────────────────
-// Prevent multiple instances of the app from running simultaneously.
-// This is especially important on Linux where the AppImage can be launched
-// multiple times without the OS preventing it.
-if (process.platform === 'linux') {
-  // Explicitly set app name and userData path to prevent Electron from
-  // resolving them inside temporary mount paths (e.g. /tmp/.mount_FloXXXXXX)
+// Single-instance lock: prevent duplicate app instances.
+if (process.env.FLO_E2E_USER_DATA_DIR) {
+  // Use isolated profile directory in E2E tests.
+  app.setPath('userData', path.resolve(process.env.FLO_E2E_USER_DATA_DIR));
+} else if (process.platform === 'linux') {
+  // Set explicit paths on Linux to avoid temporary mount directories.
   app.name = 'flo-desktop';
   app.setPath('userData', path.join(os.homedir(), '.config', 'flo-desktop'));
 }
@@ -345,9 +590,8 @@ if (!gotSingleInstanceLock) {
 if (gotSingleInstanceLock) {
   // Focus the existing window if a second launch is attempted.
   app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      mainWindow.show();
+    void handleMainWindowActivation();
+    if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.focus();
       if (process.platform === 'linux') {
         mainWindow.setAlwaysOnTop(true);
@@ -359,37 +603,60 @@ if (gotSingleInstanceLock) {
 }
 
 function createWindow(): void {
-  // Runs on every call, not just the initial one — the crash-recovery path
-  // below (render-process-gone) and the macOS 'activate' handler both call
-  // createWindow() again without going through initialize(). If a stale
-  // cache directory failed to clear on the previous attempt (e.g. a
-  // transient lock), retrying here means the app can still self-heal within
-  // the same run instead of only on the next full relaunch.
+  if (isQuitting || isShutdownRequested()) return;
+  if (!isRuntimeHealthy(runtimeState, getRuntimeServices(), isShutdownRequested())) {
+    log.error('[Lifecycle] Refusing to create a POS window without a healthy runtime');
+    requestRuntimeRelaunchOnce('create-window-without-healthy-runtime');
+    return;
+  }
+
+  // Clear stale GPU/code caches when Electron version upgrades.
   clearStaleRenderCachesOnVersionChange(app.getPath('userData'), process.versions.electron, log);
 
-  mainWindow = new BrowserWindow({
-    width: 1400,
-    height: 900,
-    minWidth: 1024,
-    minHeight: 768,
-    title: 'Flo',
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      // Chromium renderer sandbox. Safe to enable because the preload
-      // (main/preload.ts) is a narrow contextBridge allowlist that only uses
-      // `electron` (contextBridge/ipcRenderer) and `process.platform` — all
-      // available to sandboxed preloads — with no fs/path/Node-module access.
-      sandbox: true,
-    },
-    show: false,
+  // Initialize readiness fail-safe and start document epoch.
+  initWindowReadiness(() => {
+    showMainWindow();
   });
+  beginRendererDocument();
+
+  // Resolve whether native title bar overlay is supported or if fallback is required.
+  resolvedTitleBarMode = resolveTitleBarMode({
+    platform: process.platform,
+    electronVersion: process.versions.electron,
+    overlayApiPresent: typeof BrowserWindow.prototype?.setTitleBarOverlay === 'function',
+  });
+  // Direct read: createWindow() runs before IPC handlers exist; re-read on
+  // crash-recovery re-entry. Absent/invalid rows resolve to 'system'.
+  let themeMode: ThemeMode = 'system';
+  try {
+    const row = getDatabase()
+      .prepare("SELECT value FROM settings WHERE key = 'theme_mode'")
+      .get() as { value?: string } | undefined;
+    themeMode = resolveThemeMode(row?.value);
+  } catch {
+    // No DB yet (first boot edge) → 'system'.
+  }
+  const initialIsDark = resolveInitialIsDark(themeMode, nativeTheme.shouldUseDarkColors);
+  currentEffectiveIsDark = initialIsDark;
+  const createdWindow = createMainWindow(
+    BrowserWindow,
+    path.join(__dirname, 'preload.js'),
+    process.platform,
+    initialIsDark,
+    resolvedTitleBarMode,
+  );
+  mainWindow = createdWindow;
 
   mainWindow.once('ready-to-show', () => {
-    mainWindow?.show();
     if (isDev) {
       mainWindow?.webContents.openDevTools();
+    }
+  });
+
+  // Track full navigations to begin new readiness epochs.
+  mainWindow.webContents.on('did-start-navigation', (_event, _url, isSameDocument, isMainFrame) => {
+    if (isFullDocumentMainFrameNavigation({ isSameDocument, isMainFrame })) {
+      beginRendererDocument();
     }
   });
 
@@ -402,24 +669,11 @@ function createWindow(): void {
 
   // Allow target="_blank" links to open new windows for local URLs (e.g. the KDS page)
   // and blank popup windows (e.g. browser print popups). External URLs are sent to the system browser.
+  const localWindowOpenHandler = createLocalWindowOpenHandler(isAllowedLocalWindowUrl, getServerPort, getLocalIP);
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    const isBlank = url === 'about:blank' || url === '';
-    const isLocal = isAllowedLocalWindowUrl(url, getServerPort(), getLocalIP());
-    if (isLocal) {
-      return {
-        action: 'allow',
-        overrideBrowserWindowOptions: {
-          width: isBlank ? 800 : 1280,
-          height: isBlank ? 600 : 800,
-          title: isBlank ? 'Print Receipt' : 'Flo - Kitchen Display',
-          autoHideMenuBar: isBlank,
-          webPreferences: {
-            contextIsolation: true,
-            nodeIntegration: false,
-          },
-        },
-      };
-    }
+    const localWindowResponse = localWindowOpenHandler({ url });
+    if (localWindowResponse) return localWindowResponse;
+
     if (isSafeExternalUrl(url)) {
       shell.openExternal(url).catch((err) => console.warn('[Flo] Failed to open external URL:', err?.message || err));
     } else {
@@ -436,6 +690,29 @@ function createWindow(): void {
     });
   });
 
+  // Register WebUSB permissions for direct thermal printer connection.
+  if (!usbDevicePermissionsRegistered) {
+    registerUsbDevicePermissions(mainWindow.webContents.session, `http://localhost:${getServerPort()}`);
+    usbDevicePermissionsRegistered = true;
+  }
+
+  const sendWindowState = () => {
+    if (!createdWindow || createdWindow.isDestroyed()) return;
+    try {
+      createdWindow.webContents.send('window-state-changed', {
+        isMaximized: createdWindow.isMaximized(),
+        isFullScreen: createdWindow.isFullScreen(),
+      });
+    } catch {
+      // Ignored if webContents destroyed
+    }
+  };
+
+  createdWindow.on('maximize', sendWindowState);
+  createdWindow.on('unmaximize', sendWindowState);
+  createdWindow.on('enter-full-screen', sendWindowState);
+  createdWindow.on('leave-full-screen', sendWindowState);
+
   mainWindow.on('close', (event) => {
     if (!isQuitting) {
       event.preventDefault();
@@ -444,14 +721,41 @@ function createWindow(): void {
   });
 
   mainWindow.on('closed', () => {
-    mainWindow = null;
+    if (mainWindow === createdWindow) mainWindow = null;
+  });
+
+  mainWindow.webContents.once('did-finish-load', () => {
+    windowLoadRecoveryAttempted = false;
+    lastWindowLoadFailure = null;
+    clearRendererStabilityResetTimer();
+    rendererStabilityResetTimer = setTimeout(() => {
+      rendererStabilityResetTimer = null;
+      consecutiveRendererCrashes = 0;
+      consecutiveGpuCrashes = 0;
+    }, RENDERER_STABILITY_RESET_MS);
   });
 
   mainWindow.webContents.on('render-process-gone', (event, details) => {
     log.error('[Window] Renderer process gone:', details.reason);
     console.error('[Window] Renderer process gone:', details.reason);
-    
+
     if (details.reason !== 'clean-exit') {
+      // Crash invalidated stability; cancel reset timer.
+      clearRendererStabilityResetTimer();
+      // Report telemetry event for hard renderer crash.
+      void sendTelemetryEvent('renderer_process_gone', {
+        reason: details.reason,
+        exitCode: details.exitCode,
+        consecutiveCrashCount: ++consecutiveRendererCrashes,
+      });
+      if (consecutiveRendererCrashes >= GPU_FALLBACK_CRASH_THRESHOLD) {
+        shouldDisableGpuOnRelaunch = true;
+        log.error('[Window] Repeated renderer crashes — requesting relaunch with hardware acceleration disabled.');
+        requestRuntimeRelaunchOnce('renderer-repeated-crash-gpu-fallback');
+      }
+    }
+
+    if (details.reason !== 'clean-exit' && mainWindow === createdWindow) {
       dialog.showMessageBox({
         type: 'error',
         title: 'App Crashed',
@@ -459,16 +763,31 @@ function createWindow(): void {
         detail: `Reason: ${details.reason}`,
         buttons: ['OK'],
       }).then(() => {
-        mainWindow?.destroy();
-        mainWindow = null;
-        createWindow();
+        if (mainWindow !== createdWindow) return;
+        windowRecoveryInProgress = true;
+        try {
+          createdWindow.destroy();
+          if (mainWindow === createdWindow) mainWindow = null;
+          void handleMainWindowActivation();
+        } finally {
+          windowRecoveryInProgress = false;
+        }
+      }).catch((error) => {
+        log.error('[Window] Renderer crash recovery failed:', error);
+        if (!isQuitting && !isShutdownRequested()) {
+          requestRuntimeRelaunchOnce('renderer-crash-recovery-failed');
+        }
       });
     }
   });
 
-  mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription) => {
-    log.error('[Window] Failed to load:', errorCode, errorDescription);
-    console.error('[Window] Failed to load:', errorCode, errorDescription);
+  setupWindowLoadRetry(createdWindow, () => `http://localhost:${getServerPort()}`, {
+    log,
+    onRetryExhausted: ({ errorCode, errorDescription, validatedURL, retries }) => {
+      log.error('[Window] Load retry exhaustion:', errorCode, errorDescription, validatedURL, `retries=${retries}`);
+      lastWindowLoadFailure = { errorCode, errorDescription, validatedURL };
+      recoverFailedWindow(createdWindow);
+    },
   });
 
   mainWindow.webContents.on('unresponsive', () => {
@@ -480,15 +799,109 @@ function createWindow(): void {
   });
 }
 
+async function handleMainWindowActivation(): Promise<void> {
+  const services = getRuntimeServices();
+  const hasWindow = Boolean(mainWindow && !mainWindow.isDestroyed());
+  const action = decideRuntimeActivationAction({
+    state: runtimeState,
+    hasWindow,
+    services,
+    shutdownRequested: isQuitting || isShutdownRequested(),
+  });
+  log.info(
+    `[Lifecycle] Activation action=${action} state=${runtimeState}`
+      + ` services=${services.main ? 'main' : 'no-main'},${services.kds ? 'kds' : 'no-kds'},${services.serverApp ? 'server-app' : 'no-server-app'}`,
+  );
+
+  if (action === 'show') {
+    // Confirm backend HTTP listeners are actively responding before showing window.
+    const reallyHealthy = await probeBackendHealth({
+      server: getServerPort(),
+      kds: getKdsPort(),
+      serverApp: getServerAppPort(),
+    });
+    // Ignore probe results if shutdown or update was initiated while probing.
+    if (isQuitting || isShutdownRequested()) return;
+    if (!reallyHealthy) {
+      requestRuntimeRelaunchOnce('activation-health-probe-failed');
+      return;
+    }
+    showMainWindow();
+    return;
+  }
+  if (action === 'create') {
+    createWindow();
+    return;
+  }
+  if (action === 'wait') {
+    if (!initializationPromise) {
+      activationPending = true;
+      return;
+    }
+    void initializationPromise.then(
+      () => { void handleMainWindowActivation(); },
+      (error) => {
+        log.error('[Lifecycle] Startup failed while activation was waiting:', error);
+        requestRuntimeRelaunchOnce('activation-startup-failed');
+      },
+    );
+    return;
+  }
+  if (action === 'ignore') return;
+
+  requestRuntimeRelaunchOnce(`activation-runtime-unavailable-${runtimeState}`);
+}
+
+// Sleep/wake recovery: nudge window dimensions on resume to force GPU compositor repaint.
+function registerPowerMonitorRecovery(): void {
+  powerMonitor.on('resume', () => {
+    console.log('[Window] System resumed from sleep, forcing repaint');
+    // Allow display pipeline to wake before nudging.
+    setTimeout(() => {
+      if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.isVisible()) return;
+      const [width, height] = mainWindow.getSize();
+      mainWindow.setSize(width + 1, height);
+      mainWindow.setSize(width, height);
+    }, 1000);
+  });
+}
+
+// Track child process crashes and trigger GPU fallback relaunch on GPU crash.
+function registerChildProcessCrashTelemetry(): void {
+  app.on('child-process-gone', (_event, details) => {
+    log.error('[Process] Child process gone:', details.type, details.reason, details.exitCode);
+    console.error('[Process] Child process gone:', details.type, details.reason, details.exitCode);
+    // Ignore normal shutdown/clean-exit signals.
+    const isGpuFailure = details.type === 'GPU'
+      && details.reason !== 'clean-exit'
+      && !isQuitting
+      && !isShutdownRequested();
+    if (isGpuFailure) {
+      // Cancel stability reset timer and increment GPU crash count.
+      clearRendererStabilityResetTimer();
+      consecutiveGpuCrashes++;
+    }
+    void sendTelemetryEvent('child_process_gone', {
+      type: details.type,
+      reason: details.reason,
+      exitCode: details.exitCode,
+      serviceName: details.serviceName,
+      consecutiveGpuCrashCount: isGpuFailure ? consecutiveGpuCrashes : undefined,
+    }).catch((error) => {
+      log.error('[Process] Failed to report child-process failure:', error);
+    });
+    if (isGpuFailure) {
+      // Hardware acceleration fallback after GPU process crash.
+      shouldDisableGpuOnRelaunch = true;
+      log.error('[Process] GPU process crashed — requesting relaunch with hardware acceleration disabled.');
+      requestRuntimeRelaunchOnce('gpu-process-crashed');
+    }
+  });
+}
+
 function createTray(): void {
   if (process.platform === 'linux') {
-    // ── Linux system tray ────────────────────────────────────────────────────
-    // On Linux the window close button hides the window (same as other
-    // platforms), but there is no native macOS-style dock or Windows taskbar
-    // integration to bring it back. A system-tray icon gives Linux users a
-    // persistent, discoverable way to show the window or fully quit the app
-    // (which triggers the existing quit handler that tears down DB, servers,
-    // mDNS, etc.).
+    // Linux tray: provides persistent icon to restore or quit the app.
     const linuxIconPath = isDev
       ? path.join(__dirname, '../../assets/icon-512.png')
       : path.join(process.resourcesPath, 'assets/icon-512.png');
@@ -502,9 +915,7 @@ function createTray(): void {
           label: 'Show',
           click: () => {
             if (mainWindow) {
-              if (mainWindow.isMinimized()) mainWindow.restore();
-              mainWindow.show();
-              mainWindow.focus();
+              if (showMainWindow()) mainWindow.focus();
             }
           },
         },
@@ -524,9 +935,7 @@ function createTray(): void {
                 tray.destroy();
                 tray = null;
               }
-              // will-quit owns the same awaited cleanup sequence as every
-              // other Electron entrypoint. Do not force-exit while resources
-              // are still draining.
+              // Defer quit so context menu can close and drain resources cleanly.
               app.quit();
             }, 100);
           },
@@ -538,9 +947,7 @@ function createTray(): void {
       // Single-click also shows the window on Linux (no double-click standard).
       tray.on('click', () => {
         if (mainWindow) {
-          if (mainWindow.isMinimized()) mainWindow.restore();
-          mainWindow.show();
-          mainWindow.focus();
+          if (showMainWindow()) mainWindow.focus();
         }
       });
 
@@ -561,14 +968,14 @@ function createTray(): void {
     tray = new Tray(icon.resize({ width: 16, height: 16 }));
 
     const contextMenu = Menu.buildFromTemplate([
-      { label: 'Open Flo', click: () => mainWindow?.show() },
+      { label: 'Open Flo', click: () => { showMainWindow(); } },
       { type: 'separator' },
       { label: 'Quit', click: () => { isQuitting = true; app.quit(); } },
     ]);
 
     tray.setToolTip('Flo');
     tray.setContextMenu(contextMenu);
-    tray.on('double-click', () => mainWindow?.show());
+    tray.on('double-click', () => { showMainWindow(); });
   } catch {
     console.log('[Tray] Icon not found, skipping tray');
   }
@@ -703,7 +1110,7 @@ function createMenu(): void {
     {
       label: 'Window',
       submenu: [
-        { label: 'Flo Cafe', click: () => { mainWindow?.show(); mainWindow?.focus(); } },
+        { label: 'Flo Cafe', click: () => { if (showMainWindow()) mainWindow?.focus(); } },
         { type: 'separator' },
         { role: 'minimize' },
         ...(process.platform === 'darwin' ? [
@@ -746,7 +1153,7 @@ function showAbout(): void {
   dialog.showMessageBox({
     type: 'info',
     title: 'About Flo',
-    message: 'Flo Desktop',
+    message: 'Flo Cafe',
     detail: [
       `Version: ${app.getVersion()}`,
       `Electron: ${process.versions.electron}`,
@@ -766,6 +1173,8 @@ function showAbout(): void {
 }
 
 async function initialize(): Promise<void> {
+  runtimeState = 'starting';
+  log.info('[Lifecycle] Runtime is starting');
   try {
     if (isShutdownRequested()) return;
     console.log('[Flo] Initializing...');
@@ -791,18 +1200,19 @@ async function initialize(): Promise<void> {
     await startServerApp();
     if (isShutdownRequested()) return;
 
-    console.log('[Flo] Initializing WhatsApp service...');
-    initWhatsAppFromDb();
-
-    console.log('[Flo] Starting mDNS advertisement...');
-    startMdns();
+    // Native E2E owns an offline fixture; optional LAN discovery must not
+    // contend with a developer session or keep the test process alive.
+    if (process.env.FLO_E2E_SKIP_OPTIONAL_NETWORK !== '1') {
+      console.log('[Flo] Starting mDNS advertisement...');
+      startMdns();
+    }
 
     console.log('[Flo] Initializing printer...');
     await initPrinter();
     if (isShutdownRequested()) return;
 
     console.log('[Flo] Registering IPC handlers...');
-    registerIpcHandlers(shutdownSignal);
+    registerIpcHandlers(shutdownSignal, () => mainWindow, showMainWindow, () => currentEffectiveIsDark);
 
     ipcMain.handle('get-update-status', () =>
       // #467: return the real persisted state (including not-checked-yet and
@@ -814,14 +1224,49 @@ async function initialize(): Promise<void> {
       checkForUpdates();
     });
 
-    ipcMain.handle('restart-and-install', () => {
-      if (!isInstallReady(storedUpdateStatus, stagedUpdateReady)) {
-        log.warn('[Update] Ignoring install request before an update is downloaded');
-        return;
+    ipcMain.handle('updates:get-beta-channel', () =>
+      // Returns persisted beta channel preference.
+      withDatabaseRequest(() => readBetaChannelEnabled())
+    );
+
+    ipcMain.handle('updates:set-beta-channel', (_event, enabled: unknown) => {
+      if (typeof enabled !== 'boolean') {
+        return { success: false, error: 'enabled must be a boolean' };
       }
-      isQuitting = true;
-      autoUpdater.quitAndInstall();
+      return enqueueBetaChannelTransition(() => withDatabaseRequest(async () => {
+        // Prevent channel switch if an update check/download is active or staged.
+        if (isInstallReady(storedUpdateStatus, stagedUpdateReady)) {
+          return { success: false, error: 'A downloaded update is waiting to be installed — install it before switching channels' };
+        }
+        if (isUpdateCheckInFlight(storedUpdateStatus, updaterPhase)) {
+          return { success: false, error: 'An update check or download is in progress — try again once it finishes' };
+        }
+        try {
+          writeBetaChannelEnabled(enabled);
+        } catch (error) {
+          log.error('[Update] Failed to persist beta-channel preference:', error);
+          return { success: false, error: 'Could not save the channel preference' };
+        }
+        log.info(`[Update] Beta channel ${enabled ? 'enabled' : 'disabled'} by user`);
+        // Reconfigure channel settings and initiate immediate update re-check.
+        configureAutoUpdaterChannel(enabled);
+        setUpdateStatus(initialUpdateState());
+        checkForUpdates();
+        return { success: true };
+      }));
     });
+
+    // Requires master PIN authorization and runs cleanup before quitAndInstall.
+    ipcMain.handle('restart-and-install', createRestartAndInstallHandler({
+      isInstallReady: () => isInstallReady(storedUpdateStatus, stagedUpdateReady),
+      authorize: (pin) => authorizeMasterPin(pin, 'ipc:restart-and-install'),
+      runCleanup,
+      quitAndInstall: (isSilent, isForceRunAfter) => autoUpdater.quitAndInstall(isSilent, isForceRunAfter),
+      updateState: updateShutdownState,
+      onInstallFailure: () => requestRuntimeRelaunchOnce('update-install-failed'),
+      warn: (message) => log.warn(message),
+      error: (message, error) => log.error(message, error),
+    }));
 
     ipcMain.handle('get-status', () => {
       const mem = process.memoryUsage();
@@ -836,29 +1281,56 @@ async function initialize(): Promise<void> {
         },
         uptime: process.uptime(),
         port: getServerPort(),
+        titleBarMode: resolvedTitleBarMode,
+        titleBarEpoch: getRendererReadinessEpoch(),
+        titleBarDocumentNonce: getRendererDocumentNonce() ?? undefined,
+        effectiveTheme: currentEffectiveIsDark ? 'dark' : 'light',
       };
     });
 
+    runtimeState = 'ready';
+    relaunchAttemptGuard.markRuntimeRecovered();
+    log.info('[Lifecycle] Runtime is ready');
+    ipcMain.handle('set-theme-effective', (event, isDark: unknown) => {
+      // Validate sender origin matches trusted local window.
+      if (!isTrustedSender(event)) {
+        return { success: false, error: 'Untrusted sender' };
+      }
+      if (typeof isDark !== 'boolean') {
+        return { success: false, error: 'isDark must be boolean' };
+      }
+      currentEffectiveIsDark = isDark;
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        applyTitleBarOverlayTheme(mainWindow, isDark, process.platform);
+        // Match window background to overlay token to prevent border flashing.
+        mainWindow.setBackgroundColor(resolveTitleBarOverlayColors(isDark).color);
+      }
+      return { success: true };
+    });
     console.log('[Flo] Creating window...');
     createWindow();
+    registerPowerMonitorRecovery();
+    registerChildProcessCrashTelemetry();
     createTray();
     createMenu();
-    // Auto-updater: wired up on every non-store platform, including Linux now
-    // (#58) — checkForUpdates() itself decides whether Linux's build format
-    // (AppImage vs deb/rpm/snap) actually supports self-update.
+    // Auto-updater configured on non-store platforms.
     if (!isStoreBuild) {
-      setupAutoUpdater();
-      setTimeout(() => checkForUpdates(), 5000);
+      if (process.env.FLO_E2E_SKIP_OPTIONAL_NETWORK !== '1') {
+        setupAutoUpdater();
+        setTimeout(() => checkForUpdates(), 5000);
+      }
     } else {
-      // Store builds skip electron-updater entirely; seed the persisted state
-      // so the renderer shows honest "managed by the store" status from the
-      // first load instead of a stale never-checked default (#467).
+      // Store builds skip auto-updater and report store-managed status.
       setUpdateStatus(oneShotUpdateState('store-managed'));
     }
-    setTimeout(() => { void checkTaxPackUpdatesOnStartup(); }, 5000);
+    if (process.env.FLO_E2E_SKIP_OPTIONAL_NETWORK !== '1') {
+      setTimeout(() => { void checkTaxPackUpdatesOnStartup(); }, 5000);
+    }
 
     console.log('[Flo] Ready!');
   } catch (error) {
+    runtimeState = 'failed';
+    log.error('[Lifecycle] Runtime initialization failed:', error);
     console.error('[Flo] Initialization error:', error);
     const errorDetails = error as { code?: unknown; name?: unknown } | null;
     const expectedShutdownCancellation = errorDetails?.code === 'ERR_SHUTDOWN_ABORTED'
@@ -875,10 +1347,7 @@ async function initialize(): Promise<void> {
     }
     dialog.showErrorBox('Initialization Error', `Failed to start Flo: ${error}`);
 
-    // Best-effort: report the fatal startup failure so support can see which
-    // installs are stuck on a stale build without waiting for a user to
-    // describe the error message themselves. The cleanup below remains safe
-    // even when initialization failed before the database or listeners opened.
+    // Report fatal startup error to telemetry on a best-effort basis.
     try {
       const payload: Record<string, unknown> = {
         error_message: String(error instanceof Error ? error.message : error).slice(0, 500),
@@ -900,24 +1369,45 @@ async function initialize(): Promise<void> {
     }
     // Cleanup has settled (or reported its bounded failure) before exiting.
     app.exit(1);
+  } finally {
+    if (isShutdownRequested() && runtimeState === 'starting') runtimeState = 'stopping';
   }
 }
 
-app.whenReady().then(initialize);
+app.whenReady().then(() => {
+  initializationPromise = initialize();
+  void initializationPromise.then(
+    () => {
+      if (!activationPending) return;
+      activationPending = false;
+      void handleMainWindowActivation();
+    },
+    (error) => {
+      if (!activationPending) return;
+      activationPending = false;
+      log.error('[Lifecycle] Startup failed while activation was pending:', error);
+      if (!isQuitting && !isShutdownRequested()) requestRuntimeRelaunchOnce('activation-startup-failed');
+    },
+  );
+});
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
+  if (process.platform !== 'darwin' && !windowRecoveryInProgress) {
     app.quit();
   }
 });
 
 app.on('activate', () => {
-  if (mainWindow === null) {
-    createWindow();
-  } else {
-    mainWindow.show();
-  }
+  void handleMainWindowActivation();
 });
+
+if (process.env.NODE_ENV === 'test' && process.env.FLO_E2E_PID_FILE) {
+  try {
+    fs.writeFileSync(process.env.FLO_E2E_PID_FILE, String(process.pid));
+  } catch (error) {
+    log.error('[Native E2E] Could not write Electron PID:', error);
+  }
+}
 
 // --- Cleanup function (idempotent — safe to call from every entrypoint) ---
 const cleanupCoordinator = createShutdownCoordinator(() => [
@@ -929,8 +1419,8 @@ const cleanupCoordinator = createShutdownCoordinator(() => [
       if (currentTray) currentTray.destroy();
     },
   },
-  // The Server App can be forwarding an active request to the main API, so
-  // drain it before closing the API listener it depends on.
+  { name: 'raster surface', run: () => destroySharedRasterRenderer() },
+  // Drain Server App before shutting down main API.
   { name: 'Server App', run: () => stopServerApp(), blocksDatabase: true },
   { name: 'Main server', run: () => stopServer(), blocksDatabase: true },
   { name: 'KDS server', run: () => stopKdsServer(), blocksDatabase: true },
@@ -943,31 +1433,42 @@ const cleanupCoordinator = createShutdownCoordinator(() => [
   { name: 'HTTP handler cleanup', run: () => waitForHttpShutdownWork(), blocksDatabase: true },
   { name: 'database admission', run: () => beginDatabaseShutdown(), blocksDatabase: true },
   { name: 'database requests', run: () => waitForDatabaseRequests(), blocksDatabase: true },
-  // Database closure is deliberately last: all HTTP and WebSocket work must
-  // have settled before handlers can lose access to SQLite.
+  // Close database after all in-flight handlers have finished.
   { name: 'database', run: () => closeDatabase(), databaseClose: true },
-], { onFatalTimeout: () => app.exit(1) });
+], {
+  onFatalTimeout: () => {
+    // Avoid exit(1) on timeout during update installation so updater can hand off.
+    if (!isInstallingUpdate && !runtimeRelaunchRequested) {
+      app.exit(1);
+    }
+  },
+});
 
 const { runCleanup, isShutdownRequested, shutdownSignal } = createShutdownEntrypoints({
   app: app as unknown as ShutdownEntrypointApp,
   process: process as unknown as ShutdownEntrypointProcess,
   cleanup: async () => {
+    log.info('[Lifecycle] Cleanup started');
     console.log('[Flo] Running cleanup...');
     try {
       await cleanupCoordinator();
+      log.info('[Lifecycle] Cleanup completed');
       console.log('[Flo] Goodbye!');
     } catch (error) {
+      log.error('[Lifecycle] Cleanup failed:', error);
       console.error('[Flo] Cleanup failed:', error);
       throw error;
     }
   },
   setQuitting: () => {
     isQuitting = true;
+    runtimeState = 'stopping';
   },
   onShutdownRequested: requestWhatsAppShutdown,
   destroyWindow: () => {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.destroy();
   },
+  isInstallingUpdate: () => isInstallingUpdate,
   reportFailure: (context, error) => {
     console.error(`[Flo] Cleanup failed before ${context}:`, error);
   },
@@ -978,9 +1479,19 @@ const { runCleanup, isShutdownRequested, shutdownSignal } = createShutdownEntryp
 process.on('uncaughtException', (error) => {
   log.error('[Flo] Uncaught exception:', error);
   console.error('[Flo] Uncaught exception:', error);
+  void sendTelemetryEvent('main_uncaught_exception', {
+    message: error?.message?.slice(0, 500),
+    stack: error?.stack?.slice(0, 4000),
+  });
 });
 
 process.on('unhandledRejection', (reason) => {
   log.error('[Flo] Unhandled rejection:', reason);
   console.error('[Flo] Unhandled rejection:', reason);
+  const message = reason instanceof Error ? reason.message : String(reason);
+  const stack = reason instanceof Error ? reason.stack : undefined;
+  void sendTelemetryEvent('main_unhandled_rejection', {
+    message: message?.slice(0, 500),
+    stack: stack?.slice(0, 4000),
+  });
 });

@@ -1,11 +1,12 @@
 import express, { Express, Request, Response, NextFunction } from 'express';
+import expressRateLimit from 'express-rate-limit';
 import cors from 'cors';
 import jwt from 'jsonwebtoken';
 import { WebSocketServer } from 'ws';
 import * as http from 'http';
 import * as path from 'path';
 import * as fs from 'fs';
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'node:crypto';
 import { closeServerResources, createShutdownCancellationError, installHttpShutdownTracking } from './shutdown';
 import { databaseMaintenanceMiddleware, getDatabase, getKdsStationCategoryIds, getKdsStationRoutingScope, getUserKdsStationIds, hasUserKdsStationAssignments, isDatabaseMaintenanceActive, isKdsStationItemAllowed, parseItemJson, attachEffectiveAddons, isKdsEnabled, isVoidedItemKdsVisible, KDS_VOIDED_ITEM_VISIBILITY_MS, projectKdsItem, projectKdsOrder } from './db';
 import { setupKdsWebSocket, notifyKdsUpdate } from './services/kds';
@@ -13,6 +14,7 @@ import { getJWTSecret, parseCategoryIds } from './routes/auth';
 import { rateLimit, authRateLimit, staticRouteRateLimit, corsOptions, isTokenRevoked, isTokenStale, revokeToken } from './middleware/security';
 import { buildCspHeader } from './csp';
 import { resolveContainedPath } from './lib/path-containment';
+import { ROLE_ACCESS, hasRole } from '../shared/role-permissions';
 
 let kdsServer: http.Server | null = null;
 let kdsWss: WebSocketServer | null = null;
@@ -33,16 +35,14 @@ type KdsRequestUser = {
 };
 
 function categoryIdsForRole(role: string, categoryIds: string | null): string[] {
-  return role === 'manager' || role === 'owner' ? [] : parseCategoryIds(categoryIds);
+  return hasRole(role, ROLE_ACCESS.ownerManager) ? [] : parseCategoryIds(categoryIds);
 }
 
 export function isKdsServerRunning(): boolean {
   return kdsServer !== null;
 }
 
-/**
- * Locate the static export directory.
- */
+/** Locate the static export directory. */
 function getStaticDir(): string | null {
   const candidates = [
     // Development / unpackaged: relative to dist/main/ (compiled output of
@@ -59,10 +59,7 @@ function getStaticDir(): string | null {
   return null;
 }
 
-/**
- * Helper to rewrite dotted Next.js static segment file requests to nested paths on Windows.
- * E.g., /products/__next.!KGRhc2hib2FyZCk.products.__PAGE__.txt -> /products/__next.!KGRhc2hib2FyZCk/products/__PAGE__.txt
- */
+/** Helper to rewrite dotted Next.js static segment file requests on Windows. */
 function rewriteNextExportPath(reqPath: string): string {
   const nextIndex = reqPath.indexOf('__next.');
   if (nextIndex === -1) return reqPath;
@@ -94,9 +91,7 @@ export function startKdsServer(): Promise<void> {
       next();
     });
     app.use(express.json());
-    // body-parser 2.x (bundled with Express 5) leaves req.body undefined
-    // instead of {} when a request has no parseable body -- restore the
-    // old default so route handlers can destructure req.body directly.
+    // Restore empty body default for Express 5 compatibility.
     app.use((req: Request, _res: Response, next: NextFunction) => {
       if (req.body === undefined) req.body = {};
       next();
@@ -124,7 +119,7 @@ export function startKdsServer(): Promise<void> {
         if (!user || isTokenStale(decoded.iat, user.tokens_valid_after)) {
           return res.status(401).json({ error: 'Invalid token' });
         }
-        if (!['chef', 'manager', 'owner'].includes(user.role)) {
+        if (!hasRole(user.role, ROLE_ACCESS.kitchen)) {
           return res.status(403).json({ error: 'Access denied. Only kitchen staff allowed.' });
         }
         const stationIds = getUserKdsStationIds(db, user.id);
@@ -158,14 +153,14 @@ export function startKdsServer(): Promise<void> {
       });
     });
 
-    // Public tenant metadata — language + KDS defaults.
-    // No auth: the standalone KDS needs this on first paint, before login,
-    // and lives on a different origin than the main API.
-    app.get('/api/kds/info', (_req: Request, res: Response) => {
-      // Disabled KDS → pretend the endpoint doesn't exist rather than
-      // confirming it's just off; this is the first thing a standalone KDS
-      // device fetches, pre-login, so it's the least info a stale/
-      // misconfigured device on the LAN should get (issue #133).
+    // Public tenant metadata: language and KDS defaults for pre-login display.
+    app.get('/api/kds/info', expressRateLimit({
+      windowMs: 60 * 1000,
+      limit: 100,
+      standardHeaders: true,
+      legacyHeaders: false,
+    }), (_req: Request, res: Response) => {
+      // Return 404 when disabled to avoid revealing KDS presence to unauthorized LAN clients.
       if (!isKdsEnabled()) {
         return res.status(404).json({ error: 'Not found' });
       }
@@ -202,7 +197,7 @@ export function startKdsServer(): Promise<void> {
         }
 
         // Only allow chef, manager, owner roles
-        if (!['chef', 'manager', 'owner'].includes(user.role)) {
+        if (!hasRole(user.role, ROLE_ACCESS.kitchen)) {
           return res.status(403).json({ error: 'Access denied. Only kitchen staff allowed.' });
         }
 
@@ -214,7 +209,7 @@ export function startKdsServer(): Promise<void> {
         }
 
         const token = jwt.sign(
-          { userId: user.id, email: user.email, role: user.role, jti: uuidv4() },
+          { userId: user.id, email: user.email, role: user.role, jti: randomUUID() },
           getJWTSecret(),
           { expiresIn: '24h' }
         );
@@ -302,16 +297,16 @@ export function startKdsServer(): Promise<void> {
               AND active_oi.status NOT IN ('served', 'cancelled')
             WHERE active_o.status NOT IN ('pending', 'preparing', 'ready', 'served', 'cancelled')
           )
-          AND oi.status NOT IN ('completed', 'cancelled', 'void_adjustment')
+          AND oi.status NOT IN ('completed', 'cancelled', 'void_adjustment', 'refunded')
           AND (oi.status != 'voided' OR oi.voided_at IS NULL OR oi.voided_at > ?)
         `;
         const orderParams: string[] = [voidedCutoff];
         if (stationIds.length > 0) {
           const stationPlaceholders = stationIds.map(() => '?').join(',');
           const categoryRoute = stationRoutingCategoryIds.length > 0
-            ? ` OR EXISTS (SELECT 1 FROM order_items routed_oi JOIN products routed_p ON routed_p.id = routed_oi.product_id WHERE routed_oi.order_id = o.id AND o.table_id IS NULL AND routed_p.category_id IN (${stationRoutingCategoryIds.map(() => '?').join(',')}))`
+            ? ` OR EXISTS (SELECT 1 FROM order_items routed_oi JOIN products routed_p ON routed_p.id = routed_oi.product_id WHERE routed_oi.order_id = o.id AND t.kitchen_station_id IS NULL AND routed_p.category_id IN (${stationRoutingCategoryIds.map(() => '?').join(',')}))`
             : '';
-          query += ` AND (EXISTS (SELECT 1 FROM tables assigned_table WHERE assigned_table.id = o.table_id AND assigned_table.kitchen_station_id IN (${stationPlaceholders}))${categoryRoute}${stationScope.hasUnrestrictedStation ? ' OR o.table_id IS NULL' : ''})`;
+          query += ` AND (EXISTS (SELECT 1 FROM tables assigned_table WHERE assigned_table.id = o.table_id AND assigned_table.kitchen_station_id IN (${stationPlaceholders}))${categoryRoute}${stationScope.hasUnrestrictedStation ? ' OR t.kitchen_station_id IS NULL' : ''})`;
           orderParams.push(...stationIds, ...stationRoutingCategoryIds);
         }
         query += ' ORDER BY o.created_at ASC';
@@ -327,8 +322,7 @@ export function startKdsServer(): Promise<void> {
           allowedProductIds = new Set(productRows.map((p) => p.id));
         }
 
-        // Batch item and addon fetches across all active orders (issue #226)
-        // instead of running one items query and one addons pass per order.
+        // Batch item and addon fetches across all active orders to avoid N+1 queries.
         const orderIds = (orders as any[]).map((o: any) => o.id);
         const itemsByOrder: Record<string, any[]> = {};
         if (orderIds.length > 0) {
@@ -347,7 +341,7 @@ export function startKdsServer(): Promise<void> {
         // #150: hide the void reversal line (bill adjustment, not a kitchen
         // item) and age voided items off the board after their grace period.
         const isVisibleItem = (item: any, order: any) => item.status !== 'void_adjustment'
-          && !['completed', 'cancelled'].includes(item.status)
+          && !['completed', 'cancelled', 'refunded'].includes(item.status)
           && (item.status !== 'voided' || isVoidedItemKdsVisible(item.voided_at))
           && isKdsStationItemAllowed(stationIds, stationRoutingCategoryIds, order.kitchen_station_id, item.category_id, order.kitchen_station_id ? stationScope?.categoryIdsByStation[String(order.kitchen_station_id)] : undefined, stationScope.hasUnrestrictedStation);
 
@@ -414,7 +408,7 @@ export function startKdsServer(): Promise<void> {
           const currentUser = db.prepare('SELECT role, category_ids, is_active, tokens_valid_after FROM users WHERE id = ?').get(kdsUser.userId) as { role: string; category_ids: string | null; is_active: number; tokens_valid_after: string | null } | undefined;
           const currentToken = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : '';
           if (!currentUser?.is_active || isTokenRevoked(currentToken) || isTokenStale(kdsUser.iat, currentUser?.tokens_valid_after)) return { statusCode: 403, error: 'User account is not active' };
-          if (!['chef', 'manager', 'owner'].includes(currentUser.role)) return { statusCode: 403, error: 'Not authorized to update KDS items' };
+          if (!hasRole(currentUser.role, ROLE_ACCESS.kitchen)) return { statusCode: 403, error: 'Not authorized to update KDS items' };
           const currentCategoryIds = categoryIdsForRole(currentUser.role, currentUser.category_ids);
           const currentStationIds = getUserKdsStationIds(db, kdsUser.userId);
           const currentAssignmentsConfigured = hasUserKdsStationAssignments(db, kdsUser.userId);
@@ -434,7 +428,7 @@ export function startKdsServer(): Promise<void> {
           // #150: locked once voided — see main/routes/order-items.ts for the same rule.
           if (item.status === 'voided') return { statusCode: 400, error: 'This item has been voided and can no longer be updated' };
           if (item.status === 'void_adjustment') return { statusCode: 400, error: 'This bill adjustment cannot be updated from KDS' };
-          if (item.status === 'completed' || item.status === 'cancelled') {
+          if (item.status === 'completed' || item.status === 'cancelled' || item.status === 'refunded') {
             return { statusCode: 400, error: 'This terminal item cannot be updated from KDS' };
           }
 
@@ -459,7 +453,7 @@ export function startKdsServer(): Promise<void> {
             ? db.prepare(`
                 UPDATE order_items
                 SET status = ?, updated_at = datetime('now')
-                WHERE id = ? AND status NOT IN ('voided', 'void_adjustment', 'completed', 'cancelled')
+                WHERE id = ? AND status NOT IN ('voided', 'void_adjustment', 'completed', 'cancelled', 'refunded')
               `).run(status, req.params.id)
             : db.prepare(`
                 UPDATE order_items
@@ -525,9 +519,6 @@ export function startKdsServer(): Promise<void> {
       console.log(`[KDS Server] Serving static files from: ${staticDir}`);
 
       // Middleware to patch Windows-specific Next.js static export path nesting.
-      // On Windows, the Next.js static export uses dotted segments (e.g.
-      // __next.!KGRhc2hib2FyZCk.products.__PAGE__.txt) instead of nested
-      // directories. This rewrite is only needed when the app runs on Windows.
       if (process.platform === 'win32') {
         app.use(staticRouteRateLimit(), (req: Request, res: Response, next: NextFunction) => {
           if (req.path.includes('__next.')) {
@@ -579,85 +570,94 @@ export function startKdsServer(): Promise<void> {
       res.status(500).json({ error: 'Internal server error' });
     });
 
-    let currentKdsPort = KDS_PORT;
+    const baseKdsPort = parseInt(process.env.KDS_PORT || '3002', 10);
+    let currentKdsPort = baseKdsPort;
     let attempts = 0;
 
-    let listeningServer: http.Server;
-    const onListening = () => {
-      if (stopping) {
-        try { listeningServer.close(); } catch { return; }
-        return;
-      }
-      startReject = null;
-      const address = listeningServer.address();
-      activeKdsPort = address && typeof address !== 'string' ? address.port : currentKdsPort;
-      console.log(`[KDS Server] HTTP server running on http://localhost:${activeKdsPort}`);
-
-      if (listeningServer) {
-        // noServer + a manual 'upgrade' handler so a disabled KDS can 404 the
-        // upgrade instead of completing it — see main/server.ts for the same
-        // pattern on the primary API server (issue #133).
-        const wss = new WebSocketServer({ noServer: true });
-        kdsWss = wss;
-        setupKdsWebSocket(wss);
-
-        listeningServer.on('upgrade', (request, socket, head) => {
-          const pathname = (request.url || '').split('?')[0];
-          if (pathname !== '/kds') {
-            socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
-            socket.destroy();
-            return;
-          }
-
-          if (isDatabaseMaintenanceActive()) {
-            socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
-            socket.destroy();
-            return;
-          }
-
-          if (!isKdsEnabled()) {
-            socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
-            socket.destroy();
-            return;
-          }
-
-          try {
-            wss.handleUpgrade(request, socket, head, (ws) => {
-              wss.emit('connection', ws, request);
-            });
-          } catch (error) {
-            console.error('[KDS Server] WebSocket upgrade failed:', error);
-            socket.destroy();
-          }
-        });
-
-        console.log(`[KDS Server] WebSocket running on ws://localhost:${activeKdsPort}/kds`);
-      }
-
-      resolve();
-    };
-
-    listeningServer = app.listen(currentKdsPort, '0.0.0.0', onListening);
+    const listeningServer = http.createServer(app);
     kdsServer = listeningServer;
     installHttpShutdownTracking(listeningServer);
 
-    listeningServer.on('error', (err: NodeJS.ErrnoException) => {
-      if (stopping) return;
-      if (err.code === 'EADDRINUSE') {
-        attempts++;
-        if (attempts >= 10) {
-          const errorMsg = `[KDS Server] Failed to bind to any port after 10 attempts starting from ${KDS_PORT}`;
-          console.error(errorMsg);
-          reject(new Error(errorMsg));
+    const tryListen = () => {
+      const attemptedPort = currentKdsPort;
+      const onListening = () => {
+        if (stopping) {
+          try { listeningServer.close(); } catch { return; }
           return;
         }
-        currentKdsPort++;
-        console.log(`[KDS Server] Port ${currentKdsPort - 1} in use, trying ${currentKdsPort}`);
-        listeningServer.listen(currentKdsPort, '0.0.0.0', onListening);
-      } else {
+        startReject = null;
+        listeningServer.off('error', onError);
+        const address = listeningServer.address();
+        activeKdsPort = address && typeof address !== 'string' ? address.port : attemptedPort;
+        console.log(`[KDS Server] HTTP server running on http://localhost:${activeKdsPort}`);
+
+        if (listeningServer) {
+          // Manual upgrade handler allows rejecting WebSocket connections when KDS is disabled.
+          const wss = new WebSocketServer({ noServer: true });
+          kdsWss = wss;
+          setupKdsWebSocket(wss);
+
+          listeningServer.on('upgrade', (request, socket, head) => {
+            const pathname = (request.url || '').split('?')[0];
+            if (pathname !== '/kds') {
+              socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+              socket.destroy();
+              return;
+            }
+
+            if (isDatabaseMaintenanceActive()) {
+              socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+              socket.destroy();
+              return;
+            }
+
+            if (!isKdsEnabled()) {
+              socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+              socket.destroy();
+              return;
+            }
+
+            try {
+              wss.handleUpgrade(request, socket, head, (ws) => {
+                wss.emit('connection', ws, request);
+              });
+            } catch (error) {
+              console.error('[KDS Server] WebSocket upgrade failed:', error);
+              socket.destroy();
+            }
+          });
+
+          console.log(`[KDS Server] WebSocket running on ws://localhost:${activeKdsPort}/kds`);
+        }
+
+        resolve();
+      };
+
+      const onError = (err: NodeJS.ErrnoException) => {
+        if (stopping) return;
+        listeningServer.off('listening', onListening);
+        if (err.code === 'EADDRINUSE' || err.code === 'EACCES') {
+          attempts++;
+          if (attempts >= 10) {
+            const errorMsg = `[KDS Server] Failed to bind to any port after 10 attempts starting from ${baseKdsPort}`;
+            console.error(errorMsg);
+            reject(new Error(errorMsg));
+            return;
+          }
+          currentKdsPort++;
+          console.log(`[KDS Server] Port ${attemptedPort} in use (${err.code}), trying ${currentKdsPort}`);
+          tryListen();
+          return;
+        }
         reject(err);
-      }
-    });
+      };
+
+      listeningServer.once('listening', onListening);
+      listeningServer.once('error', onError);
+      listeningServer.listen(attemptedPort, '0.0.0.0');
+    };
+
+    tryListen();
   });
 }
 

@@ -1,8 +1,7 @@
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt, { SignOptions } from 'jsonwebtoken';
-import { v4 as uuidv4 } from 'uuid';
-import { randomBytes } from 'crypto';
+import { randomBytes, randomUUID } from 'crypto';
 import { getCountryCallingCode, type CountryCode } from 'libphonenumber-js';
 import { getCurrentSchemaVersion, getDatabase, getSettingValue, now } from '../db';
 import { authorizeMasterPin, isMasterPinAvailable, setMasterPin } from '../services/master-pin';
@@ -12,6 +11,7 @@ import { countryConfirmationPatch } from '../services/country-provenance';
 import { cloudSync, DEFAULT_CLOUD_SERVER_URL, normalizeCloudServerUrl } from '../services/cloud-sync';
 import { asyncHandler } from '../middleware/async-handler';
 import { normalizeOptionalPhone } from '../lib/phone';
+import { isSyntacticallyValidCurrencyCode } from '../../shared/print/currency';
 
 const router = Router();
 
@@ -35,12 +35,7 @@ const VALID_SETUP_PROFILES = new Set(['empty', 'express', 'demo']);
 const VALID_SERVICE_MODELS = new Set(['qsr', 'finedine']);
 const LOCAL_SETUP_HOSTS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 
-/**
- * Lazy-loaded JWT secret. On first access, reads from the settings table.
- * If no secret exists (first launch), generates a random 32-byte hex string
- * and persists it. This ensures every install gets a unique secret without
- * requiring manual configuration.
- */
+/** Lazy-loaded JWT secret stored in settings table, generated on first launch. */
 let _jwtSecret: string | null = null;
 
 export function clearJWTSecretCache(): void {
@@ -79,11 +74,7 @@ export function getJWTSecret(): string {
   return _jwtSecret;
 }
 
-/**
- * Build a synthetic "tenant" object from local settings.
- * FloDesktop is single-tenant — there is always exactly one "business".
- * The frontend expects this shape to determine routing (chef → KDS, others → POS).
- */
+/** Build synthetic tenant object from local settings for frontend routing. */
 function buildLocalTenant(db: ReturnType<typeof getDatabase>, userRole: string) {
   const rows = db.prepare('SELECT key, value FROM settings').all() as { key: string; value: string }[];
   const s: Record<string, string> = Object.fromEntries(rows.map(r => [r.key, r.value]));
@@ -98,7 +89,11 @@ function buildLocalTenant(db: ReturnType<typeof getDatabase>, userRole: string) 
     currency: s.currency || 'INR',
     currency_symbol: getCurrencySymbol(s.currency || 'INR', getCountryByCode(s.country)?.locale) || '₹',
     timezone: s.timezone || 'Asia/Kolkata',
+    business_day_start_time: s.business_day_start_time || '00:00',
     language: s.language || 'en',
+    // Include print policies in tenant snapshot so renderer bootstraps them before first print.
+    bill_language_policy: s.bill_language_policy || null,
+    kot_language_policy: s.kot_language_policy || null,
     service_model: s.service_model || 'finedine',
     currency_display: s.currency_display || 'rial',
     number_digits: s.number_digits || 'locale',
@@ -127,9 +122,7 @@ export function parseCategoryIds(value: unknown): string[] {
   }
 }
 
-// RFC 5321 caps a mailbox at 254 octets. Bound the length before applying the
-// email regex so an attacker-supplied email cannot drive `[^\s@]+` backtracking
-// into super-linear time (CodeQL js/polynomial-redos).
+// Cap mailbox at RFC 5321 length (254 octets) before regex evaluation to avoid ReDoS.
 export const MAX_EMAIL_LENGTH = 254;
 
 export function isValidEmail(email: string): boolean {
@@ -186,14 +179,41 @@ function insertStaffUser(db: ReturnType<typeof getDatabase>, id: string, name: s
   `).run(id, name, email, bcrypt.hashSync(password, 10), role, isActive, now(), now());
 }
 
-function seedExpressRestaurant(db: ReturnType<typeof getDatabase>, serviceModel: string): void {
-  insertCategory(db, 'cat-express-food', 'Food', '#F97316', '🍽️', 1);
-  insertCategory(db, 'cat-express-beverages', 'Beverages', '#0EA5E9', '🥤', 2);
+type SeedLanguage = 'en' | 'es' | 'fr' | 'pt' | 'de' | 'tr' | 'fil' | 'fa';
 
-  insertProduct(db, 'prod-express-meal', 'cat-express-food', 'Meal', 150, 1);
-  insertProduct(db, 'prod-express-snack', 'cat-express-food', 'Snack', 80, 2);
-  insertProduct(db, 'prod-express-tea', 'cat-express-beverages', 'Tea', 25, 1);
-  insertProduct(db, 'prod-express-coffee', 'cat-express-beverages', 'Coffee', 40, 2);
+/** Filipino intentionally uses the English sample data as its reviewed exception. */
+export const ENGLISH_IDENTICAL_SEED_LANGUAGES = ['fil'] as const;
+
+function resolveSeedLanguage(language?: string): SeedLanguage {
+  return language === 'es' || language === 'fr' || language === 'pt' || language === 'de'
+    || language === 'tr' || language === 'fil' || language === 'fa'
+    ? language
+    : 'en';
+}
+
+function seedExpressRestaurant(db: ReturnType<typeof getDatabase>, serviceModel: string, language?: string): void {
+  const lang = resolveSeedLanguage(language);
+  const labels: Record<SeedLanguage, [string, string, string, string]> = {
+    en: ['Food', 'Beverages', 'Meal', 'Tea'],
+    es: ['Comida', 'Bebidas', 'Comida', 'Té'],
+    fr: ['Plats', 'Boissons', 'Plat', 'Thé'],
+    pt: ['Comidas', 'Bebidas', 'Refeição', 'Chá'],
+    de: ['Speisen', 'Getränke', 'Mahlzeit', 'Tee'],
+    tr: ['Yiyecekler', 'İçecekler', 'Yemek', 'Çay'],
+    fil: ['Food', 'Beverages', 'Meal', 'Tea'],
+    fa: ['غذاها', 'نوشیدنی‌ها', 'غذا', 'چای'],
+  };
+  const [food, beverages, meal, tea] = labels[lang];
+  const coffee = lang === 'es' ? 'Café' : lang === 'fr' ? 'Café' : lang === 'pt' ? 'Café'
+    : lang === 'de' ? 'Kaffee' : lang === 'tr' ? 'Kahve' : lang === 'fa' ? 'قهوه' : 'Coffee';
+  const snack = lang === 'es' ? 'Bocadillo' : lang === 'fr' ? 'Snack' : lang === 'pt' ? 'Lanche'
+    : lang === 'de' ? 'Snack' : lang === 'tr' ? 'Atıştırmalık' : lang === 'fa' ? 'میان‌وعده' : 'Snack';
+  insertCategory(db, 'cat-express-food', food, '#F97316', '🍽️', 1);
+  insertCategory(db, 'cat-express-beverages', beverages, '#0EA5E9', '🥤', 2);
+  insertProduct(db, 'prod-express-meal', 'cat-express-food', meal, 150, 1);
+  insertProduct(db, 'prod-express-snack', 'cat-express-food', snack, 80, 2);
+  insertProduct(db, 'prod-express-tea', 'cat-express-beverages', tea, 25, 1);
+  insertProduct(db, 'prod-express-coffee', 'cat-express-beverages', coffee, 40, 2);
 
   if (serviceModel === 'finedine') {
     insertTable(db, 'tbl-express-1', 'T1', 4);
@@ -203,8 +223,7 @@ function seedExpressRestaurant(db: ReturnType<typeof getDatabase>, serviceModel:
 }
 
 function seedDemoRestaurant(db: ReturnType<typeof getDatabase>, serviceModel: string, language?: string, country?: string): void {
-  const lang: 'en' | 'es' | 'pt' = language === 'es' ? 'es' : language === 'pt' ? 'pt' : 'en';
-  const dialCode = dialCodeFor(country);
+  const lang = resolveSeedLanguage(language);
 
   const cats = lang === 'es'
     ? [
@@ -213,12 +232,40 @@ function seedDemoRestaurant(db: ReturnType<typeof getDatabase>, serviceModel: st
         ['cat-demo-beverages', 'Bebidas', '#45B7D1', '🥤', 3],
         ['cat-demo-desserts', 'Postres', '#96CEB4', '🍰', 4],
       ] as const
+    : lang === 'fr'
+    ? [
+        ['cat-demo-starters', 'Entrées', '#FF6B6B', '🍟', 1],
+        ['cat-demo-burger', 'Hamburgers', '#4ECDC4', '🍔', 2],
+        ['cat-demo-beverages', 'Boissons', '#45B7D1', '🥤', 3],
+        ['cat-demo-desserts', 'Desserts', '#96CEB4', '🍰', 4],
+      ] as const
     : lang === 'pt'
     ? [
         ['cat-demo-starters', 'Entradas', '#FF6B6B', '🍟', 1],
         ['cat-demo-burger', 'Hambúrgueres', '#4ECDC4', '🍔', 2],
         ['cat-demo-beverages', 'Bebidas', '#45B7D1', '🥤', 3],
         ['cat-demo-desserts', 'Sobremesas', '#96CEB4', '🍰', 4],
+      ] as const
+    : lang === 'de'
+    ? [
+        ['cat-demo-starters', 'Vorspeisen', '#FF6B6B', '🍟', 1],
+        ['cat-demo-burger', 'Burger', '#4ECDC4', '🍔', 2],
+        ['cat-demo-beverages', 'Getränke', '#45B7D1', '🥤', 3],
+        ['cat-demo-desserts', 'Desserts', '#96CEB4', '🍰', 4],
+      ] as const
+    : lang === 'tr'
+    ? [
+        ['cat-demo-starters', 'Başlangıçlar', '#FF6B6B', '🍟', 1],
+        ['cat-demo-main', 'Ana Yemekler', '#4ECDC4', '🍛', 2],
+        ['cat-demo-beverages', 'İçecekler', '#45B7D1', '🥤', 3],
+        ['cat-demo-desserts', 'Tatlılar', '#96CEB4', '🍰', 4],
+      ] as const
+    : lang === 'fa'
+    ? [
+        ['cat-demo-starters', 'پیش‌غذاها', '#FF6B6B', '🍟', 1],
+        ['cat-demo-main', 'غذاهای اصلی', '#4ECDC4', '🍛', 2],
+        ['cat-demo-beverages', 'نوشیدنی‌ها', '#45B7D1', '🥤', 3],
+        ['cat-demo-desserts', 'دسرها', '#96CEB4', '🍰', 4],
       ] as const
     : [
         ['cat-demo-starters', 'Starters', '#FF6B6B', '🍔', 1],
@@ -239,6 +286,17 @@ function seedDemoRestaurant(db: ReturnType<typeof getDatabase>, serviceModel: st
         ['prod-demo-agua', 'cat-demo-beverages', 'Agua Mineral', 200, 2],
         ['prod-demo-flan', 'cat-demo-desserts', 'Flan Casero', 400, 1],
       ] as const
+    : lang === 'fr'
+    ? [
+        ['prod-demo-quiche', 'cat-demo-starters', 'Quiche Lorraine', 280, 1],
+        ['prod-demo-frites', 'cat-demo-starters', 'Frites Maison', 250, 2],
+        ['prod-demo-burger', 'cat-demo-burger', 'Burger Classique', 800, 1],
+        ['prod-demo-burger-double', 'cat-demo-burger', 'Burger Double', 1100, 2],
+        ['prod-demo-burger-bbq', 'cat-demo-burger', 'Burger BBQ', 1200, 3],
+        ['prod-demo-citronnade', 'cat-demo-beverages', 'Citronnade', 350, 1],
+        ['prod-demo-eau', 'cat-demo-beverages', 'Eau Minérale', 200, 2],
+        ['prod-demo-mousse', 'cat-demo-desserts', 'Mousse au Chocolat', 400, 1],
+      ] as const
     : lang === 'pt'
     ? [
         ['prod-demo-coxinha', 'cat-demo-starters', 'Coxinha de Frango', 280, 1],
@@ -249,6 +307,39 @@ function seedDemoRestaurant(db: ReturnType<typeof getDatabase>, serviceModel: st
         ['prod-demo-refri', 'cat-demo-beverages', 'Refrigerante Cola', 350, 1],
         ['prod-demo-agua', 'cat-demo-beverages', 'Água Mineral', 200, 2],
         ['prod-demo-pudim', 'cat-demo-desserts', 'Pudim de Leite', 400, 1],
+      ] as const
+    : lang === 'de'
+    ? [
+        ['prod-demo-currywurst', 'cat-demo-starters', 'Currywurst', 280, 1],
+        ['prod-demo-kartoffelecken', 'cat-demo-starters', 'Kartoffelecken', 250, 2],
+        ['prod-demo-schnitzel', 'cat-demo-burger', 'Schnitzel', 800, 1],
+        ['prod-demo-bratwurst', 'cat-demo-burger', 'Bratwurst', 1100, 2],
+        ['prod-demo-burger', 'cat-demo-burger', 'Klassischer Burger', 1200, 3],
+        ['prod-demo-apfelschorle', 'cat-demo-beverages', 'Apfelschorle', 350, 1],
+        ['prod-demo-mineralwasser', 'cat-demo-beverages', 'Mineralwasser', 200, 2],
+        ['prod-demo-apfelstrudel', 'cat-demo-desserts', 'Apfelstrudel', 400, 1],
+      ] as const
+    : lang === 'tr'
+    ? [
+        ['prod-demo-patates', 'cat-demo-starters', 'Patates Kızartması', 280, 1],
+        ['prod-demo-sigara-boregi', 'cat-demo-starters', 'Sigara Böreği', 250, 2],
+        ['prod-demo-kofte', 'cat-demo-main', 'Izgara Köfte', 800, 1],
+        ['prod-demo-doner', 'cat-demo-main', 'Döner', 1100, 2],
+        ['prod-demo-burger', 'cat-demo-main', 'Klasik Burger', 1200, 3],
+        ['prod-demo-kola', 'cat-demo-beverages', 'Kola', 350, 1],
+        ['prod-demo-su', 'cat-demo-beverages', 'Maden Suyu', 200, 2],
+        ['prod-demo-baklava', 'cat-demo-desserts', 'Baklava', 400, 1],
+      ] as const
+    : lang === 'fa'
+    ? [
+        ['prod-demo-kashk', 'cat-demo-starters', 'کشک بادمجان', 280, 1],
+        ['prod-demo-sibzamini', 'cat-demo-starters', 'سیب‌زمینی سرخ‌کرده', 250, 2],
+        ['prod-demo-ghormeh', 'cat-demo-main', 'قرمه‌سبزی', 800, 1],
+        ['prod-demo-zereshk', 'cat-demo-main', 'زرشک‌پلو با مرغ', 1100, 2],
+        ['prod-demo-kebab', 'cat-demo-main', 'کباب کوبیده', 1200, 3],
+        ['prod-demo-doogh', 'cat-demo-beverages', 'دوغ', 350, 1],
+        ['prod-demo-water', 'cat-demo-beverages', 'آب معدنی', 200, 2],
+        ['prod-demo-sholeh', 'cat-demo-desserts', 'شله‌زرد', 400, 1],
       ] as const
     : [
         ['prod-demo-paneer-tikka', 'cat-demo-starters', 'Paneer Tikka', 250, 1],
@@ -270,27 +361,46 @@ function seedDemoRestaurant(db: ReturnType<typeof getDatabase>, serviceModel: st
     insertTable(db, 'tbl-demo-4', `${tableLabel}4`, 2);
   }
 
-  const demoCountry = country || (lang === 'es' ? 'AR' : lang === 'pt' ? 'BR' : 'IN');
+  // Default to setup country (IN) if unspecified; country is independent of UI language.
+  const demoCountry = country || 'IN';
+  const dialCode = dialCodeFor(demoCountry);
   if (lang === 'es') {
     insertCustomer(db, 'cust-demo-1', 'Juan Pérez', '1145678901', dialCode, demoCountry);
     insertCustomer(db, 'cust-demo-2', 'María González', '1145678902', dialCode, demoCountry);
     insertCustomer(db, 'cust-demo-3', 'Carlos Rodríguez', '1145678903', dialCode, demoCountry);
+  } else if (lang === 'fr') {
+    insertCustomer(db, 'cust-demo-1', 'Camille Martin', '+33145678901', dialCode, demoCountry);
+    insertCustomer(db, 'cust-demo-2', 'Julien Bernard', '+33145678902', dialCode, demoCountry);
+    insertCustomer(db, 'cust-demo-3', 'Sophie Dubois', '+33145678903', dialCode, demoCountry);
   } else if (lang === 'pt') {
     insertCustomer(db, 'cust-demo-1', 'João Silva', '1198765432', dialCode, demoCountry);
     insertCustomer(db, 'cust-demo-2', 'Maria Santos', '1198765433', dialCode, demoCountry);
     insertCustomer(db, 'cust-demo-3', 'Carlos Oliveira', '1198765434', dialCode, demoCountry);
+  } else if (lang === 'de') {
+    insertCustomer(db, 'cust-demo-1', 'Anna Müller', '15123456789', dialCode, demoCountry);
+    insertCustomer(db, 'cust-demo-2', 'Lukas Schneider', '15123456790', dialCode, demoCountry);
+    insertCustomer(db, 'cust-demo-3', 'Sophie Weber', '15123456791', dialCode, demoCountry);
+  } else if (lang === 'tr') {
+    insertCustomer(db, 'cust-demo-1', 'Ayşe Yılmaz', '5321234567', dialCode, demoCountry);
+    insertCustomer(db, 'cust-demo-2', 'Mehmet Kaya', '5321234568', dialCode, demoCountry);
+    insertCustomer(db, 'cust-demo-3', 'Elif Demir', '5321234569', dialCode, demoCountry);
+  } else if (lang === 'fa') {
+    insertCustomer(db, 'cust-demo-1', 'علی رضایی', '9121234567', dialCode, demoCountry);
+    insertCustomer(db, 'cust-demo-2', 'سارا محمدی', '9121234568', dialCode, demoCountry);
+    insertCustomer(db, 'cust-demo-3', 'مریم کریمی', '9121234569', dialCode, demoCountry);
   } else {
     insertCustomer(db, 'cust-demo-1', 'Aarav Sharma', '9876543210', dialCode, demoCountry);
     insertCustomer(db, 'cust-demo-2', 'Maya Iyer', '9876543211', dialCode, demoCountry);
     insertCustomer(db, 'cust-demo-3', 'Kabir Khan', '9876543212', dialCode, demoCountry);
   }
 
-  const managerName = lang === 'es' ? 'Gerente Demo' : lang === 'pt' ? 'Gerente Demo' : 'Demo Manager';
-  const cashierName = lang === 'es' ? 'Cajero Demo' : lang === 'pt' ? 'Caixa Demo' : 'Demo Cashier';
-  const chefName = lang === 'es' ? 'Cocinero Demo' : lang === 'pt' ? 'Cozinheiro Demo' : 'Demo Chef';
-  // Demo staff remains useful as localized sample rows, but must never ship with
-  // a reusable public credential. The inactive rows can be explicitly replaced
-  // by an owner during setup if staff access is wanted.
+  const managerName = lang === 'es' ? 'Gerente Demo' : lang === 'fr' ? 'Gérant Démo' : lang === 'pt' ? 'Gerente Demo'
+    : lang === 'de' ? 'Demo-Manager' : lang === 'tr' ? 'Demo Müdürü' : lang === 'fa' ? 'مدیر نمایشی' : 'Demo Manager';
+  const cashierName = lang === 'es' ? 'Cajero Demo' : lang === 'fr' ? 'Caissier Démo' : lang === 'pt' ? 'Caixa Demo'
+    : lang === 'de' ? 'Demo-Kassierer' : lang === 'tr' ? 'Demo Kasiyer' : lang === 'fa' ? 'صندوقدار نمایشی' : 'Demo Cashier';
+  const chefName = lang === 'es' ? 'Cocinero Demo' : lang === 'fr' ? 'Chef Démo' : lang === 'pt' ? 'Cozinheiro Demo'
+    : lang === 'de' ? 'Demo-Koch' : lang === 'tr' ? 'Demo Aşçı' : lang === 'fa' ? 'آشپز نمایشی' : 'Demo Chef';
+  // Demo staff accounts are inactive with random passwords to prevent usable default credentials.
   insertStaffUser(db, 'user-demo-manager', managerName, 'manager@flo.local', 'manager', randomBytes(32).toString('hex'), 0);
   insertStaffUser(db, 'user-demo-cashier', cashierName, 'cashier@flo.local', 'cashier', randomBytes(32).toString('hex'), 0);
   insertStaffUser(db, 'user-demo-chef', chefName, 'chef@flo.local', 'chef', randomBytes(32).toString('hex'), 0);
@@ -298,7 +408,7 @@ function seedDemoRestaurant(db: ReturnType<typeof getDatabase>, serviceModel: st
 
 export function seedSetupProfile(db: ReturnType<typeof getDatabase>, profile: string, serviceModel: string, language?: string, country?: string): void {
   if (profile === 'express') {
-    seedExpressRestaurant(db, serviceModel);
+    seedExpressRestaurant(db, serviceModel, language);
   } else if (profile === 'demo') {
     seedDemoRestaurant(db, serviceModel, language, country);
   }
@@ -319,6 +429,9 @@ function requireLocalSetup(req: Request, res: Response): boolean {
 const loginAttempts = new Map<string, { count: number; lockedUntil: number }>();
 const MAX_ATTEMPTS = 5;
 const LOCKOUT_MINUTES = 15;
+const passwordChangeAttempts = new Map<string, { count: number; lockedUntil: number }>();
+const PASSWORD_CHANGE_MAX_ATTEMPTS = 5;
+const PASSWORD_CHANGE_LOCKOUT_MINUTES = 5;
 
 function checkRateLimit(ip: string): { allowed: boolean; waitMinutes?: number } {
   const nowMs = Date.now();
@@ -350,6 +463,32 @@ function incrementFailedLogin(ip: string): number {
 
 function resetSuccessfulLogin(ip: string) {
   loginAttempts.delete(ip);
+}
+
+function checkPasswordChangeRateLimit(userId: string): { allowed: boolean; waitMinutes?: number } {
+  const nowMs = Date.now();
+  const record = passwordChangeAttempts.get(userId);
+  if (record?.lockedUntil && record.lockedUntil > nowMs) {
+    return { allowed: false, waitMinutes: Math.ceil((record.lockedUntil - nowMs) / 60000) };
+  }
+  if (record?.lockedUntil && record.lockedUntil <= nowMs) {
+    passwordChangeAttempts.delete(userId);
+  }
+  return { allowed: true };
+}
+
+function incrementFailedPasswordChange(userId: string): number {
+  const record = passwordChangeAttempts.get(userId) || { count: 0, lockedUntil: 0 };
+  record.count += 1;
+  if (record.count >= PASSWORD_CHANGE_MAX_ATTEMPTS) {
+    record.lockedUntil = Date.now() + PASSWORD_CHANGE_LOCKOUT_MINUTES * 60000;
+  }
+  passwordChangeAttempts.set(userId, record);
+  return Math.max(0, PASSWORD_CHANGE_MAX_ATTEMPTS - record.count);
+}
+
+function resetPasswordChangeRateLimit(userId: string): void {
+  passwordChangeAttempts.delete(userId);
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -394,7 +533,7 @@ router.post('/login', authRateLimit(), asyncHandler(async (req: Request, res: Re
 
     const remember = !!rememberMe;
     const token = jwt.sign(
-      { userId: user.id, email: user.email, role: user.role, remember, jti: uuidv4() },
+      { userId: user.id, email: user.email, role: user.role, remember, jti: randomUUID() },
       getJWTSecret(),
       { expiresIn: expiresInFor(remember) }
     );
@@ -450,7 +589,7 @@ router.post('/tenants/select', (req: Request, res: Response) => {
     // Re-issue token with tenant context embedded (same payload — desktop is single-tenant)
     const remember = !!decoded.remember;
     const newToken = jwt.sign(
-      { userId: user.id, email: user.email, role: user.role, tenantId: 1, remember, jti: uuidv4() },
+      { userId: user.id, email: user.email, role: user.role, tenantId: 1, remember, jti: randomUUID() },
       getJWTSecret(),
       { expiresIn: expiresInFor(remember) }
     );
@@ -507,7 +646,7 @@ router.post('/refresh', (req: Request, res: Response) => {
 
     const remember = !!decoded.remember;
     const newToken = jwt.sign(
-      { userId: decoded.userId, email: decoded.email, role: decoded.role, tenantId: decoded.tenantId, remember, jti: uuidv4() },
+      { userId: decoded.userId, email: decoded.email, role: decoded.role, tenantId: decoded.tenantId, remember, jti: randomUUID() },
       getJWTSecret(),
       { expiresIn: expiresInFor(remember) }
     );
@@ -557,7 +696,7 @@ router.get('/me', (req: Request, res: Response) => {
 
 // ── POST /api/auth/password/change ────────────────────────────────────────────
 
-router.post('/password/change', (req: Request, res: Response) => {
+router.post('/password/change', authRateLimit(), (req: Request, res: Response) => {
   try {
     const { current_password, password } = req.body || {};
     const authHeader = req.headers.authorization;
@@ -579,6 +718,13 @@ router.post('/password/change', (req: Request, res: Response) => {
       return res.status(401).json({ error: 'Invalid token' });
     }
 
+    const passwordChangeRateLimit = checkPasswordChangeRateLimit(user.id);
+    if (!passwordChangeRateLimit.allowed) {
+      return res.status(429).json({
+        error: `Too many password change attempts. Try again in ${passwordChangeRateLimit.waitMinutes} minutes.`,
+      });
+    }
+
     if (typeof current_password !== 'string' || !current_password) {
       return res.status(400).json({ error: 'Current password is required' });
     }
@@ -586,8 +732,14 @@ router.post('/password/change', (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Password is required' });
     }
     if (!bcrypt.compareSync(current_password, user.password)) {
-      return res.status(400).json({ error: 'Current password is incorrect' });
+      const attemptsRemaining = incrementFailedPasswordChange(user.id);
+      return res.status(400).json({
+        error: 'Current password is incorrect',
+        attempts_remaining: attemptsRemaining,
+        lockout_minutes: attemptsRemaining === 0 ? PASSWORD_CHANGE_LOCKOUT_MINUTES : undefined,
+      });
     }
+    resetPasswordChangeRateLimit(user.id);
     if (!validatePassword(password)) {
       return res.status(400).json({ error: 'Password must be at least 8 characters long and contain at least one uppercase letter, one lowercase letter, and one number.' });
     }
@@ -606,21 +758,7 @@ router.post('/password/change', (req: Request, res: Response) => {
 });
 
 // ── POST /api/auth/recover-password ───────────────────────────────────────────
-// Local, unauthenticated-but-PIN-gated recovery for a locked-out owner (#127).
-//
-// Deliberately does NOT require a JWT/session — that's the whole point: the
-// owner has no working credentials. Local proof of ownership is the Master
-// PIN instead (see main/services/master-pin.ts). When no active owner remains,
-// this endpoint restores owner role to one active account. It can never create,
-// reinitialize, or wipe anything — that stays behind /api/db-tools/initialize
-// (owner session + Master PIN + explicit confirmation phrase).
-//
-// No remote backdoor: nothing here lets a Flo cloud server or anyone without
-// physical/local access to this machine set the password. See #128 for the
-// signup-time copy explaining this to the owner, and the scope note in this
-// PR for why the optional cloud/email identity-verification tier described in
-// the issue is intentionally NOT implemented here (no cloud server exists in
-// this repo to issue the short-lived signed grant safely).
+// Local password recovery for locked-out owner gated by Master PIN; requires no active JWT.
 
 router.post('/recover-password', authRateLimit(), (req: Request, res: Response) => {
   try {
@@ -643,9 +781,7 @@ router.post('/recover-password', authRateLimit(), (req: Request, res: Response) 
       return res.status(400).json({ error: 'Password must be at least 8 characters long and contain at least one uppercase letter, one lowercase letter, and one number.' });
     }
 
-    // Rate-limit key is IP-scoped only (not email-scoped) so an attacker can't
-    // reset the Master PIN attempt counter simply by guessing a different
-    // email address on each request.
+    // Rate-limit key is IP-scoped to prevent resetting attempt counters with varying emails.
     const ip = req.ip || req.socket.remoteAddress || 'unknown';
     const pinResult = authorizeMasterPin(master_pin, `auth:recover-password:${ip}`);
     if (!pinResult.ok) {
@@ -682,11 +818,7 @@ router.post('/recover-password', authRateLimit(), (req: Request, res: Response) 
     }
     invalidateUserAuthCache(user.id);
 
-    // Local audit trail — this codebase has no dedicated audit-events table,
-    // so we follow its existing convention: a tagged console log (grep-able
-    // in the app's log file) plus a timestamp/identity pair in `settings`,
-    // the same generic key/value mechanism already used for e.g.
-    // `telemetry_last_ping_at`.
+    // Record recovery timestamp and user ID in settings table for audit purposes.
     upsertSettings(db, {
       last_password_recovery_at: now(),
       last_password_recovery_user_id: String(user.id),
@@ -735,9 +867,7 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
   try {
     if (!requireLocalSetup(req, res)) return;
 
-    // Guard the disabled-setup state before any payload validation: once an
-    // owner exists this endpoint must always answer 403, and an invalid field
-    // (e.g. a bad timezone) must not downgrade that to a 400.
+    // Reject request if setup is already complete before running payload validation.
     const db = getDatabase();
     if (getUserCount(db) > 0) {
       return res.status(403).json({ error: 'Setup already complete. This endpoint is disabled.' });
@@ -775,7 +905,10 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
     const normalizedBusinessType = String(business_type || 'restaurant').trim();
     const normalizedSetupProfile = String(setup_profile || 'express').trim().toLowerCase();
     const normalizedServiceModel = String(service_model || 'qsr').trim().toLowerCase();
-    const normalizedCurrency = String(currency || 'INR').trim().toUpperCase();
+    const normalizedCurrency = typeof currency === 'string' ? currency.trim().toUpperCase() : currency;
+    if (!isSyntacticallyValidCurrencyCode(normalizedCurrency)) {
+      return res.status(400).json({ error: 'Invalid currency' });
+    }
     if (!isValidTimeZone(timezone)) {
       return res.status(400).json({ error: 'Invalid timezone' });
     }
@@ -823,8 +956,7 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Invalid service model' });
     }
 
-    // Cloud v2 registers the POS automatically on first boot. There is no
-    // pending/claim step, so new installs start with cloud coordination on.
+    // New installs start with cloud coordination enabled.
     const cloudSyncEnabled = true;
     let normalizedCloudServerUrl: string | undefined;
     if (cloudSyncEnabled) {
@@ -838,9 +970,7 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
     let userId = '';
     const hashedPassword = bcrypt.hashSync(password, 10);
 
-    // Persist the external Master PIN before committing the owner transaction.
-    // A keyring/filesystem failure must leave setup retryable rather than
-    // returning 500 after the database already contains an owner.
+    // Save Master PIN before committing user transaction so keyring errors leave setup retryable.
     if (masterPinRequired) {
       setMasterPin(String(master_pin));
     }
@@ -856,7 +986,7 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
         throw new Error('User with this email already exists');
       }
 
-      userId = uuidv4();
+      userId = randomUUID();
       db.prepare(`
         INSERT INTO users (id, name, email, password, role, is_active, terms_accepted_at, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -883,10 +1013,7 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
         service_model: normalizedServiceModel,
         setup_profile: normalizedSetupProfile,
         onboarding_completed: 'true',
-        // Completing setup is not by itself a country choice: the wizard
-        // preselects IN and submits it whether or not the picker was touched.
-        // Only a country that differs from the seeded default — or a client
-        // that reports the selection outright — counts.
+        // Confirm country if user explicitly selected it or differed from default.
         ...countryConfirmationPatch(country, getSettingValue('country'), req.body.country_selected),
         anonymous_data_consent: 'true',
         telemetry_enabled: 'true',
@@ -904,10 +1031,7 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
       seedSetupProfile(db, normalizedSetupProfile, normalizedServiceModel, language, country);
     })();
 
-    // Pick up the cloud settings just written without requiring a restart —
-    // mirrors PUT /api/settings/cloud's own reload() call. Cloud coordination
-    // is best-effort: a network/profile failure must not make a completed local
-    // setup appear to have failed.
+    // Reload cloud sync and registration profile immediately after setup.
     try {
       cloudSync.reload();
     } catch (error) {
@@ -920,7 +1044,7 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
     }
 
     const token = jwt.sign(
-      { userId, email, role: INITIAL_ADMIN_ROLE, jti: uuidv4() },
+      { userId, email, role: INITIAL_ADMIN_ROLE, jti: randomUUID() },
       getJWTSecret(),
       { expiresIn: JWT_EXPIRES_IN }
     );
@@ -946,8 +1070,7 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
 });
 
 // ── POST /api/auth/setup/seed ───────────────────────────────────────────────────
-// Legacy endpoint retained only to return a clear error. First-run setup must
-// create the owner through /setup/initialize and pass the selected seed profile.
+// Legacy endpoint retained to direct callers to /api/auth/setup/initialize.
 
 router.post('/setup/seed', (req: Request, res: Response) => {
   res.status(410).json({ error: 'Use /api/auth/setup/initialize with setup_profile and owner details.' });

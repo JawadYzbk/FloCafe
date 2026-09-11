@@ -1,11 +1,4 @@
-/**
- * PrinterService — WebUSB ESC/POS thermal printer driver.
- *
- * Real usage (WebUSB):  await printerService.connect();
- *                        await printerService.print(bytes);
- *
- * Browser fallback:     Use window.print() with thermal-optimized CSS
- */
+/** WebUSB ESC/POS thermal printer driver with browser print fallback. */
 
 export type PrinterStatus =
   | 'disconnected'
@@ -69,57 +62,43 @@ class PrinterService {
     return () => this.listeners.delete(listener);
   }
 
-  /**
-   * Opens the browser's USB device picker and connects to a thermal printer.
-   * Must be called from a user-gesture handler (click, etc.).
-   */
-  async connect(): Promise<void> {
-    if (this._printMode === 'browser') {
-      return;
-    }
+  private static readonly DEVICE_FILTERS: USBDeviceFilter[] = [
+    { classCode: ESCPOS_USB_CLASS },
+    { vendorId: 0x0483 },
+    { vendorId: 0x04b8 },
+    { vendorId: 0x0519 },
+    { vendorId: 0x0dd4 },
+    { vendorId: 0x1504 },
+    { vendorId: 0x1a86 },
+    { vendorId: 0x1fc9 },
+    { vendorId: 0x20d1 },
+    { vendorId: 0x2109 },
+    { vendorId: 0x22e0 },
+    { vendorId: 0x2e8d },
+    { vendorId: 0x37b9 },
+    { vendorId: 0x41c9 },
+    { vendorId: 0x4d42 },
+    { vendorId: 0x5255 },
+    { vendorId: 0x525a },
+    { vendorId: 0x0fe6 },
+    { vendorId: 0x1b24 },
+    { vendorId: 0x0922 },
+  ];
 
-    if (!navigator.usb) {
-      throw new Error(
-        'WebUSB API is not supported in this browser. Use Chrome or Edge 89+.'
-      );
-    }
-
-    this.setStatus('connecting');
-
-    try {
-      this.device = await navigator.usb.requestDevice({
-        filters: [
-          { classCode: ESCPOS_USB_CLASS },
-          { vendorId: 0x0483 },
-          { vendorId: 0x04b8 },
-          { vendorId: 0x0519 },
-          { vendorId: 0x0dd4 },
-          { vendorId: 0x1504 },
-          { vendorId: 0x1a86 },
-          { vendorId: 0x1fc9 },
-          { vendorId: 0x20d1 },
-          { vendorId: 0x2109 },
-          { vendorId: 0x22e0 },
-          { vendorId: 0x2e8d },
-          { vendorId: 0x37b9 },
-          { vendorId: 0x41c9 },
-          { vendorId: 0x4d42 },
-          { vendorId: 0x5255 },
-          { vendorId: 0x525a },
-          { vendorId: 0x0fe6 },
-          { vendorId: 0x1b24 },
-          { vendorId: 0x0922 },
-        ],
-      });
-    } catch (err: unknown) {
-      if (err instanceof DOMException && err.name === 'NotFoundError') {
-        this.setStatus('disconnected');
+  /** Opens (or re-opens) a device and claims its ESC/POS interface. */
+  private async openDevice(device: USBDevice): Promise<void> {
+    if (this.device) {
+      // Check if this is the exact same physical device.
+      const sameDevice = this.device.vendorId === device.vendorId
+        && this.device.productId === device.productId
+        && this.device.serialNumber === device.serialNumber;
+      if (sameDevice) {
         return;
       }
-      this.setStatus('error');
-      throw new Error(`USB device selection failed: ${(err as Error).message}`);
+      // Release claim/interface on the previously connected device before switching.
+      await this.disconnect();
     }
-
+    this.device = device;
     try {
       await this.device.open();
 
@@ -157,6 +136,81 @@ class PrinterService {
     navigator.usb.addEventListener('disconnect', this.handleDisconnect);
   }
 
+  // Serializes openDevice() to prevent concurrent mutations of device/interface state.
+  private connectLock: Promise<unknown> = Promise.resolve();
+
+  private async runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const previous = this.connectLock.catch(() => undefined);
+    const run = previous.then(fn, fn);
+    this.connectLock = run.catch(() => undefined);
+    return run;
+  }
+
+  /** Opens the browser's USB device picker and connects to a thermal printer. */
+  async connect(): Promise<void> {
+    if (this._printMode === 'browser') {
+      return;
+    }
+
+    if (!navigator.usb) {
+      throw new Error(
+        'WebUSB API is not supported in this browser. Use Chrome or Edge 89+.'
+      );
+    }
+
+    this.setStatus('connecting');
+
+    let device: USBDevice;
+    try {
+      device = await navigator.usb.requestDevice({ filters: PrinterService.DEVICE_FILTERS });
+    } catch (err: unknown) {
+      // Don't overwrite an existing connection if this request was cancelled or failed.
+      if (err instanceof DOMException && err.name === 'NotFoundError') {
+        if (!this.device) this.setStatus('disconnected');
+        return;
+      }
+      if (!this.device) this.setStatus('error');
+      throw new Error(`USB device selection failed: ${(err as Error).message}`);
+    }
+
+    await this.runExclusive(() => this.openDevice(device));
+  }
+
+  private reconnectPromise: Promise<boolean> | null = null;
+
+  /** Silently re-attaches to a printer granted permission in a previous session. */
+  async tryReconnect(): Promise<boolean> {
+    if (this.reconnectPromise) return this.reconnectPromise;
+    if (this._printMode === 'browser' || this.device || !navigator.usb) {
+      return false;
+    }
+    this.reconnectPromise = this.runExclusive(async () => {
+      // Re-check after acquiring the lock: a concurrent connect() may have
+      // already opened a device while this call was waiting its turn.
+      if (this.device) return true;
+      try {
+        const devices = await navigator.usb!.getDevices();
+        const previouslyGranted = devices[0];
+        if (!previouslyGranted) return false;
+        this.setStatus('connecting');
+        await this.openDevice(previouslyGranted);
+        return true;
+      } catch (err) {
+        console.warn('[PrinterService] Silent reconnect failed:', err);
+        this.setStatus('disconnected');
+        return false;
+      }
+    }).finally(() => {
+      this.reconnectPromise = null;
+    });
+    return this.reconnectPromise;
+  }
+
+  /** Waits for an in-flight silent reconnect to settle before caller checks connection. */
+  async awaitPendingReconnect(): Promise<void> {
+    if (this.reconnectPromise) await this.reconnectPromise;
+  }
+
   async disconnect(): Promise<void> {
     navigator.usb?.removeEventListener('disconnect', this.handleDisconnect);
 
@@ -180,10 +234,7 @@ class PrinterService {
     this.setStatus('disconnected');
   }
 
-  /**
-   * Send raw ESC/POS bytes to the printer via WebUSB.
-   * Throws if not connected or in browser print mode.
-   */
+  /** Send raw ESC/POS bytes to the printer via WebUSB. */
   async print(data: Uint8Array): Promise<void> {
     if (this._printMode === 'browser') {
       throw new Error('Browser print mode is active. Use window.print() instead.');
@@ -194,8 +245,7 @@ class PrinterService {
     }
 
     try {
-      // Copy to a fresh ArrayBuffer covering exactly the encoder's bytes,
-      // which avoids sending garbage if the Uint8Array is a subarray view.
+      // Copy to fresh ArrayBuffer to avoid subarray view issues.
       const buf = new Uint8Array(data).buffer as ArrayBuffer;
       await this.device.transferOut(this.endpointOut, buf);
     } catch (err) {
@@ -203,11 +253,7 @@ class PrinterService {
     }
   }
 
-  /**
-   * Print using browser's print dialog with thermal-optimized styles.
-   * @param htmlContent - The HTML to print
-   * @param paperWidth - Paper width in mm (58 or 80)
-   */
+  /** Print using browser's print dialog with thermal-optimized styles. */
   async printViaBrowser(htmlContent: string, paperWidth: 58 | 80): Promise<void> {
     const printWindow = window.open('', '_blank');
     if (!printWindow) {
@@ -237,8 +283,7 @@ class PrinterService {
     `;
     printWindow.document.head.appendChild(style);
 
-    // Parse receipt markup in an inert document, then remove executable and
-    // javascript-bearing nodes before importing it into the print window.
+    // Parse receipt markup and strip executable/script nodes before printing.
     const parsed = new DOMParser().parseFromString(htmlContent, 'text/html');
     parsed.querySelectorAll('script, link, meta, base, iframe, object, embed, form').forEach((node) => node.remove());
     parsed.querySelectorAll('*').forEach((element) => {

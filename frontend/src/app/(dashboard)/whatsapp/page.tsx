@@ -20,6 +20,7 @@ import { usePosSettingsStore } from '@/store/pos-settings';
 import { useFormatDate } from '@/hooks/useFormatDate';
 import { dialCodeFor, parsePhone } from '@/lib/phone';
 import { Ltr } from '@/components/layout/Ltr';
+import { ROLE_ACCESS, hasRole } from '@shared/role-permissions';
 
 interface WhatsAppStatus {
   enabled: boolean;
@@ -162,11 +163,7 @@ function StatusStepper({ status }: { status: string }) {
   );
 }
 
-/**
- * Translate a backend lastError by its reason code. Falls back to the raw
- * English message when no reason is set (legacy / unknown), then to the
- * localized generic cooldown line if the raw is also empty.
- */
+/** Translates backend lastError by reason code, falling back to raw message. */
 function translateLastError(
   reason: string | null | undefined,
   raw: string | null | undefined,
@@ -206,8 +203,7 @@ export default function WhatsAppPage() {
   const { confirm, ConfirmDialog } = useConfirm();
   const setWhatsappEnabled = usePosSettingsStore((s) => s.setWhatsappEnabled);
   const { currentTenant } = useAuthStore();
-  const role = currentTenant?.role ?? '';
-  const isAdmin = role === 'owner' || role === 'manager';
+  const isAdmin = hasRole(currentTenant?.role, ROLE_ACCESS.ownerManager);
   const { formatDateTime: fmt, formatTime: fmtClock } = useFormatDate();
 
   const tenantCountry = currentTenant?.country || '';
@@ -233,12 +229,7 @@ export default function WhatsAppPage() {
   const [blockPhone, setBlockPhone] = useState('');
   const [blockReason, setBlockReason] = useState('');
 
-  // The user's chosen tab, or null if they have never clicked one. Persisted
-  // in localStorage so the choice survives remounts — previously this was two
-  // parallel useState + two localStorage keys (`tab` + `tabInitialized`) and
-  // a remount could reset the flag to false and bounce the user from Inbox
-  // back to Sent. Collapsed to one nullable string: null = never picked =
-  // fall through to the connection-state default below.
+  // Selected tab persisted in localStorage; null falls back to connection-state default.
   const [userTab, setUserTab] = useState<string | null>(() => {
     if (typeof window === 'undefined') return null;
     return window.localStorage.getItem('whatsapp.activeTab');
@@ -255,7 +246,8 @@ export default function WhatsAppPage() {
     }
   }, []);
 
-  const effectiveTab = userTab ?? (status?.state === 'connected' ? 'sent' : 'connection');
+  const defaultTab = status?.state === 'connected' ? 'sent' : 'connection';
+  const effectiveTab = (userTab === 'inbox' && !isAdmin) ? defaultTab : userTab ?? defaultTab;
   const onTabChange = (v: string) => {
     setUserTab(v);
     if (typeof window !== 'undefined') window.localStorage.setItem('whatsapp.activeTab', v);
@@ -289,11 +281,12 @@ export default function WhatsAppPage() {
   }, []);
 
   const refreshInbox = useCallback(async () => {
+    if (!isAdmin) return;
     try {
       const { data } = await api.get('/whatsapp/inbox', { params: { limit: 100 } });
       setInbox(data.messages ?? []);
     } catch { /* ignore */ }
-  }, []);
+  }, [isAdmin]);
 
   const refreshBlocklist = useCallback(async () => {
     if (!isAdmin) return;
@@ -466,7 +459,9 @@ export default function WhatsAppPage() {
       <Tabs value={effectiveTab} onValueChange={onTabChange}>
         <TabsList>
           <TabsTrigger value="sent"><Send className="size-4" /> {tTabs('sent')}</TabsTrigger>
-          <TabsTrigger value="inbox"><Inbox className="size-4" /> {tTabs('inbox')}</TabsTrigger>
+          {isAdmin && (
+            <TabsTrigger value="inbox"><Inbox className="size-4" /> {tTabs('inbox')}</TabsTrigger>
+          )}
           <TabsTrigger value="connection"><QrCode className="size-4" /> {tTabs('connection')}</TabsTrigger>
         </TabsList>
 
@@ -499,7 +494,7 @@ export default function WhatsAppPage() {
                       <div className="grid gap-4 md:grid-cols-2">
                         <div className="rounded-lg border bg-card p-4 flex flex-col gap-3">
                           <div className="flex items-center gap-2">
-                            <div className="flex items-center justify-center size-9 rounded-md bg-brand-light text-brand">
+                            <div className="flex items-center justify-center size-9 rounded-md bg-brand-light dark:bg-[var(--color-brand-light)] text-brand dark:text-indigo-300">
                               <QrCode className="size-5" />
                             </div>
                             <h3 className="font-semibold text-sm">{tConnect('qrMethodTitle')}</h3>
@@ -518,7 +513,7 @@ export default function WhatsAppPage() {
 
                         <div className="rounded-lg border bg-card p-4 flex flex-col gap-3">
                           <div className="flex items-center gap-2">
-                            <div className="flex items-center justify-center size-9 rounded-md bg-brand-light text-brand">
+                            <div className="flex items-center justify-center size-9 rounded-md bg-brand-light dark:bg-[var(--color-brand-light)] text-brand dark:text-indigo-300">
                               <KeyRound className="size-5" />
                             </div>
                             <h3 className="font-semibold text-sm">{tConnect('pairingMethodTitle')}</h3>
@@ -551,7 +546,7 @@ export default function WhatsAppPage() {
                       <div className="space-y-2">
                         <p className="text-sm text-muted-foreground">{tConnect('qrInstruction')}</p>
                         {qrDataUrl ? (
-                          <div className="rounded-md border p-3 inline-block bg-white">
+                          <div className="rounded-md border p-3 inline-block bg-card">
                             <img src={qrDataUrl} alt={tTabs('connection')} className="w-64 h-64" />
                           </div>
                         ) : (
@@ -653,7 +648,7 @@ export default function WhatsAppPage() {
                   <CardContent className="space-y-3">
                     <div className="flex flex-wrap gap-2 items-end">
                       <div className="flex-1 min-w-[180px]">
-                        <label className="text-xs text-gray-500">{tBlocklist('phoneLabel')}</label>
+                        <label className="text-xs text-muted-foreground">{tBlocklist('phoneLabel')}</label>
                         <Input
                           value={blockPhone}
                           onChange={(e) => setBlockPhone(e.target.value)}
@@ -663,13 +658,13 @@ export default function WhatsAppPage() {
                         />
                       </div>
                       <div className="flex-1 min-w-[180px]">
-                        <label className="text-xs text-gray-500">{tBlocklist('reasonLabel')}</label>
+                        <label className="text-xs text-muted-foreground">{tBlocklist('reasonLabel')}</label>
                         <Input value={blockReason} onChange={(e) => setBlockReason(e.target.value)} placeholder={tBlocklist('reasonPlaceholder')} />
                       </div>
                       <Button onClick={addBlock}>{tBlocklist('addCta')}</Button>
                     </div>
                     {blocklist.length === 0 ? (
-                      <p className="text-sm text-gray-500">{tBlocklist('empty')}</p>
+                      <p className="text-sm text-muted-foreground">{tBlocklist('empty')}</p>
                     ) : (
                       <Table>
                         <TableHeader>
@@ -684,8 +679,8 @@ export default function WhatsAppPage() {
                           {blocklist.map((b) => (
                             <TableRow key={b.phone_e164}>
                               <TableCell className="font-mono text-sm"><Ltr>{b.phone_e164}</Ltr></TableCell>
-                              <TableCell className="text-sm text-gray-600">{b.reason ?? '—'}</TableCell>
-                              <TableCell className="text-sm text-gray-600">{fmt(b.blocked_at)}</TableCell>
+                              <TableCell className="text-sm text-muted-foreground">{b.reason ?? '—'}</TableCell>
+                              <TableCell className="text-sm text-muted-foreground">{fmt(b.blocked_at)}</TableCell>
                               <TableCell><Button size="sm" variant="ghost" onClick={() => removeBlock(b.phone_e164)}>{tBlocklist('removeCta')}</Button></TableCell>
                             </TableRow>
                           ))}
@@ -765,65 +760,67 @@ export default function WhatsAppPage() {
           </Card>
         </TabsContent>
 
-        <TabsContent value="inbox" className="space-y-2">
-          <Card>
-            <CardHeader>
-              <CardTitle>{tInbox('title')}</CardTitle>
-              <CardDescription>{tInbox('description')}</CardDescription>
-            </CardHeader>
-            <CardContent>
-              {inbox.length === 0 ? (
-                <div className="flex flex-col items-center justify-center py-10 text-center text-sm text-muted-foreground">
-                  <Inbox className="size-8 mb-2 opacity-40" />
-                  <p className="font-medium text-foreground">{tInbox('empty')}</p>
-                  <p className="mt-1 max-w-sm">{tInbox('emptyHint')}</p>
-                </div>
-              ) : (
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>{tSent('colWhen')}</TableHead>
-                      <TableHead>{tSent('colPhone')}</TableHead>
-                      <TableHead>{tSent('colBody')}</TableHead>
-                      <TableHead></TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {inbox.map((m) => {
-                      const isBlocked = blocklist.some((b) => b.phone_e164 === m.phone_e164);
-                      return (
-                        <TableRow key={m.id}>
-                          <TableCell className="text-xs text-muted-foreground whitespace-nowrap">{fmt(m.queued_at)}</TableCell>
-                          <TableCell className="font-mono text-xs">
-                            <button
-                              type="button"
-                              onClick={() => copyToClipboard(m.phone_e164, m.phone_e164)}
-                              className="inline-flex items-center gap-1 hover:text-foreground transition-colors cursor-pointer"
-                              title={tInbox('copyPhone')}
-                            >
-                              <Copy className="size-3 opacity-0 group-hover:opacity-100" />
-                              <Ltr>{m.phone_e164}</Ltr>
-                            </button>
-                          </TableCell>
-                          <TableCell className="text-sm whitespace-pre-line break-words max-w-md">{m.body}</TableCell>
-                          <TableCell>
-                            {isBlocked ? (
-                              <Badge variant="secondary">{tInbox('blocked')}</Badge>
-                            ) : (
-                              <Button size="sm" variant="outline" onClick={() => blockFromInbox(m.phone_e164)}>
-                                <Ban className="size-3" /> {tInbox('blockCta')}
-                              </Button>
-                            )}
-                          </TableCell>
-                        </TableRow>
-                      );
-                    })}
-                  </TableBody>
-                </Table>
-              )}
-            </CardContent>
-          </Card>
-        </TabsContent>
+        {isAdmin && (
+          <TabsContent value="inbox" className="space-y-2">
+            <Card>
+              <CardHeader>
+                <CardTitle>{tInbox('title')}</CardTitle>
+                <CardDescription>{tInbox('description')}</CardDescription>
+              </CardHeader>
+              <CardContent>
+                {inbox.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center py-10 text-center text-sm text-muted-foreground">
+                    <Inbox className="size-8 mb-2 opacity-40" />
+                    <p className="font-medium text-foreground">{tInbox('empty')}</p>
+                    <p className="mt-1 max-w-sm">{tInbox('emptyHint')}</p>
+                  </div>
+                ) : (
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead>{tSent('colWhen')}</TableHead>
+                        <TableHead>{tSent('colPhone')}</TableHead>
+                        <TableHead>{tSent('colBody')}</TableHead>
+                        <TableHead></TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {inbox.map((m) => {
+                        const isBlocked = blocklist.some((b) => b.phone_e164 === m.phone_e164);
+                        return (
+                          <TableRow key={m.id}>
+                            <TableCell className="text-xs text-muted-foreground whitespace-nowrap">{fmt(m.queued_at)}</TableCell>
+                            <TableCell className="font-mono text-xs">
+                              <button
+                                type="button"
+                                onClick={() => copyToClipboard(m.phone_e164, m.phone_e164)}
+                                className="inline-flex items-center gap-1 hover:text-foreground transition-colors cursor-pointer"
+                                title={tInbox('copyPhone')}
+                              >
+                                <Copy className="size-3 opacity-0 group-hover:opacity-100" />
+                                <Ltr>{m.phone_e164}</Ltr>
+                              </button>
+                            </TableCell>
+                            <TableCell className="text-sm whitespace-pre-line break-words max-w-md">{m.body}</TableCell>
+                            <TableCell>
+                              {isBlocked ? (
+                                <Badge variant="secondary">{tInbox('blocked')}</Badge>
+                              ) : (
+                                <Button size="sm" variant="outline" onClick={() => blockFromInbox(m.phone_e164)}>
+                                  <Ban className="size-3" /> {tInbox('blockCta')}
+                                </Button>
+                              )}
+                            </TableCell>
+                          </TableRow>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
+                )}
+              </CardContent>
+            </Card>
+          </TabsContent>
+        )}
       </Tabs>
 
       {status?.lastError && status.state !== 'cooldown' && (

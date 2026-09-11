@@ -11,15 +11,20 @@ import {
   formatReceipt,
   formatKOT,
   buildEscPos,
+  resolveCurrencyPrefix,
   buildTestPage,
   escPosToText,
   detectConnectedPrinters,
   printViaUSB,
   printViaNetwork,
   classifyPrintFailure,
+  appendCashDrawerPulse,
+  hasFinancialPrintWarning,
+  makeFinancialPrintRefusalMessage,
 } from '../main/printers/thermal';
 import { matchSupportedPrinterProfile } from '../main/printers/profiles';
 import { getCountryByCode, getCurrencySymbol } from '../main/countries';
+import { GENERIC_THERMAL_CAPABILITIES } from '../shared/print/thermal-capabilities';
 
 const ESC = 0x1b;
 const GS = 0x1d;
@@ -92,13 +97,17 @@ function loadWarningsToastWithCapture(captured: string[]): typeof import('../fro
   };
   const toastPath = require.resolve('react-hot-toast', { paths: [path.resolve(__dirname, '../frontend')] });
   const previousToastModule = require.cache[toastPath];
+  const toastMock = Object.assign(
+    (message: string) => { captured.push(message); },
+    { error: (message: string) => { captured.push(message); } },
+  );
   require.cache[toastPath] = {
     id: toastPath,
     filename: toastPath,
     loaded: true,
     exports: {
       __esModule: true,
-      default: (message: string) => captured.push(message),
+      default: toastMock,
     },
   } as any;
   const originalResolveFilename = moduleApi._resolveFilename;
@@ -205,6 +214,7 @@ function visibleRawPrinterLines(data: Uint8Array): string[] {
 
 const fixtureOrder = {
   order_number: 'ORD-20260421-0001',
+  type: 'dine_in',
   created_at: new Date('2026-04-21T10:30:00Z').toISOString(),
   table: { name: 'T3' },
   items: [
@@ -288,6 +298,15 @@ console.log('\n✅ Test 1: buildEscPos emits correct control bytes');
   assert('no stray {TOKEN} markers remain', !/\{[A-Z_/]+\}/.test(buf.toString('utf8')));
 }
 
+console.log('\n✅ Test 1a: cash drawer pulse is opt-in');
+{
+  const base = buildEscPos(['{INIT}', 'Sale complete', '{CUT}']);
+  const withPulse = appendCashDrawerPulse(base);
+
+  assert('default receipt bytes do not pulse the cash drawer', !bytesContain(base, [ESC, 0x70, 0x00, 0x19, 0xFA]));
+  assert('appendCashDrawerPulse adds ESC p drawer-kick bytes', bytesContain(withPulse, [ESC, 0x70, 0x00, 0x19, 0xFA]));
+}
+
 console.log('\n✅ Test 1b: Unsupported receipt text is skipped with a warning');
 {
   const warnings: Array<{ field: string; text: string; message: string }> = [];
@@ -346,8 +365,34 @@ console.log('\n✅ Test 1b2: Arabic shaping capability gate');
     feWarnings.safePrinterText(boundedEnc, 'Table: میز غذای مخصوص', boundedWarnings, false, true, undefined, 16);
     assert('frontend shaping bounds raw text to the layout width', boundedEnc.out.length === 1 && Array.from(boundedEnc.out[0]).length <= 16 && boundedEnc.out[0].endsWith('…') && boundedWarnings.length === 0);
 
+    const asciiRawControlEnc: any = {
+      out: [] as string[],
+      text(v: string) { this.out.push(v); return this; },
+      raw(data: Uint8Array) { this.out.push(new TextDecoder().decode(data)); return this; },
+    };
+    const asciiRawControlWarnings: any[] = [];
+    feWarnings.safePrinterText(asciiRawControlEnc, 'Sale\x07 complete', asciiRawControlWarnings, false, true);
+    assert('frontend shaping strips controls from ASCII raw output', asciiRawControlEnc.out[0] === 'Sale complete' && asciiRawControlWarnings.length === 0);
+
     assert('isArabicShapingSafeLine accepts ASCII+Persian', feWarnings.isArabicShapingSafeLine('2x چای - Rs50.00') === true);
     assert('isArabicShapingSafeLine rejects other non-ASCII', feWarnings.isArabicShapingSafeLine('کافé') === false);
+
+    const asciiCurrencyEnc = makeEnc();
+    const asciiCurrencyWarnings: any[] = [];
+    feWarnings.safePrinterText(asciiCurrencyEnc, '₹ Tax', asciiCurrencyWarnings, false, false, undefined, undefined, 'en', true, false);
+    assert('WebUSB ASCII mode normalizes currency labels before classification', asciiCurrencyEnc.out[0] === 'Rs Tax' && asciiCurrencyWarnings.length === 0);
+
+    for (const [symbol, fallback] of [['د.إ', 'AED'], ['৳', 'BDT'], ['E£', 'EGP']] as const) {
+      const mappedEnc = makeEnc();
+      const mappedWarnings: any[] = [];
+      feWarnings.safePrinterText(mappedEnc, `${symbol} Tax`, mappedWarnings, false, false, undefined, undefined, 'en', true, false);
+      assert(`WebUSB ASCII mode maps ${symbol} exactly`, mappedEnc.out[0] === `${fallback} Tax` && mappedWarnings.length === 0);
+    }
+
+    const unicodeCurrencyEnc = makeEnc();
+    const unicodeCurrencyWarnings: any[] = [];
+    feWarnings.safePrinterText(unicodeCurrencyEnc, '₹ Tax', unicodeCurrencyWarnings, false, false, undefined, undefined, 'en', true, true);
+    assert('WebUSB Unicode mode preserves currency labels', unicodeCurrencyEnc.out[0] === '₹ Tax' && unicodeCurrencyWarnings.length === 0);
   }
 
   // Default (no capability): Persian is skipped with a precise warning.
@@ -366,6 +411,20 @@ console.log('\n✅ Test 1b2: Arabic shaping capability gate');
   const shapedCurrencyBuf = buildEscPos(['چای زعفرانی ₹500.00'], true, { arabicShaping: true }, shapedCurrencyWarnings);
   assert('with flag, Persian line with Unicode currency is emitted', shapedCurrencyBuf.toString('utf8').includes('چای زعفرانی ₹500.00'));
   assert('with flag, Persian line with Unicode currency emits no warning', shapedCurrencyWarnings.length === 0);
+
+  const asciiCurrencyWarnings: any[] = [];
+  const asciiCurrencyBuf = buildEscPos(['{FINANCIAL}₹ Tax'], false, {}, asciiCurrencyWarnings);
+  assert('backend ASCII mode normalizes currency labels before classification', asciiCurrencyBuf.toString('utf8').includes('Rs Tax') && asciiCurrencyWarnings.length === 0);
+
+  for (const [symbol, fallback] of [['د.إ', 'AED'], ['৳', 'BDT'], ['E£', 'EGP']] as const) {
+    const mappedWarnings: any[] = [];
+    const mappedBuf = buildEscPos([`{FINANCIAL}${symbol} Tax`], false, {}, mappedWarnings);
+    assert(`backend ASCII mode maps ${symbol} exactly`, mappedBuf.toString('utf8').includes(`${fallback} Tax`) && mappedWarnings.length === 0);
+  }
+
+  const unicodeCurrencyWarnings: any[] = [];
+  const unicodeCurrencyBuf = buildEscPos(['{FINANCIAL}₹ Tax'], true, {}, unicodeCurrencyWarnings);
+  assert('backend Unicode mode preserves currency labels', unicodeCurrencyBuf.toString('utf8').includes('₹ Tax') && unicodeCurrencyWarnings.length === 0);
 
   for (const [label, value] of [
     ['ZWNJ', 'می\u200Cرود'],
@@ -406,6 +465,8 @@ console.log('\n✅ Test 1b2: Arabic shaping capability gate');
   assert('core bill templates do not create a fallback warning', templateWarnings.makeBillTemplateFallbackWarning('classic') === null);
   showPrintWarningsToast([merchantFallbackWarning!]);
   assert('template fallback warnings are user-visible', toastMessages.length === 2 && toastMessages[1].includes('selected bill template'));
+  showPrintWarningsToast([{ field: 'receipt language', text: 'de', message: 'locale warning', kind: 'locale' }]);
+  assert('locale warnings use actionable language-load guidance', toastMessages.length === 3 && toastMessages[2].includes('Print language bundle(s) "de"') && !toastMessages[2].includes('line was not printed'));
 
   // The full receipt path threads the flag into the encoder.
   const persianBiz = { ...fixtureBusiness, name: 'کافه فلو تهران', currency_symbol: 'IRR', country: 'IR' };
@@ -417,13 +478,13 @@ console.log('\n✅ Test 1b2: Arabic shaping capability gate');
     ],
   };
 
-  // Receipt without capability flag: Persian lines skipped with precise warnings, English item and financial lines remain
+  // Receipt without capability flag: paid Persian rows refuse before transport.
   const defaultReceiptWarnings: Array<{ field: string; text: string; message: string }> = [];
   const defaultReceipt = formatReceipt(persianReceiptOrder, fixtureBill, persianBiz, 'compact', 48, true, false, 'full', defaultReceiptWarnings, false);
   assert('formatReceipt without flag skips Persian business name', !defaultReceipt.toString('utf8').includes('کافه فلو تهران'));
   assert('formatReceipt without flag skips Persian item name', !defaultReceipt.toString('utf8').includes('چای زعفرانی'));
-  assert('formatReceipt without flag retains English item name', defaultReceipt.toString('utf8').includes('Espresso'));
-  assert('formatReceipt without flag retains financial lines', defaultReceipt.toString('utf8').includes('TOTAL'));
+  assert('formatReceipt without flag refuses the unsupported financial receipt', defaultReceipt.length === 0);
+  assert('formatReceipt without flag reports a financial warning', defaultReceiptWarnings.some((warning) => warning.kind === 'financial'));
   assert('formatReceipt without flag emits precise Arabic shaping warnings', defaultReceiptWarnings.length >= 2 && defaultReceiptWarnings.every(w => /Arabic shaping|Persian\/Arabic/.test(w.message)));
 
   // Receipt with capability flag: Persian business name and items printed with 0 warnings
@@ -455,7 +516,9 @@ console.log('\n✅ Test 1b2: Arabic shaping capability gate');
   const boundedBackendWarnings: Array<{ field: string; text: string; message: string }> = [];
   const boundedBackend = buildEscPos(['{DOUBLE_WIDTH}این خط فارسی خیلی طولانی است{/DOUBLE_WIDTH}'], true, { arabicShaping: true, columns: 32 }, boundedBackendWarnings);
   const boundedBackendLines = visiblePreview(boundedBackend, 32).split('\n').slice(1, -1);
-  assert('backend shaping bounds raw double-width lines', boundedBackendLines.every((line) => line.length <= 16) && boundedBackendWarnings.length === 0);
+  assert('backend shaping downgrades overlong double-width lines without truncation', boundedBackendLines.every((line) => line.length <= 32)
+    && boundedBackendLines.join('').includes('این خط فارسی خیلی طولانی است')
+    && boundedBackendWarnings.length === 0);
 
   const narrowPersianOrder = {
     ...persianReceiptOrder,
@@ -501,7 +564,144 @@ console.log('\n✅ Test 1b2: Arabic shaping capability gate');
   assert('shaped KOT emits no width warnings', narrowKotWarnings.length === 0);
 }
 
-console.log('\n✅ Test 1c: ESC/POS output can be previewed without a printer');
+console.log('\n✅ Test 1c: Unsupported financial receipt text refuses before transport');
+{
+  const unsupportedBusiness = {
+    ...fixtureBusiness,
+    country: 'IR',
+    currency_symbol: 'ریال',
+    show_tax_breakdown: false,
+  };
+  const unsupportedBill = {
+    ...fixtureBill,
+    payment_details: JSON.stringify([{ method: 'cash', amount: 950 }]),
+  };
+
+  for (const template of ['classic', 'compact'] as const) {
+    for (const cols of [32, 42, 48]) {
+      const warnings: any[] = [];
+      const data = formatReceipt(
+        fixtureOrder,
+        unsupportedBill,
+        unsupportedBusiness,
+        template,
+        cols,
+        false,
+        false,
+        'full',
+        warnings,
+        false,
+        'fa',
+      );
+      assert(`${template}/${cols}: unsupported financial rows are identified`, hasFinancialPrintWarning(warnings));
+      assert(`${template}/${cols}: refusal is explicit`, makeFinancialPrintRefusalMessage(warnings).includes('Receipt not printed'));
+      assert(`${template}/${cols}: unsupported financial amount is not emitted`, !escPosToText(data).includes('IRR950.00'));
+    }
+  }
+
+  const accentedWarnings: any[] = [];
+  formatReceipt(
+    { ...fixtureOrder, items: [{ ...fixtureOrder.items[0], product_name: 'Café Crème' }] },
+    fixtureBill,
+    { ...fixtureBusiness, country: 'IN', currency_symbol: '₹', show_tax_breakdown: false },
+    'classic',
+    48,
+    false,
+    false,
+    'full',
+    accentedWarnings,
+    false,
+    'en',
+  );
+  assert('backend accented item labels are treated as financial content', hasFinancialPrintWarning(accentedWarnings));
+
+  const bhdWarnings: any[] = [];
+  const bhdReceipt = formatReceipt(
+    fixtureOrder,
+    fixtureBill,
+    { ...fixtureBusiness, country: 'BH', currency: 'BHD', currency_symbol: getCurrencySymbol('BHD', 'ar-BH'), show_tax_breakdown: false },
+    'classic',
+    48,
+    false,
+    false,
+    'full',
+    bhdWarnings,
+    false,
+    'en',
+  );
+  assert('backend BHD receipt falls back to the canonical code', !hasFinancialPrintWarning(bhdWarnings) && escPosToText(bhdReceipt).includes('BHD'));
+  assert('currency prefix fallback uses the supplied canonical code', resolveCurrencyPrefix('د.ب.', false, undefined, false, 'BHD').includes('BHD'));
+  assert('currency prefix fallback uses the supplied canonical code for empty symbol with capabilities', resolveCurrencyPrefix('', false, GENERIC_THERMAL_CAPABILITIES, false, 'USD') === 'USD');
+
+  const xafWarnings: any[] = [];
+  const xafReceipt = formatReceipt(
+    fixtureOrder,
+    fixtureBill,
+    { ...fixtureBusiness, country: 'CM', currency: 'XAF', currency_symbol: getCurrencySymbol('XAF', 'fr-CM'), show_tax_breakdown: false },
+    'classic',
+    48,
+    false,
+    false,
+    'full',
+    xafWarnings,
+    false,
+    'en',
+  );
+  assert('backend XAF receipt preserves its full representable symbol', !hasFinancialPrintWarning(xafWarnings) && escPosToText(xafReceipt).includes('FCFA'));
+
+  const cnyWarnings: any[] = [];
+  const cnyReceipt = formatReceipt(
+    fixtureOrder,
+    fixtureBill,
+    { ...fixtureBusiness, country: 'CN', currency: 'CNY', currency_symbol: '¥', show_tax_breakdown: false },
+    'classic',
+    48,
+    false,
+    false,
+    'full',
+    cnyWarnings,
+    false,
+    'en',
+  );
+  assert('backend CNY receipt preserves its canonical code on ASCII output', !hasFinancialPrintWarning(cnyWarnings) && escPosToText(cnyReceipt).includes('CNY'));
+
+  const { receiptEncoder, taxBillEncoder, warnings: frontendWarnings } = loadFrontendPrinterModules();
+  const arbitraryCodeTenant = { business_name: 'Cafe', currency: 'XXX', country: 'IN' };
+  for (const template of ['classic', 'compact'] as const) {
+    for (const paperWidth of [58, 80] as const) {
+      const warnings: any[] = [];
+      const builder = template === 'classic'
+        ? receiptEncoder.buildClassicReceiptBytes(unsupportedBill as any, arbitraryCodeTenant as any, { paperWidth, languages: ['en'] as any }, warnings)
+        : receiptEncoder.buildCompactReceiptBytes(unsupportedBill as any, arbitraryCodeTenant as any, { paperWidth, languages: ['en'] as any }, warnings);
+      assert(`WebUSB ${template}/${paperWidth}mm: arbitrary three-letter currency code is printable`, !frontendWarnings.hasFinancialPrintWarning(warnings));
+      assert(`WebUSB ${template}/${paperWidth}mm: arbitrary currency code is emitted`, Buffer.from(builder).toString().includes('XXX'));
+    }
+  }
+
+  const cnyFrontendTenant = { business_name: 'Cafe', currency: 'CNY', country: 'CN' };
+  for (const paperWidth of [58, 80] as const) {
+    const receiptWarnings: any[] = [];
+    const receipt = receiptEncoder.buildClassicReceiptBytes(unsupportedBill as any, cnyFrontendTenant as any, { paperWidth, languages: ['en'] as any }, receiptWarnings);
+    assert(`WebUSB classic/${paperWidth}mm: CNY preserves its canonical code`, !frontendWarnings.hasFinancialPrintWarning(receiptWarnings) && Buffer.from(receipt).toString().includes('CNY'));
+
+    const taxWarnings: any[] = [];
+    const taxBill = taxBillEncoder.buildTaxBillBytes(unsupportedBill as any, cnyFrontendTenant as any, { paperWidth, language: 'en' }, taxWarnings);
+    assert(`WebUSB tax/${paperWidth}mm: CNY preserves its canonical code`, !frontendWarnings.hasFinancialPrintWarning(taxWarnings) && Buffer.from(taxBill).toString().includes('CNY'));
+  }
+
+  const bhdFrontendTenant = { business_name: 'Cafe', currency: 'BHD', country: 'BH' };
+  for (const paperWidth of [58, 80] as const) {
+    const receiptWarnings: any[] = [];
+    const receipt = receiptEncoder.buildClassicReceiptBytes(unsupportedBill as any, bhdFrontendTenant as any, { paperWidth, languages: ['en'] as any }, receiptWarnings);
+    assert(`WebUSB classic/${paperWidth}mm: BHD falls back to its canonical code`, !frontendWarnings.hasFinancialPrintWarning(receiptWarnings) && Buffer.from(receipt).toString().includes('BHD'));
+
+    const taxWarnings: any[] = [];
+    const taxBill = taxBillEncoder.buildTaxBillBytes(unsupportedBill as any, bhdFrontendTenant as any, { paperWidth, language: 'en' }, taxWarnings);
+    assert(`WebUSB tax/${paperWidth}mm: BHD falls back to its canonical code`, !frontendWarnings.hasFinancialPrintWarning(taxWarnings) && Buffer.from(taxBill).toString().includes('BHD'));
+  }
+}
+
+console.log('\n✅ Test 1d: ESC/POS output can be previewed without a printer');
 {
   const buf = buildEscPos(['{INIT}', '{CENTER}{BOLD}HEADER{/BOLD}{/CENTER}', 'Item       Rs63.00', '{CUT}']);
   const text = escPosToText(buf);
@@ -529,11 +729,11 @@ console.log('\n✅ Test 2: Compact receipt (80mm, 48 cols)');
   assert('renders Cash payment', text.includes('Cash') && text.includes('₹500.00'));
   assert('renders UPI payment', text.includes('UPI') && text.includes('₹450.00'));
   assert('renders tax registration number', text.includes('TAXID-0001'));
-  assert('renders non-configurable FloPOS footer', text.includes('Powered by FloPOS') && text.includes('https://flopos.com'));
-  assert('long product name is truncated to fit', !text.includes('Truncated By Formatter'));
-  assert('ends with cut byte sequence', bytesContain(buf, [GS, 0x56, 0x00]));
-
+  assert('renders non-configurable FloPOS footer', text.includes('Powered by FloPOS') && text.includes('(flopos.com)'));
   const rowLines = visiblePreview(buf, 48).split('\n');
+  const longRowIndex = rowLines.findIndex((l) => l.includes('Very Long Product Name That'));
+  assert('long product name wraps cleanly onto multiple lines', longRowIndex >= 0 && rowLines[longRowIndex + 1]?.includes('Truncated By Formatter'));
+  assert('ends with cut byte sequence', bytesContain(buf, [GS, 0x56, 0x00]));
   const cheeseLine = rowLines.find((l) => l.startsWith('Cheeseburger') && l.includes('₹540'));
   assert('item row columns are aligned (no smashed qty)', !!cheeseLine && !/Cheeseburger\d/.test(cheeseLine), cheeseLine);
   assert('item row right-edge total lines up at col 48', !!cheeseLine && cheeseLine.length <= 48);
@@ -613,7 +813,7 @@ console.log('\n✅ Test 4: Classic receipt template');
 
   assert('renders business name', text.includes('Flo Test Cafe'));
   assert('renders item and total', text.includes('Cheeseburger') && text.includes('₹950.00'));
-  assert('renders non-configurable FloPOS footer', text.includes('Powered by FloPOS') && text.includes('https://flopos.com'));
+  assert('renders non-configurable FloPOS footer', text.includes('Powered by FloPOS') && text.includes('(flopos.com)'));
   assert('ends with cut', bytesContain(buf, [GS, 0x56, 0x00]));
 
   console.log('\n   — Rendered classic —');
@@ -627,7 +827,7 @@ console.log('\n✅ Test 5: Tax-specific labels fall back to the default template
 
   assert('legacy detailed label renders the default classic receipt', text.includes('Invoice #:'));
   assert('legacy detailed label does not render the GST-style tax invoice', !text.includes('TAX INVOICE'));
-  assert('renders non-configurable FloPOS footer', text.includes('Powered by FloPOS') && text.includes('https://flopos.com'));
+  assert('renders non-configurable FloPOS footer', text.includes('Powered by FloPOS') && text.includes('(flopos.com)'));
 
   console.log('\n   — Rendered detailed fallback —');
   console.log(visiblePreview(buf, 48));
@@ -749,10 +949,11 @@ console.log('\n✅ Test 6: KOT (Kitchen Order Ticket)');
   assert('renders station name', text.includes('Main Kitchen'));
   assert('renders order number', text.includes('ORD-20260421-0001'));
   assert('renders table number', text.includes('T3'));
+  assert('renders localized order type', text.includes('Type: Dine in'));
   assert('renders each item with qty prefix', text.includes('2x  Cheeseburger'));
   assert('renders addon "Extra Cheese"', text.includes('+ Extra Cheese'));
   assert('renders addon "Bacon"', text.includes('+ Bacon'));
-  assert('renders special instructions with ** markers', text.includes('** No onions **'));
+  assert('renders special instructions with >> markers', text.includes('>> No onions'));
   assert('sets DOUBLE_HEIGHT mode for items', bytesContain(buf, [ESC, 0x21, 0x18]));
   assert('does NOT render prices (KOT has no money)', !text.includes('₹'));
   assert('ends with cut', bytesContain(buf, [GS, 0x56, 0x00]));
@@ -1135,10 +1336,16 @@ console.log('\n✅ Test 11: IR country thermal receipt financial-line preservati
 
   const browserHtml = generateBillHtml(frontendBill as any, frontendTenant, { useUnicode: false });
   assert('browser printing preserves the Persian Rial symbol', browserHtml.includes('ریال') && !browserHtml.includes('IRR'));
-  assert('shared currency normalization leaves the Persian Rial symbol unchanged', normalizeCurrencyToAscii('ریال') === 'ریال');
+  assert('shared currency normalization maps the Persian Rial token to ASCII IRR', normalizeCurrencyToAscii('ریال') === 'IRR');
   const browserTaxHtml = generateBillHtml(frontendBill as any, frontendTenant, { useUnicode: false });
   assert('browser tax-bill printing preserves Persian Rial output', browserTaxHtml.includes('ریال') && !browserTaxHtml.includes('IRR'));
   assert('browser tax-bill printing preserves Persian numeric output', /[۰-۹]/.test(browserTaxHtml));
+  const browserArbitraryCurrencyHtml = generateBillHtml(
+    frontendBill as any,
+    { ...frontendTenant, country: 'US', currency: 'XXX' },
+    { useUnicode: false },
+  );
+  assert('browser printing uses the arbitrary currency code instead of Intl placeholder', browserArbitraryCurrencyHtml.includes('XXX') && !browserArbitraryCurrencyHtml.includes('¤'));
   const browserTomanHtml = generateBillHtml(
     frontendBill as any,
     { ...frontendTenant, currency_display: 'toman' },
@@ -1161,8 +1368,8 @@ console.log('\n✅ Test 11: IR country thermal receipt financial-line preservati
   assert('frontend Persian warning names Arabic script as the cause', frontendWarnings.some((w: any) => /Persian\/Arabic script/.test(w.message)));
 
   // 3. Currency normalization and unsupported character guard unit tests
-  assert('hasUnsupportedPrinterChars("ریال") remains true before currency normalization', hasUnsupportedPrinterChars('ریال') === true);
-  assert('hasUnsupportedPrinterChars("﷼") remains true', hasUnsupportedPrinterChars('﷼') === true);
+  assert('hasUnsupportedPrinterChars("ریال") accepts the documented currency token', hasUnsupportedPrinterChars('ریال') === false);
+  assert('hasUnsupportedPrinterChars("﷼") accepts the documented currency token', hasUnsupportedPrinterChars('﷼') === false);
   assert('hasUnsupportedPrinterChars("یار") remains true', hasUnsupportedPrinterChars('یار') === true);
   assert('hasUnsupportedPrinterChars("کافه") remains true', hasUnsupportedPrinterChars('کافه') === true);
   assert('hasUnsupportedPrinterChars("IRR100,000.00") is false', hasUnsupportedPrinterChars('IRR100,000.00') === false);

@@ -1,24 +1,4 @@
-/**
- * Optional Google Drive integration for automated, off-device DB backups (#129).
- *
- * Follows the same explicit-opt-in shape as cloud-sync.ts: nothing in this
- * module ever talks to Google until the owner clicks "Connect" in
- * Settings > Integrations > Google Drive. Until then `start()` only arms a
- * timer that no-ops (readTokens() returns null) — no network call, no
- * background request.
- *
- * OAuth: standard "installed app" loopback flow (Google's recommended
- * pattern for desktop apps) — open the consent screen in the system browser
- * via shell.openExternal and catch the redirect on a local HTTP server bound
- * to a random port, rather than embedding a webview. Scope is restricted to
- * `drive.file` (least privilege — the app only ever sees files it created).
- *
- * Tokens are OS-encrypted via Electron's safeStorage (same pattern as
- * master-pin.ts) and stored in their own file — never in the SQLite DB.
- *
- * Backups reuse `createBackup()` from db.ts unmodified — no second export
- * path that could skip the redaction already applied to /api/db/export.
- */
+/** Optional Google Drive integration for automated, off-device DB backups via OAuth loopback. */
 
 import { app, shell, safeStorage } from 'electron';
 import { isSafeExternalUrl } from '../security/url-allowlist';
@@ -27,16 +7,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import log from 'electron-log';
-import { google } from 'googleapis';
+import { auth as googleAuth, drive } from '@googleapis/drive';
 import { getDatabase, now, createBackup } from '../db';
 import { SHUTDOWN_TIMEOUT_MS } from '../shutdown';
 
-// googleapis bundles its own internal copy of google-auth-library — use its
-// re-exported OAuth2 client (google.auth.OAuth2) rather than depending on
-// the standalone `google-auth-library` package directly, which can resolve
-// to a different version than the one googleapis' Drive client expects and
-// trips up structural typing between the two copies.
-type OAuth2Client = InstanceType<typeof google.auth.OAuth2>;
+// Use OAuth2 constructor from @googleapis/drive to avoid version mismatches.
+type OAuth2Client = InstanceType<typeof googleAuth.OAuth2>;
 
 export const DRIVE_FILE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
 export const DRIVE_BACKUP_FOLDER_NAME = 'FloCafe Backups';
@@ -190,11 +166,7 @@ function isSecureStorageAvailable(): boolean {
   }
 }
 
-/**
- * Pure retention math, split out from applyRetention() so it's unit
- * testable without a real Drive client: given the app-folder's files
- * (oldest-first) and how many to keep, returns the ids to delete.
- */
+/** Computes which file IDs to delete based on retention limit and file timestamps. */
 export function computeFilesToDelete(
   files: { id: string; createdTime: string }[],
   retentionCount: number
@@ -204,10 +176,7 @@ export function computeFilesToDelete(
   return sorted.slice(0, sorted.length - retentionCount).map((f) => f.id);
 }
 
-/**
- * Pure scheduling check, split out for unit testing: is a new Drive backup
- * due given the last successful backup time and the configured frequency?
- */
+/** Determines if a scheduled backup is due based on interval and last backup timestamp. */
 export function isBackupDue(lastBackupAtIso: string | null, frequency: BackupFrequency, nowMs = Date.now()): boolean {
   if (!lastBackupAtIso) return true;
   const last = new Date(lastBackupAtIso).getTime();
@@ -365,12 +334,7 @@ class GoogleDriveService {
     return this.getStatus();
   }
 
-  /**
-   * Explicit opt-in entry point: user clicked "Connect" in Settings. Opens
-   * the consent screen in the system browser and waits for the loopback
-   * redirect. Throws with a user-facing message if this build has no
-   * client credentials configured, or secure storage isn't available.
-   */
+  /** Connects to Google Drive using a loopback browser OAuth flow. */
   async connect(signal?: AbortSignal): Promise<GoogleDriveStatus> {
     if (this.stopping) throw new Error('Google Drive is stopping');
     const operationSignal = signal
@@ -392,7 +356,7 @@ class GoogleDriveService {
 
     const { code, redirectUri } = await this.runLoopbackFlow(creds, signal);
     this.throwIfStopping(signal);
-    const client = new google.auth.OAuth2(creds.clientId, creds.clientSecret, redirectUri);
+    const client = new googleAuth.OAuth2(creds.clientId, creds.clientSecret, redirectUri);
     const { tokens } = await waitForDriveOperation(() => client.getToken(code), signal, DRIVE_REQUEST_TIMEOUT_MS, 'Google Drive token exchange', (operation) => this.trackDriveOperation(operation), () => this.stopping);
     this.throwIfStopping(signal);
     if (!tokens.refresh_token) {
@@ -413,8 +377,8 @@ class GoogleDriveService {
 
     let folderId: string | null = null;
     try {
-      const drive = google.drive({ version: 'v3', auth: client });
-      folderId = await this.ensureAppFolder(drive, signal);
+      const driveClient = drive({ version: 'v3', auth: client });
+      folderId = await this.ensureAppFolder(driveClient, signal);
     } catch (err) {
       if (this.stopping || signal.aborted) throw err;
       log.warn('[GoogleDrive] could not prepare app folder', (err as Error).message);
@@ -485,8 +449,8 @@ class GoogleDriveService {
     try {
       const client = await this.getAuthorizedClient(signal);
       this.throwIfStopping(signal);
-      const drive = google.drive({ version: 'v3', auth: client });
-      const folderId = await this.ensureAppFolder(drive, signal);
+      const driveClient = drive({ version: 'v3', auth: client });
+      const folderId = await this.ensureAppFolder(driveClient, signal);
 
       this.throwIfStopping(signal);
       const { path: backupPath } = await waitForDriveOperation(
@@ -500,14 +464,14 @@ class GoogleDriveService {
       const fileName = path.basename(backupPath);
 
       this.throwIfStopping(signal);
-      await drive.files.create({
+      await driveClient.files.create({
         requestBody: { name: fileName, parents: [folderId] },
         media: { mimeType: 'application/x-sqlite3', body: fs.createReadStream(backupPath) },
         fields: 'id',
       }, { signal: requestSignal(signal, DRIVE_REQUEST_TIMEOUT_MS), timeout: DRIVE_REQUEST_TIMEOUT_MS });
       this.throwIfStopping(signal);
 
-      await this.applyRetention(drive, folderId, signal);
+      await this.applyRetention(driveClient, folderId, signal);
 
       this.throwIfStopping(signal);
       this.upsertSettings({
@@ -538,11 +502,9 @@ class GoogleDriveService {
     const tokens = this.readTokens();
     if (!tokens) throw new Error('Google Drive is not connected');
 
-    const client = new google.auth.OAuth2(creds.clientId, creds.clientSecret);
+    const client = new googleAuth.OAuth2(creds.clientId, creds.clientSecret);
     client.setCredentials(tokens);
-    // google-auth-library refreshes the access token transparently using the
-    // refresh_token when it's expired; persist whatever it hands back so the
-    // next scheduled run doesn't have to refresh again.
+    // Persist refreshed OAuth tokens emitted transparently by google-auth-library.
     client.on('tokens', (refreshed) => {
       if (this.stopping || this.terminalCleanup || signal?.aborted) return;
       const merged = { ...this.readTokens(), ...refreshed };
@@ -565,13 +527,13 @@ class GoogleDriveService {
     return data.email || null;
   }
 
-  private async ensureAppFolder(drive: ReturnType<typeof google.drive>, signal?: AbortSignal): Promise<string> {
+  private async ensureAppFolder(driveClient: ReturnType<typeof drive>, signal?: AbortSignal): Promise<string> {
     this.throwIfStopping(signal);
     const existingId = this.readSettings().google_drive_folder_id;
     if (existingId) {
       // Confirm it still exists / is still visible to this scope before reusing it.
       try {
-        const res = await drive.files.get({ fileId: existingId, fields: 'id, trashed' }, { signal: requestSignal(signal, DRIVE_REQUEST_TIMEOUT_MS), timeout: DRIVE_REQUEST_TIMEOUT_MS });
+        const res = await driveClient.files.get({ fileId: existingId, fields: 'id, trashed' }, { signal: requestSignal(signal, DRIVE_REQUEST_TIMEOUT_MS), timeout: DRIVE_REQUEST_TIMEOUT_MS });
         this.throwIfStopping(signal);
         if (res.data.id && !res.data.trashed) return res.data.id;
       } catch {
@@ -581,7 +543,7 @@ class GoogleDriveService {
       this.throwIfStopping(signal);
     }
 
-    const found = await drive.files.list({
+    const found = await driveClient.files.list({
       q: `mimeType='application/vnd.google-apps.folder' and name='${DRIVE_BACKUP_FOLDER_NAME}' and trashed=false`,
       fields: 'files(id, name)',
       spaces: 'drive',
@@ -591,7 +553,7 @@ class GoogleDriveService {
     const existing = found.data.files?.[0]?.id;
     if (existing) return existing;
 
-    const created = await drive.files.create({
+    const created = await driveClient.files.create({
       requestBody: { name: DRIVE_BACKUP_FOLDER_NAME, mimeType: 'application/vnd.google-apps.folder' },
       fields: 'id',
     }, { signal: requestSignal(signal, DRIVE_REQUEST_TIMEOUT_MS), timeout: DRIVE_REQUEST_TIMEOUT_MS });
@@ -600,13 +562,13 @@ class GoogleDriveService {
     return created.data.id;
   }
 
-  private async applyRetention(drive: ReturnType<typeof google.drive>, folderId: string, signal: AbortSignal): Promise<void> {
+  private async applyRetention(driveClient: ReturnType<typeof drive>, folderId: string, signal: AbortSignal): Promise<void> {
     this.throwIfStopping(signal);
     const retention = this.retentionFromSettings(this.readSettings());
     const files: { id: string; createdTime: string }[] = [];
     let pageToken: string | undefined;
     do {
-      const res = await drive.files.list({
+      const res = await driveClient.files.list({
         q: `'${folderId}' in parents and trashed=false`,
         fields: 'nextPageToken, files(id, name, createdTime)',
         orderBy: 'createdTime',
@@ -627,7 +589,7 @@ class GoogleDriveService {
       await Promise.all(toDelete.slice(i, i + 5).map(async (id) => {
         try {
           this.throwIfStopping(signal);
-          await drive.files.delete({ fileId: id }, { signal: requestSignal(signal, DRIVE_REQUEST_TIMEOUT_MS), timeout: DRIVE_REQUEST_TIMEOUT_MS });
+          await driveClient.files.delete({ fileId: id }, { signal: requestSignal(signal, DRIVE_REQUEST_TIMEOUT_MS), timeout: DRIVE_REQUEST_TIMEOUT_MS });
         } catch (err) {
           if (this.stopping || signal.aborted) throw err;
           log.warn('[GoogleDrive] retention delete failed', id, (err as Error).message);
@@ -714,7 +676,7 @@ class GoogleDriveService {
         const port = typeof address === 'object' && address ? address.port : 0;
         redirectUri = `http://127.0.0.1:${port}/oauth2callback`;
 
-        const authClient = new google.auth.OAuth2(creds.clientId, creds.clientSecret, redirectUri);
+        const authClient = new googleAuth.OAuth2(creds.clientId, creds.clientSecret, redirectUri);
         const authUrl = authClient.generateAuthUrl({
           access_type: 'offline',
           prompt: 'consent',

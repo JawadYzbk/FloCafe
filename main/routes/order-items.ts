@@ -3,6 +3,7 @@ import { getDatabase, getKdsStationCategoryIds, getKdsStationRoutingScope, getUs
 import { notifyKdsUpdate } from '../services/kds';
 import { parseCategoryIds } from './auth';
 import { requireKdsEnabled, isTokenRevoked, isTokenStale } from '../middleware/security';
+import { ROLE_ACCESS, hasRole } from '../../shared/role-permissions';
 
 const router = Router();
 
@@ -17,7 +18,7 @@ interface OrderItemRow {
 router.patch('/:id/status', requireKdsEnabled, (req: Request, res: Response) => {
   try {
     const role = (req as any).user?.role;
-    if (!role || !['chef', 'manager', 'owner'].includes(role)) {
+    if (!hasRole(role, ROLE_ACCESS.kitchen)) {
       return res.status(403).json({ error: 'Only chef, manager, or owner can update item status' });
     }
 
@@ -42,7 +43,7 @@ router.patch('/:id/status', requireKdsEnabled, (req: Request, res: Response) => 
       ? db.prepare('SELECT role, category_ids FROM users WHERE id = ? AND is_active = 1').get(userId) as { role: string; category_ids: string | null } | undefined
       : undefined;
     if (!currentUser) return res.status(403).json({ error: 'User account is not active' });
-    let categoryIds = currentUser.role === 'manager' || currentUser.role === 'owner'
+    let categoryIds = hasRole(currentUser.role, ROLE_ACCESS.ownerManager)
       ? []
       : parseCategoryIds(currentUser.category_ids);
     const loadedStationIds = getUserKdsStationIds(db, userId);
@@ -60,8 +61,8 @@ router.patch('/:id/status', requireKdsEnabled, (req: Request, res: Response) => 
     const orderData = withTxn(() => {
       const liveUser = db.prepare('SELECT role, category_ids, tokens_valid_after FROM users WHERE id = ? AND is_active = 1').get(userId) as { role: string; category_ids: string | null; tokens_valid_after: string | null } | undefined;
       const token = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : '';
-      if (!liveUser || isTokenRevoked(token) || isTokenStale((req as any).user?.iat, liveUser.tokens_valid_after) || !['chef', 'manager', 'owner'].includes(liveUser.role)) throw new Error('USER_FORBIDDEN');
-      categoryIds = liveUser.role === 'manager' || liveUser.role === 'owner' ? [] : parseCategoryIds(liveUser.category_ids);
+      if (!liveUser || isTokenRevoked(token) || isTokenStale((req as any).user?.iat, liveUser.tokens_valid_after) || !hasRole(liveUser.role, ROLE_ACCESS.kitchen)) throw new Error('USER_FORBIDDEN');
+      categoryIds = hasRole(liveUser.role, ROLE_ACCESS.ownerManager) ? [] : parseCategoryIds(liveUser.category_ids);
       const liveStationIds = getUserKdsStationIds(db, userId);
       const liveAssignments = hasUserKdsStationAssignments(db, userId);
       if (!liveStationIds || liveAssignments === null) throw new Error('USER_FORBIDDEN');
@@ -90,7 +91,7 @@ router.patch('/:id/status', requireKdsEnabled, (req: Request, res: Response) => 
       if (item.status === 'void_adjustment') {
         throw new Error('IMMUTABLE_KDS_ITEM');
       }
-      if (item.status === 'completed' || item.status === 'cancelled') {
+      if (item.status === 'completed' || item.status === 'cancelled' || item.status === 'refunded') {
         throw new Error('TERMINAL_KDS_ITEM');
       }
 
@@ -113,7 +114,7 @@ router.patch('/:id/status', requireKdsEnabled, (req: Request, res: Response) => 
       }
 
       const updateResult = expectedStatus === undefined
-        ? db.prepare("UPDATE order_items SET status = ?, updated_at = ? WHERE id = ? AND status NOT IN ('voided', 'void_adjustment', 'completed', 'cancelled')").run(status, now(), itemId)
+        ? db.prepare("UPDATE order_items SET status = ?, updated_at = ? WHERE id = ? AND status NOT IN ('voided', 'void_adjustment', 'completed', 'cancelled', 'refunded')").run(status, now(), itemId)
         : db.prepare('UPDATE order_items SET status = ?, updated_at = ? WHERE id = ? AND status = ?').run(status, now(), itemId, expectedStatus);
       if (updateResult.changes !== 1) throw new Error('STATUS_CONFLICT');
 
@@ -126,7 +127,7 @@ router.patch('/:id/status', requireKdsEnabled, (req: Request, res: Response) => 
         WHERE oi.order_id = ?
       `).all(item.order_id) as any[];
       const visibleItems = rawItems
-        .filter((row) => !['completed', 'cancelled', 'void_adjustment'].includes(row.status))
+        .filter((row) => !['completed', 'cancelled', 'void_adjustment', 'refunded'].includes(row.status))
         .filter((row) => row.status !== 'voided' || isVoidedItemKdsVisible(row.voided_at))
         .filter((row) => categoryIds.length === 0 || (row.category_id && categoryIds.includes(String(row.category_id))))
         .filter((row) => stationIds.length === 0 || isKdsStationItemAllowed(stationIds, stationRoutingCategoryIds, orderStationId, row.category_id, orderStationId ? stationScope.categoryIdsByStation[String(orderStationId)] : undefined, stationScope.hasUnrestrictedStation));

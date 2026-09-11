@@ -17,6 +17,7 @@ import { asyncHandler } from '../middleware/async-handler';
 import { notifyKdsUpdate, notifyOrderUpdated } from '../services/kds';
 import { printReceipt } from '../services/receipt';
 import { requireRole } from '../middleware/security';
+import { ROLE_ACCESS } from '../../shared/role-permissions';
 import {
   calculateConfiguredChargeTaxes,
   combineItemAndChargeTaxes,
@@ -26,9 +27,54 @@ import {
 import { applyPayableRounding } from '../services/tax-engine';
 import { sendEvent } from '../services/telemetry';
 import { getBaseCurrency, getSecondaryCurrencies } from '../currency-config';
-import { convertTenderToBase } from '../countries';
+import {
+  convertTenderToBase,
+  getCurrencyFractionDigits,
+  getCurrencyMinorUnitFactor,
+  resolveTenantCurrency,
+} from '../countries';
 
 const router = Router();
+const OWNER_MANAGER_ROLE_PLACEHOLDERS = ROLE_ACCESS.ownerManager.map(() => '?').join(', ');
+
+export function getTenantCurrency(): string {
+  return resolveTenantCurrency(getSettingValue('currency'), getSettingValue('country'));
+}
+
+type BillLoyaltyRow = {
+  [key: string]: unknown;
+  id: number;
+  customer_id?: number | string | null;
+};
+
+export function addBillLoyaltyFields(db: ReturnType<typeof getDatabase>, bill: BillLoyaltyRow | null | undefined) {
+  if (!bill?.customer_id) return bill;
+
+  const earned = db.prepare(
+    `SELECT COALESCE(SUM(amount), 0) as total FROM loyalty_ledger WHERE bill_id = ? AND type = 'credit'`,
+  ).get(bill.id) as { total: number };
+  const redeemed = db.prepare(
+    `SELECT COALESCE(SUM(amount), 0) as total FROM loyalty_ledger WHERE bill_id = ? AND type = 'debit'`,
+  ).get(bill.id) as { total: number };
+  const loyaltyEnabled = ['true', '1'].includes(getSettingValue('loyalty_enabled') || '');
+  let pointsBalance: number | null = null;
+  if (loyaltyEnabled) {
+    const credits = db.prepare(
+      `SELECT COALESCE(SUM(amount), 0) as total FROM loyalty_ledger WHERE customer_id = ? AND type = 'credit'`,
+    ).get(bill.customer_id) as { total: number };
+    const debits = db.prepare(
+      `SELECT COALESCE(SUM(amount), 0) as total FROM loyalty_ledger WHERE customer_id = ? AND type = 'debit'`,
+    ).get(bill.customer_id) as { total: number };
+    pointsBalance = Math.max(0, Number(credits.total) - Number(debits.total));
+  }
+
+  return {
+    ...bill,
+    points_earned: Number(earned.total) || 0,
+    points_redeemed: Number(redeemed.total) || 0,
+    points_balance: pointsBalance,
+  };
+}
 
 function scaleTaxBreakdown(
   raw: unknown,
@@ -36,9 +82,10 @@ function scaleTaxBreakdown(
   ownerWeights?: number[],
   childIndex = 0,
   sourceTaxMinor?: number,
+  minorFactor = 100,
 ): unknown {
   if (ownerWeights && ownerWeights.length > 0) {
-    return allocateTaxBreakdownForChild(raw, ownerWeights, childIndex, sourceTaxMinor);
+    return allocateTaxBreakdownForChild(raw, ownerWeights, childIndex, sourceTaxMinor, minorFactor);
   }
   if (raw === null || raw === undefined || ratio === 1) return raw;
   const wasString = typeof raw === 'string';
@@ -58,8 +105,10 @@ function scaleTaxBreakdown(
     if (Object.prototype.hasOwnProperty.call(result, 'amount')) {
       const amount = Number(result.amount);
       if (Number.isFinite(amount)) {
-        const scaled = Number((amount * ratio).toFixed(2));
-        result.amount = typeof value.amount === 'string' ? scaled.toFixed(2) : scaled;
+        const scaled = Number((amount * ratio).toFixed(Math.log10(minorFactor)));
+        result.amount = typeof value.amount === 'string'
+          ? scaled.toFixed(Math.log10(minorFactor))
+          : scaled;
       }
     }
     return result;
@@ -83,9 +132,11 @@ export function projectOrderItems(
   rawItemRows: any[],
   allocations: any[] = [],
   childItemAllocations = new Map<number, ChildItemAllocation>(),
+  minorFactor = 100,
 ): any[] {
   const allocated = new Map(allocations.map((row) => [Number(row.order_item_id), Number(row.quantity)]));
   const taxDiscountRatio = getTaxDiscountRatio(order.subtotal, order.discount_amount);
+  const decimals = Math.log10(minorFactor);
   return rawItemRows
     .filter((item) => allocations.length === 0 || allocated.has(Number(item.id)))
     .map((item) => {
@@ -95,14 +146,14 @@ export function projectOrderItems(
         ? 1
         : quantity / originalQuantity;
       const ownerAllocation = childItemAllocations.get(Number(item.id));
-      const sourceTaxMinor = Math.round(Number(item.tax_amount || 0) * taxDiscountRatio * 100);
+      const sourceTaxMinor = Math.round(Number(item.tax_amount || 0) * taxDiscountRatio * minorFactor);
       const taxMinor = ownerAllocation
         ? allocateSignedMinorUnits(sourceTaxMinor, ownerAllocation.weights)[ownerAllocation.index]
         : Math.round(sourceTaxMinor * quantityRatio);
       const hasSnapshot = hasSnapshotLines(item.tax_snapshot);
       const scaledBreakdown = hasSnapshot
         ? item.tax_breakdown
-        : scaleTaxBreakdown(item.tax_breakdown, taxDiscountRatio);
+        : scaleTaxBreakdown(item.tax_breakdown, taxDiscountRatio, undefined, 0, undefined, minorFactor);
       const taxBreakdown = ownerAllocation
         ? scaleTaxBreakdown(
           scaledBreakdown,
@@ -110,20 +161,21 @@ export function projectOrderItems(
           ownerAllocation.weights,
           ownerAllocation.index,
           sourceTaxMinor,
+          minorFactor,
         )
-        : scaleTaxBreakdown(scaledBreakdown, quantityRatio);
+        : scaleTaxBreakdown(scaledBreakdown, quantityRatio, undefined, 0, undefined, minorFactor);
       const taxSnapshot = ownerAllocation || !hasSnapshot || (taxDiscountRatio === 1 && quantityRatio === 1)
         ? item.tax_snapshot
-        : scaleTaxSnapshots([item.tax_snapshot], taxDiscountRatio * quantityRatio)[0] || null;
+        : scaleTaxSnapshots([item.tax_snapshot], taxDiscountRatio * quantityRatio, minorFactor)[0] || null;
       if (quantity === undefined && taxDiscountRatio === 1 && !ownerAllocation) return item;
       return {
         ...item,
         ...(quantity === undefined ? {} : { quantity }),
-        subtotal: Number((Number(item.subtotal) * quantityRatio).toFixed(2)),
-        tax_amount: taxMinor / 100,
+        subtotal: Number((Number(item.subtotal) * quantityRatio).toFixed(decimals)),
+        tax_amount: taxMinor / minorFactor,
         tax_breakdown: taxBreakdown,
         tax_snapshot: taxSnapshot,
-        total: Number((Number(item.total) * quantityRatio).toFixed(2)),
+        total: Number((Number(item.total) * quantityRatio).toFixed(decimals)),
       };
     });
 }
@@ -158,7 +210,7 @@ function getPersistedChildTaxBreakdowns(
   for (const breakdown of parsed) {
     while (itemIndex < sourceItems.length) {
       const item = sourceItems[itemIndex++];
-      if (['cancelled', 'voided', 'void_adjustment'].includes(item.status)) continue;
+      if (['cancelled', 'voided', 'void_adjustment', 'refunded'].includes(item.status)) continue;
       const itemBreakdown = parseTaxSnapshot(item.tax_breakdown);
       if (!Array.isArray(itemBreakdown) || itemBreakdown.length === 0) continue;
       result.set(Number(item.id), breakdown);
@@ -168,13 +220,13 @@ function getPersistedChildTaxBreakdowns(
   return result;
 }
 
-function taxBreakdownMinorTotal(raw: unknown): number {
+function taxBreakdownMinorTotal(raw: unknown, minorFactor = 100): number {
   const parsed = parseTaxSnapshot(raw);
   const entries = Array.isArray(parsed) ? parsed : [parsed];
   return entries.reduce((sum, entry) => {
-    if (Array.isArray(entry)) return sum + taxBreakdownMinorTotal(entry);
+    if (Array.isArray(entry)) return sum + taxBreakdownMinorTotal(entry, minorFactor);
     const amount = Number((entry as any)?.amount);
-    return Number.isFinite(amount) ? sum + Math.round(amount * 100) : sum;
+    return Number.isFinite(amount) ? sum + Math.round(amount * minorFactor) : sum;
   }, 0);
 }
 
@@ -182,6 +234,7 @@ function applyPersistedChildTaxBreakdowns(
   projectedItems: any[],
   sourceItems: any[],
   sourceRaw: unknown,
+  minorFactor = 100,
 ): any[] {
   const childBreakdowns = getPersistedChildTaxBreakdowns(sourceRaw, sourceItems);
   if (childBreakdowns.size === 0) return projectedItems;
@@ -189,7 +242,7 @@ function applyPersistedChildTaxBreakdowns(
     if (hasSnapshotLines(item.tax_snapshot)) return item;
     const breakdown = childBreakdowns.get(Number(item.id));
     if (breakdown === undefined) return item;
-    return { ...item, tax_breakdown: [breakdown], tax_amount: taxBreakdownMinorTotal(breakdown) / 100 };
+    return { ...item, tax_breakdown: [breakdown], tax_amount: taxBreakdownMinorTotal(breakdown, minorFactor) / minorFactor };
   });
 }
 
@@ -225,13 +278,18 @@ export function getOrderWithItems(db: ReturnType<typeof getDatabase>, orderId: n
     }
   }
   const itemRows = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(orderId) as any[];
-  const projectedItems = projectOrderItems(order, itemRows, allocations, childItemAllocations);
+  const minorFactor = getCurrencyMinorUnitFactor(getTenantCurrency());
+  const projectedItems = projectOrderItems(order, itemRows, allocations, childItemAllocations, minorFactor);
   const childScopedItems = billId === undefined
     ? projectedItems
-    : applyPersistedChildTaxBreakdowns(projectedItems, itemRows, persistedTaxBreakdown);
+    : applyPersistedChildTaxBreakdowns(projectedItems, itemRows, persistedTaxBreakdown, minorFactor);
+  const table = order.table_id
+    ? db.prepare('SELECT * FROM tables WHERE id = ?').get(order.table_id) as { number?: string | number } | null
+    : null;
   return {
     ...order,
     items: attachEffectiveAddons(db, childScopedItems.map(parseItemJson)),
+    ...(table ? { table: { name: table.number } } : {}),
   };
 }
 
@@ -284,8 +342,9 @@ export function getOrdersWithItemsForBills(
       ? childAllocationsForBills(groupBills, allBillItems, Number(bill.id))
       : new Map<number, ChildItemAllocation>();
     const rawItems = itemsByOrder.get(Number(bill.order_id)) || [];
-    const projectedItems = projectOrderItems(order, rawItems, allocations, itemAllocations);
-    const items = applyPersistedChildTaxBreakdowns(projectedItems, rawItems, bill.tax_breakdown)
+    const minorFactor = getCurrencyMinorUnitFactor(getTenantCurrency());
+    const projectedItems = projectOrderItems(order, rawItems, allocations, itemAllocations, minorFactor);
+    const items = applyPersistedChildTaxBreakdowns(projectedItems, rawItems, bill.tax_breakdown, minorFactor)
       .map(parseItemJson);
     items.forEach((item) => addonItems.set(Number(item.id), item));
     projected.set(Number(bill.id), { ...order, items });
@@ -299,8 +358,9 @@ export function getOrdersWithItemsForBills(
   return result;
 }
 
-// Fixed conversion rate for redeeming loyalty wallet points as payment (points per 1 currency unit).
-const LOYALTY_REDEMPTION_RATE = 100;
+// Loyalty points are 1:1 with currency units — earning and redemption both
+// use this rate so a customer's point balance always equals its currency value.
+const LOYALTY_REDEMPTION_RATE = 1;
 
 // Rate limiting for PIN validation (simple in-memory)
 const pinAttempts = new Map<string, { count: number; resetAt: number }>();
@@ -332,7 +392,7 @@ function parsePaginationInteger(value: unknown, defaultValue: number): number | 
   return parsed;
 }
 
-router.get('/', requireRole('owner', 'manager', 'cashier'), (req: Request, res: Response) => {
+router.get('/', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     let query = 'SELECT * FROM bills WHERE 1=1';
@@ -362,9 +422,7 @@ router.get('/', requireRole('owner', 'manager', 'cashier'), (req: Request, res: 
       params.push(s, e);
     }
 
-    // #208: default page size of 50 and a hard cap even when clients omit
-    // per_page — the previous "unbounded" default could return every bill
-    // ever when a caller left the param off.
+    // Limit page size with a default of 50 and maximum cap of 500.
     const requestedLimit = parsePaginationInteger(req.query.per_page ?? req.query.limit, 50);
     if (requestedLimit === null || requestedLimit < 1) {
       return res.status(400).json({ error: 'per_page must be a positive integer' });
@@ -397,10 +455,10 @@ router.get('/', requireRole('owner', 'manager', 'cashier'), (req: Request, res: 
   }
 });
 
-router.get('/:id', requireRole('owner', 'manager', 'cashier'), (req: Request, res: Response) => {
+router.get('/:id', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
-    const bill = parseRowJson(db.prepare('SELECT * FROM bills WHERE id = ?').get(req.params.id));
+    const bill = addBillLoyaltyFields(db, parseRowJson(db.prepare('SELECT * FROM bills WHERE id = ?').get(req.params.id)));
     if (!bill) {
       return res.status(404).json({ error: 'Bill not found' });
     }
@@ -416,10 +474,10 @@ router.get('/:id', requireRole('owner', 'manager', 'cashier'), (req: Request, re
 });
 
 // Get bill by order ID
-router.get('/order/:orderId', requireRole('owner', 'manager', 'cashier'), (req: Request, res: Response) => {
+router.get('/order/:orderId', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
-    const bill = parseRowJson(db.prepare('SELECT * FROM bills WHERE order_id = ? ORDER BY created_at DESC LIMIT 1').get(req.params.orderId));
+    const bill = addBillLoyaltyFields(db, parseRowJson(db.prepare('SELECT * FROM bills WHERE order_id = ? ORDER BY created_at DESC LIMIT 1').get(req.params.orderId)));
     if (!bill) {
       return res.status(404).json({ error: 'Bill not found for this order' });
     }
@@ -434,7 +492,7 @@ router.get('/order/:orderId', requireRole('owner', 'manager', 'cashier'), (req: 
   }
 });
 
-router.post('/generate', requireRole('owner', 'manager', 'cashier'), (req: Request, res: Response) => {
+router.post('/generate', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, res: Response) => {
   try {
     const { order_id } = req.body;
 
@@ -452,23 +510,24 @@ router.post('/generate', requireRole('owner', 'manager', 'cashier'), (req: Reque
       const existingBill = db.prepare('SELECT * FROM bills WHERE order_id = ?').get(order_id) as any;
       if (existingBill) {
         if (existingBill.split_group_id) return { bill: parseRowJson(existingBill), isNew: false };
-        // Re-sync bill totals from the order in case discount/adjustments were applied
-        // after the bill was first generated (e.g. discount applied → then checkout clicked).
-        // Only sync if the bill is still unpaid (partial or full payments must not be changed).
+        // Re-sync unpaid bill totals from order in case discount/adjustments changed.
         const orderSubtotal      = order.subtotal        || 0;
         const orderTaxAmount     = order.tax_amount      || 0;
         const orderDiscountAmt   = order.discount_amount || 0;
         const orderDelivery      = order.delivery_charge || 0;
         const orderPackaging     = order.packaging_charge|| 0;
+        const orderService       = order.service_charge  || 0;
         const orderTotal         = order.total           || 0;
 
+        const currency = getTenantCurrency();
         const pack = getActiveCountryPack(getSettingValue('country') || 'IN');
-        const { total: roundedOrderTotal, adjustment: orderRoundOff } = applyPayableRounding(orderTotal, pack);
+        const { total: roundedOrderTotal, adjustment: orderRoundOff } = applyPayableRounding(orderTotal, pack, currency);
 
         const totalsChanged =
           existingBill.payment_status !== 'paid' && (
             existingBill.discount_amount !== orderDiscountAmt ||
             existingBill.subtotal        !== orderSubtotal    ||
+            existingBill.service_charge  !== orderService     ||
             existingBill.total           !== roundedOrderTotal
           );
 
@@ -486,6 +545,7 @@ router.post('/generate', requireRole('owner', 'manager', 'cashier'), (req: Reque
                 discount_reason= ?,
                 delivery_charge= ?,
                 packaging_charge= ?,
+                service_charge = ?,
                 round_off      = ?,
                 total          = ?,
                 balance        = ?,
@@ -494,7 +554,7 @@ router.post('/generate', requireRole('owner', 'manager', 'cashier'), (req: Reque
           `).run(
             orderSubtotal, orderTaxAmount, order.tax_breakdown, order.tax_snapshot,
             orderDiscountAmt, order.discount_type, order.discount_value, order.discount_reason,
-            orderDelivery, orderPackaging, orderRoundOff,
+            orderDelivery, orderPackaging, orderService, orderRoundOff,
             roundedOrderTotal, newBalance, now(),
             existingBill.id
           );
@@ -513,18 +573,20 @@ router.post('/generate', requireRole('owner', 'manager', 'cashier'), (req: Reque
       const discountAmount = order.discount_amount || 0;
       const deliveryCharge = order.delivery_charge || 0;
       const packagingCharge = order.packaging_charge || 0;
+      const serviceCharge = order.service_charge || 0;
+      const currency = getTenantCurrency();
       const pack = getActiveCountryPack(getSettingValue('country') || 'IN');
-      const { total, adjustment: roundOff } = applyPayableRounding(order.total || 0, pack);
+      const { total, adjustment: roundOff } = applyPayableRounding(order.total || 0, pack, currency);
 
       const runResult = db.prepare(`
         INSERT INTO bills (bill_number, order_id, customer_id, subtotal, tax_amount, tax_breakdown, tax_snapshot,
           discount_amount, discount_type, discount_value, discount_reason,
-          delivery_charge, packaging_charge, round_off, total, paid_amount, balance, payment_status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unpaid', ?, ?)
+          delivery_charge, packaging_charge, service_charge, round_off, total, paid_amount, balance, payment_status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unpaid', ?, ?)
       `).run(
         billNumber, order_id, order.customer_id, subtotal, taxAmount, order.tax_breakdown, order.tax_snapshot,
         discountAmount, order.discount_type, order.discount_value, order.discount_reason,
-        deliveryCharge, packagingCharge, roundOff, total, 0, total, now(), now()
+        deliveryCharge, packagingCharge, serviceCharge, roundOff, total, 0, total, now(), now()
       );
 
       const newBill = parseRowJson(db.prepare('SELECT * FROM bills WHERE id = ?').get(runResult.lastInsertRowid));
@@ -532,14 +594,15 @@ router.post('/generate', requireRole('owner', 'manager', 'cashier'), (req: Reque
     });
 
     notifyOrderUpdated();
-    res.status(result.isNew ? 201 : 200).json({ bill: result.bill });
+    const orderWithItems = getOrderWithItems(db, order_id, Number(result.bill.id));
+    res.status(result.isNew ? 201 : 200).json({ bill: { ...result.bill, order: orderWithItems } });
   } catch (error: any) {
     console.error("[API] Internal error:", error);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-function allocateMinorUnits(sourceMinor: number, weights: number[]): number[] {
+export function allocateMinorUnits(sourceMinor: number, weights: number[]): number[] {
   const n = weights.length;
   if (n === 0) return [];
   const totalWeight = weights.reduce((sum, w) => sum + w, 0);
@@ -573,9 +636,7 @@ function allocateMinorUnits(sourceMinor: number, weights: number[]): number[] {
   return base;
 }
 
-// Tax snapshots may contain signed evidence for a historical adjustment. Keep
-// allocateMinorUnits' non-negative contract unchanged and allocate the
-// magnitude with the same largest-remainder ordering before restoring the sign.
+// Allocate signed tax adjustments preserving sign with largest-remainder ordering.
 export function allocateSignedMinorUnits(sourceMinor: number, weights: number[]): number[] {
   const sign = sourceMinor < 0 ? -1 : 1;
   return allocateMinorUnits(Math.abs(sourceMinor), weights).map((minor) => minor * sign);
@@ -588,23 +649,19 @@ function parseTaxSnapshot(raw: unknown): unknown {
   try { return JSON.parse(raw); } catch { return null; }
 }
 
-function snapshotMinorAmount(value: unknown): number | null {
+function snapshotMinorAmount(value: unknown, minorFactor = 100): number | null {
   if (typeof value !== 'string' && typeof value !== 'number') return null;
   const amount = Number(value);
   if (!Number.isFinite(amount)) return null;
-  return Math.round(amount * 100);
+  return Math.round(amount * minorFactor);
 }
 
-function formatSnapshotMinorAmount(original: unknown, minor: number): string | number {
-  const amount = minor / 100;
-  return typeof original === 'string' ? amount.toFixed(2) : amount;
+function formatSnapshotMinorAmount(original: unknown, minor: number, minorFactor = 100): string | number {
+  const amount = minor / minorFactor;
+  return typeof original === 'string' ? amount.toFixed(Math.log10(minorFactor)) : amount;
 }
 
-/**
- * Persist a child-specific copy of every tax snapshot. Snapshot amounts are
- * tax evidence, so allocate each component in integer minor units with the
- * same non-negative largest-remainder allocator used for bill totals.
- */
+/** Allocates tax snapshot components in integer minor units across child checks. */
 interface SnapshotTaxAllocation {
   original: unknown;
   allocations: number[];
@@ -654,6 +711,7 @@ function allocateTaxBreakdownForChild(
   weights: number[],
   childIndex: number,
   sourceTaxMinor?: number,
+  minorFactor = 100,
 ): string | unknown {
   const parsed = typeof raw === 'string'
     ? (() => { try { return JSON.parse(raw); } catch { return null; } })()
@@ -665,20 +723,20 @@ function allocateTaxBreakdownForChild(
     parsed.forEach((outer: any, outerIndex: number) => {
       if (!Array.isArray(outer)) return;
       outer.forEach((component: any, innerIndex: number) => {
-        const amount = snapshotMinorAmount(component?.amount);
+        const amount = snapshotMinorAmount(component?.amount, minorFactor);
         if (amount !== null) entries.push({ outerIndex, innerIndex, original: component.amount, allocations: allocateSignedMinorUnits(amount, weights) });
       });
     });
   } else {
     parsed.forEach((component: any, innerIndex: number) => {
-      const amount = snapshotMinorAmount(component?.amount);
+      const amount = snapshotMinorAmount(component?.amount, minorFactor);
       if (amount !== null) entries.push({ innerIndex, original: component.amount, allocations: allocateSignedMinorUnits(amount, weights) });
     });
   }
   if (entries.length === 0) return raw;
 
   const target = sourceTaxMinor === undefined
-    ? entries.reduce((sum, entry) => sum + snapshotMinorAmount(entry.original)!, 0)
+    ? entries.reduce((sum, entry) => sum + snapshotMinorAmount(entry.original, minorFactor)!, 0)
     : sourceTaxMinor;
   reconcileSnapshotAllocations(entries, allocateSignedMinorUnits(target, weights));
   const cloned = JSON.parse(JSON.stringify(parsed));
@@ -687,13 +745,13 @@ function allocateTaxBreakdownForChild(
       if (!Array.isArray(outer)) return;
       outer.forEach((component: any, innerIndex: number) => {
         const entry = entries.find((candidate) => candidate.outerIndex === outerIndex && candidate.innerIndex === innerIndex);
-        if (entry) component.amount = formatSnapshotMinorAmount(entry.original, entry.allocations[childIndex]);
+        if (entry) component.amount = formatSnapshotMinorAmount(entry.original, entry.allocations[childIndex], minorFactor);
       });
     });
   } else {
     cloned.forEach((component: any, innerIndex: number) => {
       const entry = entries.find((candidate) => candidate.outerIndex === undefined && candidate.innerIndex === innerIndex);
-      if (entry) component.amount = formatSnapshotMinorAmount(entry.original, entry.allocations[childIndex]);
+      if (entry) component.amount = formatSnapshotMinorAmount(entry.original, entry.allocations[childIndex], minorFactor);
     });
   }
   return typeof raw === 'string' ? JSON.stringify(cloned) : cloned;
@@ -704,6 +762,7 @@ function allocateTaxSnapshotsWithTax(
   weights: number[],
   snapshotWeights?: Array<number[] | null>,
   snapshotExclusions?: boolean[],
+  minorFactor = 100,
 ): TaxSnapshotAllocationResult {
   const parsed = parseTaxSnapshot(sourceRaw);
   const sourceText = typeof sourceRaw === 'string'
@@ -738,7 +797,7 @@ function allocateTaxSnapshotsWithTax(
         const exclusive = sourceLine.taxBehavior !== 'inclusive' && sourceLine.taxBehavior !== 'exempt';
         sourceLine.components.forEach((sourceComponent: any, componentIndex: number) => {
           if (!sourceComponent || typeof sourceComponent !== 'object') return;
-          const sourceMinor = snapshotMinorAmount(sourceComponent.amount);
+          const sourceMinor = snapshotMinorAmount(sourceComponent.amount, minorFactor);
           if (sourceMinor === null) return;
           const entry: SnapshotTaxAllocation = {
             original: sourceComponent.amount,
@@ -749,7 +808,7 @@ function allocateTaxSnapshotsWithTax(
           entryByKey.set(`${snapshotIndex}:${lineIndex}:${componentIndex}`, entry);
         });
       } else {
-        const sourceMinor = snapshotMinorAmount(sourceLine.taxAmount);
+        const sourceMinor = snapshotMinorAmount(sourceLine.taxAmount, minorFactor);
         if (sourceMinor !== null) {
           const entry: SnapshotTaxAllocation = {
             original: sourceLine.taxAmount,
@@ -764,7 +823,7 @@ function allocateTaxSnapshotsWithTax(
 
     if (snapshotEntries.length > 0) {
       const snapshotTotal = snapshotEntries.reduce(
-        (sum, entry) => sum + snapshotMinorAmount(entry.original)!,
+        (sum, entry) => sum + snapshotMinorAmount(entry.original, minorFactor)!,
         0,
       );
       reconcileSnapshotAllocations(
@@ -804,11 +863,12 @@ function allocateTaxSnapshotsWithTax(
         const line = childSnapshot.lines?.[lineIndex];
         if (!sourceLine || !line || typeof line !== 'object') return;
         for (const field of ['grossAmount', 'taxableBase'] as const) {
-          const sourceMinor = snapshotMinorAmount(sourceLine[field]);
+          const sourceMinor = snapshotMinorAmount(sourceLine[field], minorFactor);
           if (sourceMinor !== null) {
             line[field] = formatSnapshotMinorAmount(
               sourceLine[field],
               allocateSignedMinorUnits(sourceMinor, localWeights)[childIndex],
+              minorFactor,
             );
           }
         }
@@ -830,15 +890,15 @@ function allocateTaxSnapshotsWithTax(
               allComponentsAllocated = false;
               return;
             }
-            resultComponent.amount = formatSnapshotMinorAmount(entry.original, entry.allocations[childIndex]);
+            resultComponent.amount = formatSnapshotMinorAmount(entry.original, entry.allocations[childIndex], minorFactor);
             componentTotal += entry.allocations[childIndex];
           });
           if (allComponentsAllocated) {
-            resultLine.taxAmount = formatSnapshotMinorAmount(sourceLine.taxAmount, componentTotal);
+            resultLine.taxAmount = formatSnapshotMinorAmount(sourceLine.taxAmount, componentTotal, minorFactor);
           }
         } else {
           const entry = entryByKey.get(`${snapshotIndex}:${lineIndex}:taxAmount`);
-          if (entry) resultLine.taxAmount = formatSnapshotMinorAmount(entry.original, entry.allocations[childIndex]);
+          if (entry) resultLine.taxAmount = formatSnapshotMinorAmount(entry.original, entry.allocations[childIndex], minorFactor);
         }
       });
     });
@@ -852,26 +912,31 @@ export function allocateTaxSnapshots(
   sourceRaw: unknown,
   weights: number[],
   snapshotWeights?: Array<number[] | null>,
+  minorFactor = 100,
 ): (string | null)[] {
-  return allocateTaxSnapshotsWithTax(sourceRaw, weights, snapshotWeights).snapshots;
+  return allocateTaxSnapshotsWithTax(sourceRaw, weights, snapshotWeights, undefined, minorFactor).snapshots;
 }
 
 function composeSplitTotals(
   allocations: Record<string, number[]>,
   exclusiveTaxMinors: number[],
+  minorFactor: number = 100,
+  decimals: number = 2,
 ): number[] {
   const discountAmount = allocations.discount_amount ?? allocations.discountAmount;
   const deliveryCharge = allocations.delivery_charge ?? allocations.deliveryCharge;
   const packagingCharge = allocations.packaging_charge ?? allocations.packagingCharge;
+  const serviceCharge = allocations.service_charge ?? allocations.serviceCharge;
   const roundOff = allocations.round_off ?? allocations.roundOff;
   return allocations.subtotal.map((subtotal, index) => Number((
     subtotal
     - discountAmount[index]
-    + exclusiveTaxMinors[index] / 100
+    + exclusiveTaxMinors[index] / minorFactor
     + deliveryCharge[index]
     + packagingCharge[index]
+    + serviceCharge[index]
     + roundOff[index]
-  ).toFixed(2)));
+  ).toFixed(decimals)));
 }
 
 function allocateTaxBreakdown(
@@ -879,6 +944,7 @@ function allocateTaxBreakdown(
   checkTaxMinors: number[],
   weights: number[],
   componentWeights?: Array<number[] | null>,
+  minorFactor: number = 100,
 ): (string | null)[] {
   const numChecks = weights.length;
   const parsed = typeof sourceBreakdownRaw === 'string'
@@ -909,7 +975,7 @@ function allocateTaxBreakdown(
               outerIndex,
               innerIndex,
               component: comp,
-              minorAmount: Math.round(Number(comp.amount || 0) * 100),
+              minorAmount: Math.round(Number(comp.amount || 0) * minorFactor),
             });
           }
         });
@@ -921,7 +987,7 @@ function allocateTaxBreakdown(
         components.push({
           innerIndex,
           component: comp,
-          minorAmount: Math.round(Number(comp.amount || 0) * 100),
+          minorAmount: Math.round(Number(comp.amount || 0) * minorFactor),
         });
       }
     });
@@ -981,10 +1047,10 @@ function allocateTaxBreakdown(
         if (!Array.isArray(outer)) return outer;
         return outer.map((comp: any, innerIdx: number) => {
           const compIdx = components.findIndex((c) => c.outerIndex === outerIdx && c.innerIndex === innerIdx);
-          const minor = compIdx !== -1 ? compAllocations[compIdx][k] : Math.round(Number(comp?.amount || 0) * 100);
+          const minor = compIdx !== -1 ? compAllocations[compIdx][k] : Math.round(Number(comp?.amount || 0) * minorFactor);
           return {
             ...comp,
-            amount: minor / 100,
+            amount: minor / minorFactor,
           };
         });
       });
@@ -992,10 +1058,10 @@ function allocateTaxBreakdown(
     } else {
       const clonedFlat = parsed.map((comp: any, innerIdx: number) => {
         const compIdx = components.findIndex((c) => c.innerIndex === innerIdx);
-        const minor = compIdx !== -1 ? compAllocations[compIdx][k] : Math.round(Number(comp?.amount || 0) * 100);
+        const minor = compIdx !== -1 ? compAllocations[compIdx][k] : Math.round(Number(comp?.amount || 0) * minorFactor);
         return {
           ...comp,
-          amount: minor / 100,
+          amount: minor / minorFactor,
         };
       });
       result.push(JSON.stringify(clonedFlat));
@@ -1013,6 +1079,7 @@ interface OrderBillSyncValues {
   discountAmount: number;
   deliveryCharge: number;
   packagingCharge: number;
+  serviceCharge: number;
   total: number;
 }
 
@@ -1034,6 +1101,7 @@ function collectLegacyTaxContribution(
   itemWeights: (item: any) => number[],
   taxRatio: number,
   sourceBreakdownRaw?: unknown,
+  minorFactor = 100,
 ): LegacyTaxContribution {
   const taxWeights = new Array(weights.length).fill(0);
   const exclusiveWeights = new Array(weights.length).fill(0);
@@ -1049,10 +1117,10 @@ function collectLegacyTaxContribution(
     ? new Map<number, any>()
     : getPersistedChildTaxBreakdowns(sourceBreakdownRaw, items);
   for (const item of items) {
-    if (['cancelled', 'voided', 'void_adjustment'].includes(item.status) || hasSnapshotLines(item.tax_snapshot)) continue;
+    if (['cancelled', 'voided', 'void_adjustment', 'refunded'].includes(item.status) || hasSnapshotLines(item.tax_snapshot)) continue;
     const sourceCents = persistedBreakdowns.has(Number(item.id))
-      ? taxBreakdownMinorTotal(persistedBreakdowns.get(Number(item.id)))
-      : Number(item.tax_amount || 0) * taxRatio * 100;
+      ? taxBreakdownMinorTotal(persistedBreakdowns.get(Number(item.id)), minorFactor)
+      : Number(item.tax_amount || 0) * taxRatio * minorFactor;
     if (!Number.isFinite(sourceCents) || sourceCents === 0) continue;
     const ownerWeights = itemWeights(item);
     const effectiveWeights = ownerWeights.some((weight) => weight > 0) ? ownerWeights : weights;
@@ -1080,7 +1148,7 @@ function collectLegacyTaxContribution(
     else allExclusive = false;
     hasLegacyItems = true;
   }
-  const hasDocumentLegacyTax = sourceBreakdownRaw !== undefined && taxBreakdownMinorTotal(sourceBreakdownRaw) !== 0;
+  const hasDocumentLegacyTax = sourceBreakdownRaw !== undefined && taxBreakdownMinorTotal(sourceBreakdownRaw, minorFactor) !== 0;
   return {
     taxWeights,
     exclusiveWeights,
@@ -1155,6 +1223,7 @@ function getSplitBillAllocationWeights(
   bills: any[],
   legacyTaxRatio = 1,
   legacyBreakdownRaw?: unknown,
+  minorFactor = 100,
 ): {
   weights: number[];
   snapshotWeights: Array<number[] | null>;
@@ -1176,7 +1245,7 @@ function getSplitBillAllocationWeights(
   const weights = bills.map((bill) => {
     const byItem = quantities.get(Number(bill.id)) || new Map<number, number>();
     return items
-      .filter((item) => !['cancelled', 'voided', 'void_adjustment'].includes(item.status))
+      .filter((item) => !['cancelled', 'voided', 'void_adjustment', 'refunded'].includes(item.status))
       .reduce((sum, item) => {
         const quantity = byItem.get(Number(item.id)) || 0;
         if (quantity <= 0 || Number(item.quantity) <= 0) return sum;
@@ -1185,7 +1254,7 @@ function getSplitBillAllocationWeights(
   });
 
   const snapshotItems = items
-    .filter((item) => !['cancelled', 'voided', 'void_adjustment'].includes(item.status) && hasSnapshotLines(item.tax_snapshot))
+    .filter((item) => !['cancelled', 'voided', 'void_adjustment', 'refunded'].includes(item.status) && hasSnapshotLines(item.tax_snapshot))
   const snapshotWeights = snapshotItems.map((item) => {
     if (['voided', 'void_adjustment'].includes(item.status)) return null;
     const itemWeights = bills.map((bill) => (
@@ -1200,6 +1269,7 @@ function getSplitBillAllocationWeights(
     (item) => bills.map((bill) => quantities.get(Number(bill.id))?.get(Number(item.id)) || 0),
     legacyTaxRatio,
     legacyBreakdownRaw,
+    minorFactor,
   );
 
   return {
@@ -1267,7 +1337,7 @@ function getTaxBreakdownWeights(
   if (!Array.isArray(parsed[0])) {
     const ownerWeightsByKey = new Map<string, number[]>();
     for (const item of items) {
-      if (['cancelled', 'voided', 'void_adjustment'].includes(item.status) || hasSnapshotLines(item.tax_snapshot)) continue;
+      if (['cancelled', 'voided', 'void_adjustment', 'refunded'].includes(item.status) || hasSnapshotLines(item.tax_snapshot)) continue;
       const itemBreakdown = parseTaxSnapshot(item.tax_breakdown);
       if (!Array.isArray(itemBreakdown)) continue;
       const itemComponents = itemBreakdown.flatMap((entry: any) => Array.isArray(entry) ? entry : [entry]);
@@ -1289,7 +1359,7 @@ function getTaxBreakdownWeights(
   return parsed.map(() => {
     while (itemIndex < items.length) {
       const item = items[itemIndex++];
-      if (['cancelled', 'voided', 'void_adjustment'].includes(item.status)) continue;
+      if (['cancelled', 'voided', 'void_adjustment', 'refunded'].includes(item.status)) continue;
       const breakdown = parseTaxSnapshot(item.tax_breakdown);
       if (Array.isArray(breakdown) && breakdown.length > 0) {
         return itemWeights(item);
@@ -1313,25 +1383,28 @@ export function syncUnpaidBillsForOrder(
   const unpaidBills = bills.filter((bill) => bill.payment_status !== 'paid');
   if (unpaidBills.length === 0) return;
 
+  const tenantCurrency = getTenantCurrency();
   const pack = getActiveCountryPack(country);
-  const { total: billTotal, adjustment: billRoundOff } = applyPayableRounding(source.total, pack);
+  const { total: billTotal, adjustment: billRoundOff } = applyPayableRounding(source.total, pack, tenantCurrency);
 
   if (!splitBills) {
     const update = db.prepare(`
       UPDATE bills SET subtotal = ?, total = ?, balance = ?, tax_amount = ?, tax_breakdown = ?, tax_snapshot = ?,
-        discount_amount = ?, delivery_charge = ?, packaging_charge = ?, round_off = ?, updated_at = ?
+        discount_amount = ?, delivery_charge = ?, packaging_charge = ?, service_charge = ?, round_off = ?, updated_at = ?
       WHERE id = ?
     `);
     for (const bill of unpaidBills) {
       update.run(
         source.subtotal, billTotal, Math.max(0, billTotal - Number(bill.paid_amount || 0)), source.taxAmount,
         source.taxBreakdown, source.taxSnapshot, source.discountAmount, source.deliveryCharge,
-        source.packagingCharge, billRoundOff, now(), bill.id,
+        source.packagingCharge, source.serviceCharge, billRoundOff, now(), bill.id,
       );
     }
     return;
   }
 
+  const minorFactor = getCurrencyMinorUnitFactor(tenantCurrency);
+  const decimals = getCurrencyFractionDigits(tenantCurrency);
   const {
     weights,
     snapshotWeights,
@@ -1343,24 +1416,26 @@ export function syncUnpaidBillsForOrder(
     bills,
     getTaxDiscountRatio(source.subtotal, source.discountAmount),
     source.taxBreakdown,
+    minorFactor,
   );
   const fields = {
-    subtotal: Math.round(source.subtotal * 100),
-    taxAmount: Math.round(source.taxAmount * 100),
-    discountAmount: Math.round(source.discountAmount * 100),
-    deliveryCharge: Math.round(source.deliveryCharge * 100),
-    packagingCharge: Math.round(source.packagingCharge * 100),
-    roundOff: Math.round(billRoundOff * 100),
-    total: Math.round(billTotal * 100),
+    subtotal: Math.round(source.subtotal * minorFactor),
+    taxAmount: Math.round(source.taxAmount * minorFactor),
+    discountAmount: Math.round(source.discountAmount * minorFactor),
+    deliveryCharge: Math.round(source.deliveryCharge * minorFactor),
+    packagingCharge: Math.round(source.packagingCharge * minorFactor),
+    serviceCharge: Math.round(source.serviceCharge * minorFactor),
+    roundOff: Math.round(billRoundOff * minorFactor),
+    total: Math.round(billTotal * minorFactor),
   };
   const allocations = Object.fromEntries(Object.entries(fields).map(([field, value]) => [
     field,
     (field === 'roundOff' ? allocateSignedMinorUnits(value, weights) : allocateMinorUnits(value, weights))
-      .map((minor) => minor / 100),
+      .map((minor) => minor / minorFactor),
   ])) as Record<keyof typeof fields, number[]>;
-  const allocatedTaxMinors = allocations.taxAmount.map((amount) => Math.round(amount * 100));
-  const snapshotAllocation = allocateTaxSnapshotsWithTax(source.taxSnapshot, weights, snapshotWeights, snapshotExclusions);
-  const sourceTaxMinor = Math.round(Number(source.taxAmount || 0) * 100);
+  const allocatedTaxMinors = allocations.taxAmount.map((amount) => Math.round(amount * minorFactor));
+  const snapshotAllocation = allocateTaxSnapshotsWithTax(source.taxSnapshot, weights, snapshotWeights, snapshotExclusions, minorFactor);
+  const sourceTaxMinor = Math.round(Number(source.taxAmount || 0) * minorFactor);
   const legacyAllocation = allocateLegacyTaxContribution(
     sourceTaxMinor,
     snapshotAllocation,
@@ -1377,8 +1452,8 @@ export function syncUnpaidBillsForOrder(
   );
   const taxMinors = resolvedTax.taxMinors;
   if (resolvedTax.exclusiveTaxMinors) {
-    allocations.taxAmount = taxMinors.map((minor) => minor / 100);
-    allocations.total = composeSplitTotals(allocations, resolvedTax.exclusiveTaxMinors);
+    allocations.taxAmount = taxMinors.map((minor) => minor / minorFactor);
+    allocations.total = composeSplitTotals(allocations, resolvedTax.exclusiveTaxMinors, minorFactor, decimals);
   }
   const sourceItems = db.prepare('SELECT * FROM order_items WHERE order_id = ? ORDER BY id').all(orderId) as any[];
   const breakdowns = allocateTaxBreakdown(
@@ -1390,11 +1465,12 @@ export function syncUnpaidBillsForOrder(
       sourceItems,
       (item) => getBillItemWeights(db, bills, Number(item.id)),
     ),
+    minorFactor,
   );
   const snapshots = snapshotAllocation.snapshots;
   const update = db.prepare(`
     UPDATE bills SET subtotal = ?, tax_amount = ?, tax_breakdown = ?, tax_snapshot = ?, discount_amount = ?,
-      delivery_charge = ?, packaging_charge = ?, round_off = ?, total = ?, balance = ?, updated_at = ?
+      delivery_charge = ?, packaging_charge = ?, service_charge = ?, round_off = ?, total = ?, balance = ?, updated_at = ?
     WHERE id = ?
   `);
 
@@ -1403,16 +1479,14 @@ export function syncUnpaidBillsForOrder(
     const total = allocations.total[index];
     update.run(
       allocations.subtotal[index], allocations.taxAmount[index], breakdowns[index], snapshots[index],
-      allocations.discountAmount[index], allocations.deliveryCharge[index], allocations.packagingCharge[index],
+      allocations.discountAmount[index], allocations.deliveryCharge[index], allocations.packagingCharge[index], allocations.serviceCharge[index],
       allocations.roundOff[index], total, Math.max(0, total - Number(bill.paid_amount || 0)), now(), bill.id,
     );
   });
 }
 
-// Divide one unpaid dine-in bill into independently payable guest checks.
-// The kitchen order and inventory rows remain singular; bill_items stores only
-// the whole-unit quantity allocated to each resulting check.
-router.post('/:id/split-check', requireRole('owner', 'manager', 'cashier'), (req: Request, res: Response) => {
+// Split unpaid dine-in bill into independently payable guest checks.
+router.post('/:id/split-check', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     if (getSettingValue('split_checks_enabled') !== 'true') return res.status(403).json({ error: 'Split checks are not enabled' });
@@ -1430,7 +1504,7 @@ router.post('/:id/split-check', requireRole('owner', 'manager', 'cashier'), (req
       if (txnSource.split_group_id || Number((db.prepare('SELECT COUNT(*) AS n FROM bills WHERE order_id = ?').get(txnSource.order_id) as any).n) > 1) {
         throw Object.assign(new Error('This check has already been split'), { statusCode: 409 });
       }
-      const txnActiveItems = db.prepare("SELECT * FROM order_items WHERE order_id = ? AND status NOT IN ('cancelled', 'voided', 'void_adjustment') ORDER BY id").all(txnSource.order_id) as any[];
+      const txnActiveItems = db.prepare("SELECT * FROM order_items WHERE order_id = ? AND status NOT IN ('cancelled', 'voided', 'void_adjustment', 'refunded') ORDER BY id").all(txnSource.order_id) as any[];
       const txnItemById = new Map(txnActiveItems.map((item) => [Number(item.id), item]));
       const txnAssigned = new Map<number, number>();
 
@@ -1462,17 +1536,21 @@ router.post('/:id/split-check', requireRole('owner', 'manager', 'cashier'), (req
         check.items.reduce((sum: number, entry: { item: any; quantity: number }) => sum + Number(entry.item.total || entry.item.subtotal || 0) * entry.quantity / Number(entry.item.quantity), 0)
       );
 
-      const fields = ['subtotal', 'tax_amount', 'discount_amount', 'delivery_charge', 'packaging_charge', 'round_off', 'total'] as const;
+      const tenantCurrency = getTenantCurrency();
+      const minorFactor = getCurrencyMinorUnitFactor(tenantCurrency);
+      const decimals = getCurrencyFractionDigits(tenantCurrency);
+
+      const fields = ['subtotal', 'tax_amount', 'discount_amount', 'delivery_charge', 'packaging_charge', 'service_charge', 'round_off', 'total'] as const;
       const allocations: Record<string, number[]> = {};
       for (const field of fields) {
-        const totalMinor = Math.round(Number(txnSource[field] || 0) * 100);
+        const totalMinor = Math.round(Number(txnSource[field] || 0) * minorFactor);
         const allocatedMinors = field === 'round_off'
           ? allocateSignedMinorUnits(totalMinor, weights)
           : allocateMinorUnits(totalMinor, weights);
-        allocations[field] = allocatedMinors.map((minor) => minor / 100);
+        allocations[field] = allocatedMinors.map((minor) => minor / minorFactor);
       }
 
-      const checkTaxMinors = allocations.tax_amount.map((amt) => Math.round(amt * 100));
+      const checkTaxMinors = allocations.tax_amount.map((amt) => Math.round(amt * minorFactor));
       const txnSnapshotItems = db.prepare("SELECT * FROM order_items WHERE order_id = ? AND status != 'cancelled' ORDER BY id").all(txnSource.order_id) as any[];
       const snapshotItems = txnSnapshotItems.filter((item) => hasSnapshotLines(item.tax_snapshot));
       const snapshotWeights = snapshotItems.map((item) => {
@@ -1482,8 +1560,8 @@ router.post('/:id/split-check', requireRole('owner', 'manager', 'cashier'), (req
         ));
       });
       const snapshotExclusions = snapshotItems.map((item) => ['voided', 'void_adjustment'].includes(item.status));
-      const snapshotAllocation = allocateTaxSnapshotsWithTax(txnSource.tax_snapshot, weights, snapshotWeights, snapshotExclusions);
-      const sourceTaxMinor = Math.round(Number(txnSource.tax_amount || 0) * 100);
+      const snapshotAllocation = allocateTaxSnapshotsWithTax(txnSource.tax_snapshot, weights, snapshotWeights, snapshotExclusions, minorFactor);
+      const sourceTaxMinor = Math.round(Number(txnSource.tax_amount || 0) * minorFactor);
       const legacyTaxRatio = getTaxDiscountRatio(txnSource.subtotal, txnSource.discount_amount);
       const legacyContribution = collectLegacyTaxContribution(
         txnSnapshotItems,
@@ -1493,6 +1571,7 @@ router.post('/:id/split-check', requireRole('owner', 'manager', 'cashier'), (req
         )),
         legacyTaxRatio,
         txnSource.tax_breakdown,
+        minorFactor,
       );
       const legacyAllocation = allocateLegacyTaxContribution(
         sourceTaxMinor,
@@ -1510,8 +1589,8 @@ router.post('/:id/split-check', requireRole('owner', 'manager', 'cashier'), (req
       );
       const resolvedTaxMinors = resolvedTax.taxMinors;
       if (resolvedTax.exclusiveTaxMinors) {
-        allocations.tax_amount = resolvedTaxMinors.map((minor) => minor / 100);
-        allocations.total = composeSplitTotals(allocations, resolvedTax.exclusiveTaxMinors);
+        allocations.tax_amount = resolvedTaxMinors.map((minor) => minor / minorFactor);
+        allocations.total = composeSplitTotals(allocations, resolvedTax.exclusiveTaxMinors, minorFactor, decimals);
       }
       const resolvedTaxBreakdowns = allocateTaxBreakdown(
         txnSource.tax_breakdown,
@@ -1524,6 +1603,7 @@ router.post('/:id/split-check', requireRole('owner', 'manager', 'cashier'), (req
             check.items.find((entry) => Number(entry.item.id) === Number(item.id))?.quantity || 0
           )),
         ),
+        minorFactor,
       );
       const checkTaxSnapshots = snapshotAllocation.snapshots;
 
@@ -1533,12 +1613,18 @@ router.post('/:id/split-check', requireRole('owner', 'manager', 'cashier'), (req
         const splitBk = resolvedTaxBreakdowns[index];
         const splitSnapshot = checkTaxSnapshots[index];
         if (index === 0) {
-          db.prepare(`UPDATE bills SET split_group_id = ?, split_label = ?, subtotal = ?, tax_amount = ?, tax_breakdown = ?, tax_snapshot = ?, discount_amount = ?, delivery_charge = ?, packaging_charge = ?, round_off = ?, total = ?, balance = ?, updated_at = ? WHERE id = ?`)
-            .run(groupId, check.label, allocations.subtotal[index], allocations.tax_amount[index], splitBk, splitSnapshot, allocations.discount_amount[index], allocations.delivery_charge[index], allocations.packaging_charge[index], allocations.round_off[index], allocations.total[index], allocations.total[index], now(), txnSource.id);
+          db.prepare(`UPDATE bills SET split_group_id = ?, split_label = ?, subtotal = ?, tax_amount = ?, tax_breakdown = ?, tax_snapshot = ?, discount_amount = ?, delivery_charge = ?, packaging_charge = ?, service_charge = ?, round_off = ?, total = ?, balance = ?, updated_at = ? WHERE id = ?`)
+            .run(groupId, check.label, allocations.subtotal[index], allocations.tax_amount[index], splitBk, splitSnapshot, allocations.discount_amount[index], allocations.delivery_charge[index], allocations.packaging_charge[index], allocations.service_charge[index], allocations.round_off[index], allocations.total[index], allocations.total[index], now(), txnSource.id);
           billId = Number(txnSource.id);
         } else {
-          const inserted = db.prepare(`INSERT INTO bills (bill_number, order_id, customer_id, subtotal, tax_amount, tax_breakdown, tax_snapshot, discount_amount, discount_type, discount_value, discount_reason, delivery_charge, packaging_charge, round_off, total, paid_amount, balance, payment_status, split_group_id, split_label, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'unpaid', ?, ?, ?, ?)`)
-            .run(generateBillNumber(), txnSource.order_id, txnSource.customer_id, allocations.subtotal[index], allocations.tax_amount[index], splitBk, splitSnapshot, allocations.discount_amount[index], txnSource.discount_type, txnSource.discount_value, txnSource.discount_reason, allocations.delivery_charge[index], allocations.packaging_charge[index], allocations.round_off[index], allocations.total[index], allocations.total[index], groupId, check.label, now(), now());
+          const inserted = db.prepare(`
+            INSERT INTO bills (bill_number, order_id, customer_id, subtotal, tax_amount, tax_breakdown, tax_snapshot,
+              discount_amount, discount_type, discount_value, discount_reason, delivery_charge, packaging_charge,
+              service_charge, round_off, total, paid_amount, balance, payment_status, split_group_id, split_label,
+              created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 'unpaid', ?, ?, ?, ?)
+          `)
+            .run(generateBillNumber(), txnSource.order_id, txnSource.customer_id, allocations.subtotal[index], allocations.tax_amount[index], splitBk, splitSnapshot, allocations.discount_amount[index], txnSource.discount_type, txnSource.discount_value, txnSource.discount_reason, allocations.delivery_charge[index], allocations.packaging_charge[index], allocations.service_charge[index], allocations.round_off[index], allocations.total[index], allocations.total[index], groupId, check.label, now(), now());
           billId = Number(inserted.lastInsertRowid);
         }
         billIds.push(billId);
@@ -1655,20 +1741,28 @@ function paymentIdempotencyKey(req: Request): string | null {
   return supplied;
 }
 
-function paymentAmountCents(value: unknown, label = 'Payment amount'): number {
+export function paymentAmountMinorUnits(value: unknown, currency: string, label = 'Payment amount'): number {
   if (typeof value !== 'number' && typeof value !== 'string') {
     throw Object.assign(new Error(`${label} must be a finite number greater than zero`), { statusCode: 400 });
   }
+  const decimals = getCurrencyFractionDigits(currency);
+  const factor = getCurrencyMinorUnitFactor(currency);
   const text = String(value).trim();
-  if (!/^\d+(?:\.\d{1,2})?$/.test(text)) {
-    throw Object.assign(new Error(`${label} must be a finite number greater than zero with at most 2 decimal places`), { statusCode: 400 });
+  const pattern = decimals === 0 ? /^\d+$/ : new RegExp(`^\\d+(?:\\.\\d{1,${decimals}})?$`);
+  if (!pattern.test(text)) {
+    const decDesc = decimals === 0 ? 'without decimals' : `with at most ${decimals} decimal places`;
+    throw Object.assign(new Error(`${label} must be a finite number greater than zero ${decDesc}`), { statusCode: 400 });
   }
   const parsed = Number(text);
-  const cents = Math.round(parsed * 100);
-  if (!Number.isFinite(parsed) || parsed <= 0 || !Number.isSafeInteger(cents)) {
+  const minorUnits = Math.round(parsed * factor);
+  if (!Number.isFinite(parsed) || parsed <= 0 || !Number.isSafeInteger(minorUnits)) {
     throw Object.assign(new Error(`${label} must be a finite number greater than zero`), { statusCode: 400 });
   }
-  return cents;
+  return minorUnits;
+}
+
+export function paymentAmountCents(value: unknown, label = 'Payment amount'): number {
+  return paymentAmountMinorUnits(value, 'USD', label);
 }
 
 interface PreparedPayment {
@@ -1679,7 +1773,7 @@ interface PreparedPayment {
   amountOmitted?: boolean;
 }
 
-function validatePaymentFields(payment: PaymentInput, index: number): void {
+function validatePaymentFields(payment: PaymentInput, index: number, currency: string): void {
   if (!payment || typeof payment !== 'object' || Array.isArray(payment)) {
     throw Object.assign(new Error(`Unsupported payment method at line ${index + 1}`), { statusCode: 400 });
   }
@@ -1697,7 +1791,9 @@ function validatePaymentFields(payment: PaymentInput, index: number): void {
       throw Object.assign(new Error(`${field} is invalid or too long`), { statusCode: 400 });
     }
   }
-  if (payment.amount !== undefined && payment.amount !== null) paymentAmountCents(payment.amount);
+  if (payment.amount !== undefined && payment.amount !== null) {
+    paymentAmountMinorUnits(payment.amount, currency);
+  }
 }
 
 function paymentTransactionKey(payment: unknown): string | null {
@@ -1709,17 +1805,18 @@ function paymentTransactionKey(payment: unknown): string | null {
     : null;
 }
 
-function transactionPaymentMatches(existing: any, candidate: PaymentInput): boolean {
+function transactionPaymentMatches(existing: any, candidate: PaymentInput, currency: string): boolean {
   if (!existing) return false;
   if (existing.method !== candidate.method || existing.transaction_id !== candidate.transaction_id) return false;
   if ((existing.notes ?? null) !== (candidate.notes ?? null)) return false;
   const candidateOmitted = candidate.amount === undefined || candidate.amount === null;
   if (existing.amount_omitted !== undefined && Boolean(existing.amount_omitted) !== candidateOmitted) return false;
   if (candidateOmitted) return true;
-  const requestedCents = paymentAmountCents(candidate.amount);
+  const factor = getCurrencyMinorUnitFactor(currency);
+  const requestedMinorUnits = paymentAmountMinorUnits(candidate.amount, currency);
   const storedRequested = existing.requested_amount
     ?? (existing.method === 'cash' && existing.tendered_amount !== undefined ? existing.tendered_amount : existing.amount);
-  return typeof storedRequested === 'number' && Math.round(storedRequested * 100) === requestedCents;
+  return typeof storedRequested === 'number' && Math.round(storedRequested * factor) === requestedMinorUnits;
 }
 
 function preparePaymentBatch(
@@ -1744,7 +1841,9 @@ function preparePaymentBatch(
       existingPayments = [];
     }
   }
-  payments.forEach(validatePaymentFields);
+  const currency = getTenantCurrency();
+  const minorFactor = getCurrencyMinorUnitFactor(currency);
+  payments.forEach((payment, index) => validatePaymentFields(payment, index, currency));
   const resolvedPayments = payments.map((payment, index) => {
     if (PAYMENT_METHODS.has(payment.method)) return payment;
     const configured = payment.method === 'custom'
@@ -1800,7 +1899,7 @@ function preparePaymentBatch(
   const replay = requestTransactionKeys.every((key, index) => (
     key !== null
     && existingTransactionKeys.has(key)
-    && transactionPaymentMatches(existingTransactionPayments.get(key), resolvedPayments[index])
+    && transactionPaymentMatches(existingTransactionPayments.get(key), resolvedPayments[index], currency)
   ));
   if (replay) {
     return { bill, prepared: [], existingPayments, effectiveCustomerId, idempotentReplay: true };
@@ -1813,7 +1912,7 @@ function preparePaymentBatch(
     if (key) seenTransactionKeys.add(key);
   }
   if (bill.payment_status === 'paid') throw Object.assign(new Error('Bill is already paid'), { statusCode: 400 });
-  const remainingCents = Math.max(0, Math.round((Number(bill.total) - Number(bill.paid_amount || 0)) * 100));
+  const remainingCents = Math.max(0, Math.round((Number(bill.total) - Number(bill.paid_amount || 0)) * minorFactor));
   if (remainingCents <= 0) throw Object.assign(new Error('Bill is already fully paid'), { statusCode: 400 });
   // Multi-currency: settle every line in base-currency cents. A secondary-
   // currency tender is converted here, at the entry of the pipeline, so all
@@ -1822,9 +1921,7 @@ function preparePaymentBatch(
   const secondaryByCode = new Map(getSecondaryCurrencies().map((c) => [c.code, c]));
   const raw = resolvedPayments.map((payment, lineIndex) => {
     const tender = resolveTenderContext(payment, baseCurrency, secondaryByCode, lineIndex);
-    // Preserve omitted/null compatibility for the legacy single-line contracts.
-    // Multi-line batches must state every amount explicitly so allocation is
-    // deterministic before any write.
+    // Single-line payments may omit amount to pay remaining balance; multi-line requires explicit amounts.
     const supportsOmittedAmount = allowOmittedAmount || payments.length === 1;
     const amountValue = supportsOmittedAmount && payment.amount === null ? undefined : payment.amount;
     if (tender.isSecondary && amountValue === undefined) {
@@ -1837,7 +1934,7 @@ function preparePaymentBatch(
       : amountValue;
     const amount = baseAmountValue === undefined
       ? (supportsOmittedAmount ? remainingCents : undefined)
-      : paymentAmountCents(baseAmountValue);
+      : paymentAmountMinorUnits(baseAmountValue, currency);
     if (amount === undefined) throw Object.assign(new Error('Payment amount is required for split payments'), { statusCode: 400 });
     const normalizedPayment: PaymentInput = {
       method: String(payment.method),
@@ -1878,8 +1975,8 @@ function preparePaymentBatch(
     const credits = db.prepare(`SELECT COALESCE(SUM(amount), 0) as total FROM loyalty_ledger WHERE customer_id = ? AND type = 'credit' AND (expires_at IS NULL OR expires_at > datetime('now'))`).get(effectiveCustomerId) as { total: number };
     const debits = db.prepare(`SELECT COALESCE(SUM(amount), 0) as total FROM loyalty_ledger WHERE customer_id = ? AND type = 'debit'`).get(effectiveCustomerId) as { total: number };
     const walletPoints = Math.max(0, Number(credits.total) - Number(debits.total));
-    const pointsRequired = prepared.filter((line) => line.payment.method === 'wallet').reduce((sum, line) => sum + line.amountCents, 0);
-    if (walletPoints < pointsRequired) throw Object.assign(new Error(`Insufficient wallet balance. Available: ${Math.floor(walletPoints / LOYALTY_REDEMPTION_RATE)} (${walletPoints} points), Required: ${pointsRequired / 100}`), { statusCode: 400 });
+    const pointsRequired = prepared.filter((line) => line.payment.method === 'wallet').reduce((sum, line) => sum + line.amountCents, 0) / minorFactor * LOYALTY_REDEMPTION_RATE;
+    if (walletPoints < pointsRequired) throw Object.assign(new Error(`Insufficient wallet balance. Available: ${walletPoints} points, Required: ${pointsRequired}`), { statusCode: 400 });
   }
   return { bill, prepared, existingPayments, effectiveCustomerId };
 }
@@ -1890,7 +1987,7 @@ function calculateCashback(db: ReturnType<typeof getDatabase>, bill: any, custom
   if (enabled !== 'true' && enabled !== '1') return 0;
   const globalRate = parseFloat((db.prepare(`SELECT value FROM settings WHERE key = 'global_cashback_percent'`).get() as any)?.value || '0');
   const order = db.prepare('SELECT subtotal, discount_amount FROM orders WHERE id = ?').get(bill.order_id) as any;
-  const items = db.prepare(`SELECT oi.subtotal, p.cb_percent FROM order_items oi JOIN products p ON p.id = oi.product_id WHERE oi.order_id = ? AND oi.status != 'cancelled'`).all(bill.order_id) as { subtotal: number; cb_percent: number | null }[];
+  const items = db.prepare(`SELECT oi.subtotal, p.cb_percent FROM order_items oi JOIN products p ON p.id = oi.product_id WHERE oi.order_id = ? AND oi.status NOT IN ('cancelled', 'voided', 'void_adjustment', 'refunded')`).all(bill.order_id) as { subtotal: number; cb_percent: number | null }[];
   const fullOrderCashback = items.reduce((sum, item) => {
     const discountShare = order?.discount_amount > 0 && order?.subtotal > 0 ? order.discount_amount * item.subtotal / order.subtotal : 0;
     const rate = item.cb_percent !== null ? item.cb_percent : globalRate;
@@ -1913,9 +2010,7 @@ function applyPaymentBatch(
   idempotencyUserId?: string,
 ): { bill: any; walletDebited: boolean; loyaltyPointsEarned: number } {
   if (idempotencyKey && idempotencyUserId) {
-    // `legacy` is an append-only compatibility owner for pre-user-scoped
-    // records whose original user cannot be recovered. It is only reachable
-    // with the exact bill and request hash; new records are always user-bound.
+    // Look up idempotency record scoped to user or legacy fallback.
     const prior = db.prepare(`
       SELECT bill_id, request_hash, response_json
       FROM payment_idempotency
@@ -1940,24 +2035,27 @@ function applyPaymentBatch(
   if (idempotentReplay) {
     return { bill: parseRowJson(db.prepare('SELECT * FROM bills WHERE id = ?').get(billId)), walletDebited: false, loyaltyPointsEarned: 0 };
   }
+  const currency = getTenantCurrency();
+  const minorFactor = getCurrencyMinorUnitFactor(currency);
   const totalAppliedCents = prepared.reduce((sum, line) => sum + line.amountCents, 0);
-  const oldPaidCents = Math.round(Number(bill.paid_amount || 0) * 100);
-  const totalCents = Math.round(Number(bill.total || 0) * 100);
+  const oldPaidCents = Math.round(Number(bill.paid_amount || 0) * minorFactor);
+  const totalCents = Math.round(Number(bill.total || 0) * minorFactor);
   const newPaidCents = oldPaidCents + totalAppliedCents;
   const newBalanceCents = Math.max(0, totalCents - newPaidCents);
   const paymentStatus = newBalanceCents === 0 ? 'paid' : 'partial';
   const newPayments = prepared.map((line) => ({
     ...line.payment,
-    amount: line.amountCents / 100,
-    requested_amount: (line.tenderedCents || line.amountCents) / 100,
+    amount: line.amountCents / minorFactor,
+    requested_amount: (line.tenderedCents || line.amountCents) / minorFactor,
     amount_omitted: Boolean(line.amountOmitted),
-    ...(line.payment.method === 'cash' ? { tendered_amount: (line.tenderedCents || 0) / 100, change_amount: (line.changeCents || 0) / 100 } : {}),
+    ...(line.payment.method === 'cash' ? { tendered_amount: (line.tenderedCents || 0) / minorFactor, change_amount: (line.changeCents || 0) / minorFactor } : {}),
     timestamp: now(),
   }));
   let walletDebited = false;
   for (const line of prepared) {
     if (line.payment.method !== 'wallet' || line.amountCents <= 0) continue;
-    db.prepare(`INSERT INTO loyalty_ledger (customer_id, bill_id, type, amount, description, created_at, updated_at) VALUES (?, ?, 'debit', ?, ?, ?, ?)`).run(effectiveCustomerId, bill.id, line.amountCents, `Payment for bill ${bill.bill_number}`, now(), now());
+    const pointsSpent = line.amountCents / minorFactor * LOYALTY_REDEMPTION_RATE;
+    db.prepare(`INSERT INTO loyalty_ledger (customer_id, bill_id, type, amount, description, created_at, updated_at) VALUES (?, ?, 'debit', ?, ?, ?, ?)`).run(effectiveCustomerId, bill.id, pointsSpent, `Payment for bill ${bill.bill_number}`, now(), now());
     walletDebited = true;
   }
   const allPayments = existingPayments.concat(newPayments);
@@ -1970,7 +2068,7 @@ function applyPaymentBatch(
     }
   }
   if (!bill.customer_id && effectiveCustomerId) db.prepare('UPDATE bills SET customer_id = ?, updated_at = ? WHERE id = ?').run(effectiveCustomerId, changedAt, billId);
-  db.prepare(`UPDATE bills SET paid_amount = ?, balance = ?, payment_status = ?, payment_details = ?, paid_at = CASE WHEN ? = 'paid' THEN ? ELSE paid_at END, updated_at = ? WHERE id = ?`).run(newPaidCents / 100, newBalanceCents / 100, paymentStatus, JSON.stringify(allPayments), paymentStatus, paymentStatus === 'paid' ? changedAt : null, changedAt, billId);
+  db.prepare(`UPDATE bills SET paid_amount = ?, balance = ?, payment_status = ?, payment_details = ?, paid_at = CASE WHEN ? = 'paid' THEN ? ELSE paid_at END, updated_at = ? WHERE id = ?`).run(newPaidCents / minorFactor, newBalanceCents / minorFactor, paymentStatus, JSON.stringify(allPayments), paymentStatus, paymentStatus === 'paid' ? changedAt : null, changedAt, billId);
   let loyaltyPointsEarned = 0;
   if (paymentStatus === 'paid') {
     const unpaidSibling = db.prepare(`SELECT 1 FROM bills WHERE order_id = ? AND id != ? AND payment_status != 'paid' LIMIT 1`).get(bill.order_id, bill.id);
@@ -1983,7 +2081,7 @@ function applyPaymentBatch(
     const cashback = calculateCashback(db, bill, effectiveCustomerId);
     const alreadyCredited = db.prepare(`SELECT id FROM loyalty_ledger WHERE bill_id = ? AND type = 'credit'`).get(bill.id);
     if (cashback > 0 && !alreadyCredited) {
-      const walletCents = allPayments.filter((p: any) => p.method === 'wallet').reduce((sum: number, p: any) => sum + Math.round(Number(p.amount || 0) * 100), 0);
+      const walletCents = allPayments.filter((p: any) => p.method === 'wallet').reduce((sum: number, p: any) => sum + Math.round(Number(p.amount || 0) * minorFactor), 0);
       const finalCashback = Math.floor(cashback * (1 - Math.min(1, walletCents / Math.max(1, totalCents))));
       if (finalCashback > 0) {
         db.prepare(`INSERT INTO loyalty_ledger (customer_id, bill_id, type, amount, description, created_at, updated_at) VALUES (?, ?, 'credit', ?, ?, ?, ?)`).run(effectiveCustomerId, bill.id, finalCashback, `Cashback on bill ${bill.bill_number}`, changedAt, changedAt);
@@ -1999,7 +2097,7 @@ function applyPaymentBatch(
   return result;
 }
 
-router.post('/:id/payment', requireRole('owner', 'manager', 'cashier'), (req: Request, res: Response) => {
+router.post('/:id/payment', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, res: Response) => {
   try {
     const payment = req.body;
     if (!payment || typeof payment !== 'object' || Array.isArray(payment)) {
@@ -2024,11 +2122,8 @@ router.post('/:id/payment', requireRole('owner', 'manager', 'cashier'), (req: Re
   }
 });
 
-// POST /:id/payments — atomic split-payment batch endpoint (#177). Applies every
-// payment line in the array within a single transaction, so a failure partway
-// through (insufficient wallet balance, an invalid amount, etc.) rolls back every
-// line already applied instead of leaving the bill partially paid.
-router.post('/:id/payments', requireRole('owner', 'manager', 'cashier'), (req: Request, res: Response) => {
+// Atomic split-payment batch endpoint applying payment lines in a single transaction.
+router.post('/:id/payments', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, res: Response) => {
   try {
     const body = req.body;
     if (!body || typeof body !== 'object' || Array.isArray(body)) {
@@ -2058,7 +2153,7 @@ router.post('/:id/payments', requireRole('owner', 'manager', 'cashier'), (req: R
   }
 });
 
-router.post('/:id/applyDiscount', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.post('/:id/applyDiscount', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const { type, value, reason } = req.body;
 
@@ -2076,8 +2171,8 @@ router.post('/:id/applyDiscount', requireRole('owner', 'manager'), (req: Request
       return res.status(404).json({ error: 'Bill not found' });
     }
 
-    if (bill.payment_status === 'paid') {
-      return res.status(400).json({ error: 'Cannot apply discount to a paid bill' });
+    if (bill.payment_status === 'paid' || bill.payment_status === 'refunded') {
+      return res.status(400).json({ error: 'Cannot apply discount to a paid or refunded bill' });
     }
     if (bill.split_group_id) {
       return res.status(409).json({ error: 'Apply discounts before splitting a bill' });
@@ -2102,13 +2197,13 @@ router.post('/:id/applyDiscount', requireRole('owner', 'manager'), (req: Request
       const managerId = req.body.manager_id || req.body.user_id;
       let user: any = null;
       if (managerId) {
-        const candidate = db.prepare("SELECT * FROM users WHERE id = ? AND pin_hash IS NOT NULL AND role IN ('owner', 'manager') AND is_active = 1").get(managerId) as any;
+        const candidate = db.prepare(`SELECT * FROM users WHERE id = ? AND pin_hash IS NOT NULL AND role IN (${OWNER_MANAGER_ROLE_PLACEHOLDERS}) AND is_active = 1`).get(managerId, ...ROLE_ACCESS.ownerManager) as any;
         if (candidate && verifyPin(candidate.pin_hash, override_pin)) {
           user = candidate;
         }
       }
       if (!user) {
-        const managers = db.prepare("SELECT * FROM users WHERE pin_hash IS NOT NULL AND role IN ('owner', 'manager') AND is_active = 1").all() as any[];
+        const managers = db.prepare(`SELECT * FROM users WHERE pin_hash IS NOT NULL AND role IN (${OWNER_MANAGER_ROLE_PLACEHOLDERS}) AND is_active = 1`).all(...ROLE_ACCESS.ownerManager) as any[];
         for (const u of managers) {
           if (verifyPin(u.pin_hash, override_pin)) {
             user = u;
@@ -2123,6 +2218,9 @@ router.post('/:id/applyDiscount', requireRole('owner', 'manager'), (req: Request
 
     // Check discount mode
     const discountMode = getSettingValue('discount_mode') || 'percentage';
+    if (discountMode === 'none') {
+      return res.status(400).json({ error: 'Discounts are disabled' });
+    }
     if (discountMode === 'flat' && type === 'percentage') {
       return res.status(400).json({ error: 'Percentage discounts are disabled' });
     }
@@ -2149,13 +2247,14 @@ router.post('/:id/applyDiscount', requireRole('owner', 'manager'), (req: Request
     } else {
       discountAmount = Number(value);
     }
-    discountAmount = Math.round(discountAmount * 100) / 100;
+    const currency = getTenantCurrency();
+    const decimals = getCurrencyFractionDigits(currency);
+    const minorFactor = getCurrencyMinorUnitFactor(currency);
+    discountAmount = Number(discountAmount.toFixed(decimals));
 
-    // Always derive the undiscounted tax basis from active item rows. Using
-    // bill.tax_amount here compounds the previous discount whenever a manager
-    // edits 10% to 20%. Keep inclusive tax out of the payable total.
+    // Derive undiscounted tax basis directly from active items to prevent compounding discounts.
     const activeItems = db.prepare(
-      "SELECT * FROM order_items WHERE order_id = ? AND status != 'cancelled'"
+      "SELECT * FROM order_items WHERE order_id = ? AND status NOT IN ('cancelled', 'voided', 'void_adjustment', 'refunded')"
     ).all(bill.order_id) as any[];
     let itemTaxAmount = 0;
     let itemExclusiveTax = 0;
@@ -2176,12 +2275,13 @@ router.post('/:id/applyDiscount', requireRole('owner', 'manager'), (req: Request
 
     const discountedSubtotal = Math.max(0, bill.subtotal - discountAmount);
     const taxRatio = bill.subtotal > 0 ? discountedSubtotal / bill.subtotal : 1;
-    const newTaxAmount = Math.round(itemTaxAmount * taxRatio * 100) / 100;
-    const newExclusiveTax = Math.round(itemExclusiveTax * taxRatio * 100) / 100;
+    const newTaxAmount = Number((itemTaxAmount * taxRatio).toFixed(decimals));
+    const newExclusiveTax = Number((itemExclusiveTax * taxRatio).toFixed(decimals));
     const tenantInfo = {
       country: getSettingValue('country') || 'IN',
       business_type: getSettingValue('business_type') || 'restaurant',
       state_code: getSettingValue('state_code') || '',
+      currency: getTenantCurrency(),
       taxes_enabled: getSettingValue('taxes_enabled') === 'true',
     };
     const customer = bill.customer_id
@@ -2200,14 +2300,15 @@ router.post('/:id/applyDiscount', requireRole('owner', 'manager'), (req: Request
       itemSnapshots,
       itemTaxRatio: taxRatio,
       chargeTaxes,
+      minorFactor,
     });
     const taxBreakdownJson = JSON.stringify(taxRollup.breakdowns);
 
     const preRoundTotal = discountedSubtotal + taxRollup.exclusiveTaxAmount
       + (bill.delivery_charge || 0) + (bill.packaging_charge || 0) + (bill.service_charge || 0);
-    const exactTotal = Number(preRoundTotal.toFixed(2));
+    const exactTotal = Number(preRoundTotal.toFixed(decimals));
     const pack = getActiveCountryPack(tenantInfo.country);
-    const { total: newTotal, adjustment: newRoundOff } = applyPayableRounding(exactTotal, pack);
+    const { total: newTotal, adjustment: newRoundOff } = applyPayableRounding(exactTotal, pack, currency);
     const newBalance = Math.max(0, newTotal - (bill.paid_amount || 0));
 
     const updatedBill = withTxn(() => {
@@ -2245,7 +2346,7 @@ router.post('/:id/applyDiscount', requireRole('owner', 'manager'), (req: Request
   }
 });
 
-router.post('/:id/markPrinted', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.post('/:id/markPrinted', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const bill = db.prepare('SELECT * FROM bills WHERE id = ?').get(req.params.id);
@@ -2265,7 +2366,7 @@ router.post('/:id/markPrinted', requireRole('owner', 'manager'), (req: Request, 
 });
 
 // POST /api/bills/:id/print - Print or reprint bill
-router.post('/:id/print', requireRole('owner', 'manager', 'cashier'), asyncHandler(async (req: Request, res: Response) => {
+router.post('/:id/print', requireRole(...ROLE_ACCESS.ownerManagerCashier), asyncHandler(async (req: Request, res: Response) => {
   try {
     const { print_type } = req.body;
 
@@ -2287,7 +2388,7 @@ router.post('/:id/print', requireRole('owner', 'manager', 'cashier'), asyncHandl
 }));
 
 // GET /api/bills/:id/print-history - Get print history for bill
-router.get('/:id/print-history', requireRole('owner', 'manager', 'cashier'), (req: Request, res: Response) => {
+router.get('/:id/print-history', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const prints = db.prepare(`

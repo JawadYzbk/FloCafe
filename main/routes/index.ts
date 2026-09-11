@@ -1,13 +1,16 @@
 import { Express } from 'express';
 import { authRoutes } from './auth';
 import { requireRole } from '../middleware/security';
+import { ROLE_ACCESS, hasRole } from '../../shared/role-permissions';
 import { categoryRoutes } from './categories';
 import { productRoutes } from './products';
 import { addonGroupRoutes } from './addon-groups';
 import { orderRoutes } from './orders';
 import { orderItemRoutes } from './order-items';
-import { billRoutes, syncUnpaidBillsForOrder } from './bills';
+import { billRoutes, syncUnpaidBillsForOrder, getTenantCurrency } from './bills';
 import { shiftRoutes } from './shifts';
+import { refundRoutes } from './refunds';
+import { cashClosureRoutes } from './cash-closures';
 import { tableRoutes } from './tables';
 import { kitchenStationRoutes } from './kitchen-stations';
 import { kitchenRoutes } from './kitchen';
@@ -32,8 +35,11 @@ import { heldOrderRoutes } from './held-orders';
 import { printTemplateRoutes } from './print-templates';
 import { whatsappRoutes } from './whatsapp';
 import { supportTicketRoutes } from './support-ticket';
-import { getDatabase, now, parseItemJson, attachEffectiveAddons, withTxn, getSettingValue, getCachedPairingCode, setCachedPairingCode, verifyPin } from '../db';
+import { getDatabase, now, parseItemJson, attachEffectiveAddons, withTxn, getSettingValue, getCachedPairingCode, setCachedPairingCode, verifyPin, recordOrderAudit } from '../db';
 import { checkPinRateLimit } from './orders';
+import { getCurrencyFractionDigits, getCurrencyMinorUnitFactor } from '../countries';
+
+const OWNER_MANAGER_ROLE_PLACEHOLDERS = ROLE_ACCESS.ownerManager.map(() => '?').join(', ');
 import {
   getActiveCountryPack,
   invertTaxBreakdown,
@@ -46,12 +52,7 @@ import QRCode from 'qrcode';
 import { asyncHandler } from '../middleware/async-handler';
 import expressRateLimit from 'express-rate-limit';
 
-// "Cloud POS is not registered" (thrown synchronously by cloud-sync.ts's
-// signedFetch, no network call even attempted) means this store was never
-// claimed in FloAdmin — a distinct, actionable state from a genuine
-// connectivity failure reaching FloAdmin, and the two need different status
-// codes/messages so the frontend (and anyone reading server logs) doesn't
-// mistake "not claimed yet" for "FloAdmin is down".
+// Distinguish unregistered store error from cloud connectivity failure.
 function isUnregisteredCloudError(error: any): boolean {
   return typeof error?.message === 'string' && error.message.includes('is not registered');
 }
@@ -82,6 +83,8 @@ export function registerRoutes(app: Express): void {
   app.use('/api/order-items', orderItemRoutes);
   app.use('/api/kitchen', kitchenRoutes);
   app.use('/api/bills', billRoutes);
+  app.use('/api/refunds', refundRoutes);
+  app.use('/api/cash-closures', cashClosureRoutes);
   app.use('/api/tables', tableRoutes);
   app.use('/api/kitchen-stations', kitchenStationRoutes);
   app.use('/api/customers', customerRoutes);
@@ -113,10 +116,8 @@ export function registerRoutes(app: Express): void {
     calculateTaxPreview(req, res);
   }));
 
-  // Categories available under the store's active country pack — powers the
-  // product-page category selector. Read-only; pack activation/management
-  // (installing/updating a pack) is a separate, later feature.
-  app.get('/api/tax/categories', requireRole('owner', 'manager'), asyncHandler(async (req, res) => {
+  // Returns active tax categories for product configuration.
+  app.get('/api/tax/categories', requireRole(...ROLE_ACCESS.ownerManager), asyncHandler(async (req, res) => {
     try {
       const { getActiveCountryPack, hasConfiguredTaxCategories, previewCategoryRate } = await import('../services/tax');
       const country = getSettingValue('country') || 'IN';
@@ -126,9 +127,7 @@ export function registerRoutes(app: Express): void {
       res.json({
         pack_id: pack.id,
         country: pack.country,
-        // The bundled generic pack deliberately has no rules. Exposing its
-        // placeholder categories as assignable would migrate a product from
-        // legacy tax to a zero-tax engine path.
+        // Categories available only when configuration is ready.
         categories: configurationReady
           ? pack.categories.map((category) => {
             const preview = previewCategoryRate(pack, businessType, category.id);
@@ -150,10 +149,8 @@ export function registerRoutes(app: Express): void {
     }
   }));
 
-  // Mobile pairing code — proxies FloAdmin (see cloud-sync.ts generatePairingCode).
-  // Cache-first: repeat GETs (e.g. reopening Settings) must NOT generate a new
-  // code or disconnect paired devices — only a stale/missing cache calls out.
-  app.get('/api/mobile/pairing-code', requireRole('owner'), asyncHandler(async (req, res) => {
+  // Returns cached mobile pairing code or generates fresh code if missing or expired.
+  app.get('/api/mobile/pairing-code', requireRole(...ROLE_ACCESS.owner), asyncHandler(async (req, res) => {
     try {
       const cached = getCachedPairingCode();
       if (cached) {
@@ -176,7 +173,7 @@ export function registerRoutes(app: Express): void {
   }));
 
   // Explicit rotate — disconnects every currently-paired RevFlo device.
-  app.post('/api/mobile/rotate-code', requireRole('owner'), asyncHandler(async (req, res) => {
+  app.post('/api/mobile/rotate-code', requireRole(...ROLE_ACCESS.owner), asyncHandler(async (req, res) => {
     try {
       const { code, expires_at } = await cloudSync.generatePairingCode(true);
       setCachedPairingCode(code, expires_at);
@@ -191,7 +188,7 @@ export function registerRoutes(app: Express): void {
   }));
 
   // Paired RevFlo devices for this store — Settings > Mobile App session list.
-  app.get('/api/mobile/devices', requireRole('owner'), asyncHandler(async (req, res) => {
+  app.get('/api/mobile/devices', requireRole(...ROLE_ACCESS.owner), asyncHandler(async (req, res) => {
     try {
       const devices = await cloudSync.listPairedDevices();
       res.json({ devices });
@@ -202,21 +199,35 @@ export function registerRoutes(app: Express): void {
   }));
 
   // Legacy/flat customer search endpoint (frontend uses this)
-  app.get('/api/customers-search', inlineCustomerLookupRateLimit, requireRole('owner', 'manager', 'cashier', 'server'), (req, res) => {
+  app.get('/api/customers-search', inlineCustomerLookupRateLimit, requireRole(...ROLE_ACCESS.sales), (req, res) => {
     try {
       const { q } = req.query;
-      if (!q || String(q).length < 2) {
+      const rawSearch = String(q || '').trim();
+      if (rawSearch.length < 2) {
         return res.json([]);
       }
 
       const db = getDatabase();
-      const searchTerm = `%${q}%`;
-
-      const customers = db.prepare(`
+      const digitsSearch = stripPhoneDigits(rawSearch);
+      const isPhoneLikeSearch = digitsSearch.length > 0 && !/\p{L}/u.test(rawSearch);
+      const searchTerm = `%${rawSearch}%`;
+      const phoneDigitsSearch = `REPLACE(phone_digits, '/', '')`;
+      const query = isPhoneLikeSearch
+        ? `
         SELECT * FROM customers
-        WHERE is_active = 1 AND (phone_digits LIKE ? OR name LIKE ? OR email LIKE ?)
+        WHERE is_active = 1 AND (${phoneDigitsSearch} LIKE ? OR name LIKE ? OR email LIKE ?)
         ORDER BY name LIMIT 20
-      `).all(searchTerm, searchTerm, searchTerm) as any[];
+      `
+        : `
+        SELECT * FROM customers
+        WHERE is_active = 1 AND (name LIKE ? OR email LIKE ?)
+        ORDER BY name LIMIT 20
+      `;
+      const params = isPhoneLikeSearch
+        ? [`%${digitsSearch}%`, searchTerm, searchTerm]
+        : [searchTerm, searchTerm];
+
+      const customers = db.prepare(query).all(...params) as any[];
 
       const results = customers.map((c) => ({
         ...parseCustomer(c),
@@ -231,7 +242,7 @@ export function registerRoutes(app: Express): void {
   });
 
   // CRM lookup endpoint (frontend uses this)
-  app.get('/api/crm/lookup', inlineCustomerLookupRateLimit, requireRole('owner', 'manager', 'cashier', 'server'), (req, res) => {
+  app.get('/api/crm/lookup', inlineCustomerLookupRateLimit, requireRole(...ROLE_ACCESS.sales), (req, res) => {
     try {
       const { phone, country_code } = req.query;
       if (!phone) {
@@ -270,10 +281,7 @@ export function registerRoutes(app: Express): void {
       if (!actorId) return res.status(403).json({ error: 'Authentication required' });
 
       const db = getDatabase();
-      // Keep these lookups only for the inexpensive not-found response. Every
-      // authorization, policy, and mutation decision is repeated from the
-      // transaction-local rows below so a concurrent writer cannot authorize
-      // against this pre-transaction snapshot.
+      // Look up pre-transaction rows for initial 404 validation.
       const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId) as any;
       if (!order) {
         return res.status(404).json({ error: 'Order not found' });
@@ -283,7 +291,7 @@ export function registerRoutes(app: Express): void {
         return res.status(404).json({ error: 'Item not found in this order' });
       }
 
-      // BUG #17 FIX: Wrap cancel + total recalc in transaction
+      // Wrap item cancel and total recalculation in transaction.
       const result = withTxn(() => {
         const currentOrder = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId) as any;
         const currentItem = db.prepare('SELECT * FROM order_items WHERE id = ? AND order_id = ?').get(itemId, orderId) as any;
@@ -295,15 +303,10 @@ export function registerRoutes(app: Express): void {
           throw Object.assign(new Error('Authentication required'), { statusCode: 403 });
         }
         const userRole = actor.role;
-        if (userRole === 'server' && String(currentOrder.user_id) !== actorId) {
-          throw Object.assign(new Error('Servers can only modify their own orders'), { statusCode: 403 });
-        }
 
-        // A repeated request against an already terminal item is an
-        // intentional idempotent no-op. Check it before the parent terminal
-        // policy so a retry cannot turn a harmless repeat into a new error.
-        if (['cancelled', 'voided', 'void_adjustment'].includes(currentItem.status)) {
-          if (!['owner', 'manager'].includes(userRole)) {
+        // Idempotent no-op for already-terminal items.
+        if (['cancelled', 'voided', 'void_adjustment', 'refunded'].includes(currentItem.status)) {
+          if (!hasRole(userRole, ROLE_ACCESS.ownerManager)) {
             throw Object.assign(new Error('Only owner or manager can cancel this item'), { statusCode: 403 });
           }
           const items = attachEffectiveAddons(db, db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(orderId).map(parseItemJson) as any[]);
@@ -329,32 +332,26 @@ export function registerRoutes(app: Express): void {
           throw Object.assign(new Error('Cannot cancel items on a paid or partially paid order'), { statusCode: 409 });
         }
 
-        // Completed and cancelled orders are terminal. This guard must run
-        // before any item, stock, order, table, or bill mutation.
+        // Completed and cancelled orders are terminal.
         if (['completed', 'cancelled'].includes(currentOrder.status)) {
           throw Object.assign(new Error('Cannot cancel items on completed or cancelled orders'), { statusCode: 400 });
         }
 
-        // #150: an item the kitchen has already started on (preparing/ready)
-        // can't be silently deleted like a pending one — the ingredients are
-        // already consumed. Voiding it instead requires a manager PIN, mirrors
-        // the whole-order-cancel override pattern, and leaves a negative bill
-        // line so the removal stays visible on the bill.
+        // Voiding items in preparation requires manager PIN and records a void adjustment line.
         const isItemVoid = ['preparing', 'ready'].includes(currentItem.status);
-        const isPrivilegedRole = ['owner', 'manager'].includes(userRole);
-        const canUseOverride = ['cashier', 'server'].includes(userRole) && isItemVoid;
+        const isPrivilegedRole = hasRole(userRole, ROLE_ACCESS.ownerManager);
+        const canUseOverride = hasRole(userRole, ROLE_ACCESS.cashierServer) && isItemVoid;
         if (!isPrivilegedRole && !canUseOverride) {
           throw Object.assign(new Error('Only owner or manager can cancel this item'), { statusCode: 403 });
         }
+        let approvedByUserId: string | undefined;
         if (isItemVoid) {
           if (!override_pin) {
             throw Object.assign(new Error('Manager PIN required to void an item already in progress'), { statusCode: 400 });
           }
 
           const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
-          // Key is per-client/per-action, deliberately NOT per-item: a caller
-          // must not get a fresh attempt window by rotating item identifiers
-          // (GHSA-9jjq-2fmw-x3mw).
+          // Rate-limit attempts per client rather than per item to prevent brute force attacks.
           const rateLimitKey = `pin:${clientIp}:item-void`;
           if (!checkPinRateLimit(rateLimitKey)) {
             throw Object.assign(new Error('Too many PIN attempts. Try again in 15 minutes.'), { statusCode: 429 });
@@ -363,13 +360,13 @@ export function registerRoutes(app: Express): void {
           const managerId = req.body.manager_id || req.body.user_id;
           let pinUser: any = null;
           if (managerId) {
-            const candidate = db.prepare("SELECT * FROM users WHERE id = ? AND pin_hash IS NOT NULL AND role IN ('owner', 'manager') AND is_active = 1").get(managerId) as any;
+            const candidate = db.prepare(`SELECT * FROM users WHERE id = ? AND pin_hash IS NOT NULL AND role IN (${OWNER_MANAGER_ROLE_PLACEHOLDERS}) AND is_active = 1`).get(managerId, ...ROLE_ACCESS.ownerManager) as any;
             if (candidate && verifyPin(candidate.pin_hash, override_pin)) {
               pinUser = candidate;
             }
           }
           if (!pinUser) {
-            const managers = db.prepare("SELECT * FROM users WHERE pin_hash IS NOT NULL AND role IN ('owner', 'manager') AND is_active = 1").all() as any[];
+            const managers = db.prepare(`SELECT * FROM users WHERE pin_hash IS NOT NULL AND role IN (${OWNER_MANAGER_ROLE_PLACEHOLDERS}) AND is_active = 1`).all(...ROLE_ACCESS.ownerManager) as any[];
             for (const u of managers) {
               if (verifyPin(u.pin_hash, override_pin)) {
                 pinUser = u;
@@ -380,14 +377,11 @@ export function registerRoutes(app: Express): void {
           if (!pinUser) {
             throw Object.assign(new Error('Invalid manager PIN'), { statusCode: 403 });
           }
+          approvedByUserId = pinUser.id;
         }
 
         if (isItemVoid) {
-          // Leave the original line alone (it's a true record of what was
-          // ordered and prepared) and add a mirrored negative line instead of
-          // deleting anything — the bill total nets to the refund/comp
-          // automatically via the recalc below, same as a plain cancel would,
-          // but both lines stay on the bill permanently.
+          // Record mirrored negative line to adjust bill total while preserving original item line.
           db.prepare(`
             INSERT INTO order_items (
               order_id, product_id, product_name, product_sku, unit_price, quantity,
@@ -401,11 +395,7 @@ export function registerRoutes(app: Express): void {
             -(currentItem.discount_amount || 0), -currentItem.total,
             currentItem.variant_selection, currentItem.modifier_selection, now(), now(),
           );
-          // #150 Q1-Q4 decision: mark 'voided', not 'cancelled' — a distinct,
-          // terminal status. Item stage-change endpoints reject any further
-          // transition once status is 'voided', and inventory is
-          // deliberately left alone: it was already deducted when the item
-          // was added, and voiding an already-prepared item must not restock it.
+          // Mark item voided without restoring deducted inventory.
           db.prepare("UPDATE order_items SET status = 'voided', voided_at = ?, updated_at = ? WHERE id = ?")
             .run(now(), now(), itemId);
         } else {
@@ -420,17 +410,80 @@ export function registerRoutes(app: Express): void {
           }
         }
 
-        // Recalculate order totals excluding cancelled, voided, and
-        // void_adjustment items. Single Decimal.js-based engine shared with the
-        // restore handler (services/order-recalc.ts).
-        const { subtotal, newDiscountAmount, taxRollup, total, roundOff, activeItemCount, tenantInfo } =
-          recalculateOrderTotals(db, orderId, currentOrder);
+        // Recalculate order totals excluding cancelled, voided, and void_adjustment items
+        const activeItems = db.prepare("SELECT * FROM order_items WHERE order_id = ? AND status NOT IN ('cancelled', 'voided', 'void_adjustment', 'refunded')")
+          .all(orderId) as any[];
+        let subtotal = 0;
+        let totalTax = 0;
+        let exclusiveTax = 0;
+        const allTaxBreakdowns: any[] = [];
+        const allTaxSnapshots: (string | null)[] = [];
+        for (const i of activeItems) {
+          subtotal += i.subtotal || 0;
+          totalTax += i.tax_amount || 0;
+          if (i.tax_type !== 'inclusive') {
+            exclusiveTax += i.tax_amount || 0;
+          }
+          if (i.tax_breakdown) {
+            try {
+              const breakdown = JSON.parse(i.tax_breakdown);
+              if (Array.isArray(breakdown)) allTaxBreakdowns.push(breakdown);
+            } catch { }
+          }
+          allTaxSnapshots.push(i.tax_snapshot || null);
+        }
+        // BUG #13 FIX: Preserve order-level discount (scale percentage proportionally)
+        const currency = getTenantCurrency();
+        const decimals = getCurrencyFractionDigits(currency);
+        const minorFactor = getCurrencyMinorUnitFactor(currency);
+        const existingDiscountAmount = currentOrder.discount_amount || 0;
+        let newDiscountAmount = existingDiscountAmount;
+        if (existingDiscountAmount > 0 && currentOrder.subtotal > 0) {
+          if (currentOrder.discount_type === 'percentage') {
+            const pct = currentOrder.discount_value || 0;
+            newDiscountAmount = Number((subtotal * pct / 100).toFixed(decimals));
+          }
+          // amount type: keep same value
+        }
 
-        // #132 FIX: cancelling the last active item leaves nothing to serve or
-        // bill — treat it as the whole order being cancelled, the same way the
-        // explicit order-level cancel (routes/orders.ts) does: free the table,
-        // and stamp cancelled_at/cancellation_reason. (Item stock was already restored above).
-        const orderCancelled = activeItemCount === 0 && currentOrder.status !== 'cancelled';
+        const discountedSubtotal = Math.max(0, subtotal - newDiscountAmount);
+        let newTaxAmount = totalTax;
+        let newExclusiveTax = exclusiveTax;
+        let taxRatio = 1;
+        if (newDiscountAmount > 0 && subtotal > 0) {
+          taxRatio = discountedSubtotal / subtotal;
+          newTaxAmount = Number((totalTax * taxRatio).toFixed(decimals));
+          newExclusiveTax = Number((exclusiveTax * taxRatio).toFixed(decimals));
+        }
+        const tenantInfo = {
+          country: getSettingValue('country') || 'IN',
+          business_type: getSettingValue('business_type') || 'restaurant',
+          state_code: getSettingValue('state_code') || '',
+          currency: getTenantCurrency(),
+          taxes_enabled: getSettingValue('taxes_enabled') === 'true',
+        };
+        const customer = currentOrder.customer_id
+          ? db.prepare('SELECT * FROM customers WHERE id = ?').get(currentOrder.customer_id) as any
+          : null;
+        const chargeTaxes = calculateConfiguredChargeTaxes(tenantInfo, currentOrder, customer);
+        const taxRollup = combineItemAndChargeTaxes({
+          itemTaxAmount: newTaxAmount,
+          itemExclusiveTaxAmount: newExclusiveTax,
+          itemBreakdowns: allTaxBreakdowns,
+          itemSnapshots: allTaxSnapshots,
+          itemTaxRatio: taxRatio,
+          chargeTaxes,
+          minorFactor,
+        });
+
+        // BUG #5 FIX: Correct round-off formula; BUG #24 FIX: include delivery_charge (was missing, causing total mismatch with bill generation)
+        const preRoundTotal = discountedSubtotal + taxRollup.exclusiveTaxAmount
+          + (currentOrder.delivery_charge || 0) + (currentOrder.packaging_charge || 0) + (currentOrder.service_charge || 0);
+        const roundOff = 0;
+        const total = Number(preRoundTotal.toFixed(decimals));
+
+        // Cancelling the last active item marks the entire order cancelled and frees table.
+        const orderCancelled = activeItems.length === 0 && currentOrder.status !== 'cancelled';
 
         if (orderCancelled) {
           db.prepare(`
@@ -455,8 +508,17 @@ export function registerRoutes(app: Express): void {
           discountAmount: newDiscountAmount,
           deliveryCharge: currentOrder.delivery_charge || 0,
           packagingCharge: currentOrder.packaging_charge || 0,
+          serviceCharge: currentOrder.service_charge || 0,
           total,
         }, tenantInfo.country);
+
+        recordOrderAudit(db, {
+          orderId,
+          orderItemId: itemId,
+          actorUserId: actorId,
+          action: isItemVoid ? 'item_voided' : 'item_cancelled',
+          details: { ...(approvedByUserId && { approved_by: approvedByUserId }) },
+        });
 
         const updatedOrder = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId) as any;
         const items = attachEffectiveAddons(db, db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(orderId).map(parseItemJson) as any[]);
@@ -511,7 +573,7 @@ export function registerRoutes(app: Express): void {
           throw Object.assign(new Error('Item or order not found'), { statusCode: 404 });
         }
         const actor = db.prepare('SELECT role FROM users WHERE id = ? AND is_active = 1').get(actorId) as { role: string } | undefined;
-        if (!actor || !['owner', 'manager'].includes(actor.role)) {
+        if (!actor || !hasRole(actor.role, ROLE_ACCESS.ownerManager)) {
           throw Object.assign(new Error('Only owner or manager can restore items'), { statusCode: 403 });
         }
 
@@ -542,9 +604,77 @@ export function registerRoutes(app: Express): void {
         db.prepare("UPDATE order_items SET status = 'pending', updated_at = ? WHERE id = ?")
           .run(now(), itemId);
 
-        // Recalculate order totals — same Decimal.js engine as the cancel path.
-        const { subtotal, newDiscountAmount, taxRollup, total, roundOff, tenantInfo } =
-          recalculateOrderTotals(db, orderId, currentOrder);
+        // Recalculate order totals
+        const activeItems = db.prepare("SELECT * FROM order_items WHERE order_id = ? AND status NOT IN ('cancelled', 'voided', 'void_adjustment', 'refunded')")
+          .all(orderId) as any[];
+        let subtotal = 0;
+        let totalTax = 0;
+        let exclusiveTax = 0;
+        const allTaxBreakdowns: any[] = [];
+        const allTaxSnapshots: (string | null)[] = [];
+        for (const i of activeItems) {
+          subtotal += i.subtotal || 0;
+          totalTax += i.tax_amount || 0;
+          if (i.tax_type !== 'inclusive') {
+            exclusiveTax += i.tax_amount || 0;
+          }
+          if (i.tax_breakdown) {
+            try {
+              const breakdown = JSON.parse(i.tax_breakdown);
+              if (Array.isArray(breakdown)) allTaxBreakdowns.push(breakdown);
+            } catch { }
+          }
+          allTaxSnapshots.push(i.tax_snapshot || null);
+        }
+        // BUG #13 FIX: Preserve order-level discount (scale percentage proportionally)
+        const currency = getTenantCurrency();
+        const decimals = getCurrencyFractionDigits(currency);
+        const minorFactor = getCurrencyMinorUnitFactor(currency);
+        const existingDiscountAmount = currentOrder.discount_amount || 0;
+        let newDiscountAmount = existingDiscountAmount;
+        if (existingDiscountAmount > 0 && currentOrder.subtotal > 0) {
+          if (currentOrder.discount_type === 'percentage') {
+            const pct = currentOrder.discount_value || 0;
+            newDiscountAmount = Number((subtotal * pct / 100).toFixed(decimals));
+          }
+          // amount type: keep same value
+        }
+
+        const discountedSubtotal = Math.max(0, subtotal - newDiscountAmount);
+        let newTaxAmount = totalTax;
+        let newExclusiveTax = exclusiveTax;
+        let taxRatio = 1;
+        if (newDiscountAmount > 0 && subtotal > 0) {
+          taxRatio = discountedSubtotal / subtotal;
+          newTaxAmount = Number((totalTax * taxRatio).toFixed(decimals));
+          newExclusiveTax = Number((exclusiveTax * taxRatio).toFixed(decimals));
+        }
+        const tenantInfo = {
+          country: getSettingValue('country') || 'IN',
+          business_type: getSettingValue('business_type') || 'restaurant',
+          state_code: getSettingValue('state_code') || '',
+          currency: getTenantCurrency(),
+          taxes_enabled: getSettingValue('taxes_enabled') === 'true',
+        };
+        const customer = currentOrder.customer_id
+          ? db.prepare('SELECT * FROM customers WHERE id = ?').get(currentOrder.customer_id) as any
+          : null;
+        const chargeTaxes = calculateConfiguredChargeTaxes(tenantInfo, currentOrder, customer);
+        const taxRollup = combineItemAndChargeTaxes({
+          itemTaxAmount: newTaxAmount,
+          itemExclusiveTaxAmount: newExclusiveTax,
+          itemBreakdowns: allTaxBreakdowns,
+          itemSnapshots: allTaxSnapshots,
+          itemTaxRatio: taxRatio,
+          chargeTaxes,
+          minorFactor,
+        });
+
+        // BUG #5 FIX: Correct round-off formula; BUG #24 FIX: include delivery_charge (was missing, causing total mismatch with bill generation)
+        const preRoundTotal = discountedSubtotal + taxRollup.exclusiveTaxAmount
+          + (currentOrder.delivery_charge || 0) + (currentOrder.packaging_charge || 0) + (currentOrder.service_charge || 0);
+        const roundOff = 0;
+        const total = Number(preRoundTotal.toFixed(decimals));
 
         db.prepare(`
           UPDATE orders SET subtotal = ?, tax_amount = ?, tax_breakdown = ?, tax_snapshot = ?, discount_amount = ?, total = ?, round_off = ?, updated_at = ? WHERE id = ?
@@ -558,8 +688,11 @@ export function registerRoutes(app: Express): void {
           discountAmount: newDiscountAmount,
           deliveryCharge: currentOrder.delivery_charge || 0,
           packagingCharge: currentOrder.packaging_charge || 0,
+          serviceCharge: currentOrder.service_charge || 0,
           total,
         }, tenantInfo.country);
+
+        recordOrderAudit(db, { orderId, orderItemId: itemId, actorUserId: actorId, action: 'item_restored' });
 
         const updatedOrder = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId) as any;
         const items = attachEffectiveAddons(db, db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(orderId).map(parseItemJson) as any[]);

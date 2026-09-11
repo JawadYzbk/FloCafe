@@ -1,12 +1,7 @@
-/**
- * whatsapp-share.ts
- *
- * Generate WhatsApp share links for bills.
- * Uses wa.me API to pre-fill message with bill details.
- */
+/** Generates WhatsApp share links for bills using wa.me API. */
 
 import type { Bill, Tenant, Customer } from '@/lib/types';
-import { getCountryByCode } from '@/lib/countries';
+import { getCountryByCode, getCurrencyFractionDigits } from '@/lib/countries';
 import { formatDate } from './printer/format-date';
 import api from './api';
 import toast from 'react-hot-toast';
@@ -20,9 +15,7 @@ export interface WhatsAppShareOptions {
   businessPhone?: string;
 }
 
-/**
- * Generate a wa.me URL for sharing bill details via WhatsApp.
- */
+/** Generates a wa.me URL pre-filled with bill details for WhatsApp sharing. */
 export function getWhatsAppShareUrl(
   bill: Bill,
   tenant: Pick<Tenant, 'business_name' | 'currency' | 'country'>,
@@ -76,23 +69,27 @@ export function getWhatsAppShareUrl(
   return `https://wa.me/?text=${encoded}`;
 }
 
-/**
- * Open WhatsApp share in a new window/tab.
- */
+/** Opens the WhatsApp share URL externally and reports whether it opened. */
 export function shareBillViaWhatsApp(
   bill: Bill,
   customerInfo: Pick<Customer, 'phone' | 'country_code'> | null,
   tenant: Pick<Tenant, 'business_name' | 'currency' | 'country'>,
   opts: WhatsAppShareOptions = {},
   localeOverride?: string,
-): void {
+): Promise<boolean> {
   const url = getWhatsAppShareUrl(bill, tenant, customerInfo, opts, localeOverride);
-  window.open(url, '_blank', 'noopener,noreferrer');
+  if (window.electronAPI?.openWhatsAppShare) {
+    return window.electronAPI.openWhatsAppShare(url)
+      .then((result) => 'success' in result && result.success === true);
+  }
+  const popup = window.open('', '_blank');
+  if (!popup) return Promise.resolve(false);
+  popup.opener = null;
+  popup.location.href = url;
+  return Promise.resolve(true);
 }
 
-/**
- * Generate just the message text (for copying to clipboard).
- */
+/** Generates plain text bill summary message for clipboard copy. */
 export function getWhatsAppMessage(
   bill: Bill,
   tenant: Pick<Tenant, 'business_name' | 'currency' | 'country'>,
@@ -132,17 +129,16 @@ export function getWhatsAppMessage(
   return lines.join('\n');
 }
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 function formatAmount(value: number | string, currencyCode: string, locale: string): string {
   const amount = Number(value);
+  const decimals = getCurrencyFractionDigits(currencyCode);
   return new Intl.NumberFormat(locale, {
     style: 'currency',
     currency: currencyCode,
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
   }).format(Number.isFinite(amount) ? amount : 0);
 }
 
@@ -152,11 +148,7 @@ function formatItemsList(order: Bill['order'], currencyCode: string, locale: str
   return items.map((item) => `${item.quantity}x ${item.product_name} - ${formatAmount(item.total, currencyCode, locale)}`);
 }
 
-/**
- * Send a paid bill receipt through Flo's connected WhatsApp session.
- * Single source of truth for the /whatsapp/send call + error-toast mapping,
- * shared by the orders list and the PaymentModal "send after payment" step.
- */
+/** Sends paid bill receipt through connected WhatsApp session. */
 export async function sendBillViaFlo(
   bill: Bill,
   customerPhone: string,

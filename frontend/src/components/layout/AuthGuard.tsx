@@ -5,6 +5,7 @@ import { useRouter, usePathname } from 'next/navigation';
 import { useTranslations } from 'use-intl';
 import { useAuthStore } from '@/store/auth';
 import api from '@/lib/api';
+import { showPrintLanguageLoadErrorsToast } from '@/lib/printer/warnings-toast';
 
 export function getLandingPage(): string {
   return '/pos';
@@ -15,6 +16,7 @@ const PUBLIC_PATHS = ['/kds', '/kds-standalone', '/server-standalone', '/auth/lo
 export default function AuthGuard({ children }: { children: React.ReactNode }) {
   const t = useTranslations('common');
   const { user, currentTenant, loading, loadFromStorage } = useAuthStore();
+  const printLanguageLoadErrors = useAuthStore((s) => s.printLanguageLoadErrors);
   const router = useRouter();
   const pathname = usePathname();
   const [needsSetup, setNeedsSetup] = useState<boolean | null>(null); // null = still checking
@@ -24,13 +26,15 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
   const isStandalonePath = pathname?.startsWith('/kds') || pathname?.startsWith('/server-standalone');
 
   useEffect(() => {
-    // Standalone KDS and Server App pages own their auth protocol. Their
-    // /api/auth/me responses intentionally do not include the dashboard's
-    // tenant list, so loading the shared POS auth store here can interpret a
-    // valid standalone session as malformed and clear its token.
+    // Standalone KDS and Server App pages manage their own auth sessions;
+    // skip loading shared POS auth store to avoid clearing their tokens.
     if (isStandalonePath) return;
     loadFromStorage();
   }, [isStandalonePath, loadFromStorage]);
+
+  useEffect(() => {
+    showPrintLanguageLoadErrorsToast(printLanguageLoadErrors);
+  }, [printLanguageLoadErrors]);
 
   // Single effect: determine where to redirect after auth state + setup status are known
   useEffect(() => {
@@ -77,10 +81,10 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
 
   if (loading || needsSetup === null || needsSetup === true) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-50">
+      <div className="min-h-screen flex items-center justify-center bg-muted">
         <div className="flex flex-col items-center gap-3">
           <div className="w-10 h-10 border-4 border-brand border-t-transparent rounded-full animate-spin" />
-          <p className="text-gray-500 text-sm">{t('loadingScreen')}</p>
+          <p className="text-muted-foreground text-sm">{t('loadingScreen')}</p>
         </div>
       </div>
     );

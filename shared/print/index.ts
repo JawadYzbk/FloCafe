@@ -6,8 +6,15 @@
  * functions only — see shared/print/README.md.
  */
 export * from './types';
+export * from './concepts';
+export * from './currency';
 export * from './policy';
 export * from './direction';
 export * from './bilingual';
 export * from './document';
 export * from './merchant-template';
+export * from './width';
+export * from './raster';
+export * from './warnings';
+export * from './layout';
+export * from './z-report';

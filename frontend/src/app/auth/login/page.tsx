@@ -12,18 +12,10 @@ import { Label } from '@/components/ui/label';
 import { Card, CardContent } from '@/components/ui/card';
 import toast from 'react-hot-toast';
 import { Eye, EyeOff } from 'lucide-react';
+import { ROLE_LABEL_KEYS } from '@/lib/i18n-enums';
 
 // Backend enum → leaf key maps for the tenant picker.
-type StaffRoleKey = keyof AppConfig['Messages']['staff'];
 type BusinessTypeKey = keyof AppConfig['Messages']['businessType'];
-
-const ROLE_LEAF_KEYS: Record<string, StaffRoleKey> = {
-  owner: 'roleOwner',
-  manager: 'roleManager',
-  cashier: 'roleCashier',
-  chef: 'roleChef',
-  server: 'roleServer',
-};
 
 const BUSINESS_TYPE_LEAF_KEYS: Record<string, BusinessTypeKey> = {
   restaurant: 'restaurant',
@@ -80,10 +72,7 @@ function LoginContent() {
   }, [selectTenant, t]);
 
   useEffect(() => {
-    // Single-tenant sessions are already auto-selected by the auth store —
-    // login() and loadFromStorage() set currentTenant when tenants.length === 1.
-    // Deliberately no auto-select here: it raced manual selection through
-    // selectTenant() and the shared loading flag for one login attempt (#229).
+    // Navigate to landing page once user and tenant are selected (auto-selection handled in auth store).
     if (user && currentTenant) {
       router.push(getLandingPage());
     }
@@ -148,7 +137,7 @@ function LoginContent() {
               <div className="space-y-3">
                 {tenants.map((tenant) => {
                   const businessTypeKey = tenant.business_type ? BUSINESS_TYPE_LEAF_KEYS[tenant.business_type] : undefined;
-                  const roleKey = tenant.role ? ROLE_LEAF_KEYS[tenant.role] : undefined;
+                  const roleKey = tenant.role ? ROLE_LABEL_KEYS[tenant.role] : undefined;
                   return (
                     <button
                       key={tenant.id}
@@ -175,7 +164,7 @@ function LoginContent() {
     <div className="min-h-screen flex items-center justify-center bg-background px-4">
       <div className="w-full max-w-md">
         <div className="text-center mb-8">
-          <img src="/logo.png" alt="Flo" width={120} height={77} className="mx-auto mb-3" />
+          <img src="/logo.svg" alt="Flo" width={96} height={96} className="mx-auto mb-3" />
           <p className="text-muted-foreground mt-2">{t('signInTitle')}</p>
         </div>
         {dbError && (

@@ -15,10 +15,8 @@ interface Props {
 
 type SettingsKey = keyof AppConfig['Messages']['settings'];
 
-// Option labels keyed by value. The panel itself is region-agnostic: which
-// controls (and which options within them) are rendered is driven entirely by
-// the country profile's `localeOptions`, so a region without locale options
-// never sees this panel.
+// Option labels keyed by value; rendering is driven by country profile
+// localeOptions.
 const CURRENCY_DISPLAY_LABELS = {
   rial: 'iranCurrencyDisplayRial',
   toman: 'iranCurrencyDisplayToman',
@@ -45,12 +43,12 @@ export function LocalePreferencesPanel({ options, currencyDisplay, digits, calen
   if (!hasAny) return null;
 
   return (
-    <div className="md:col-span-2 space-y-4 rounded-lg border border-gray-100 bg-gray-50/60 p-4">
-      <p className="text-sm font-medium text-gray-700">{t('iranLocaleTitle')}</p>
+    <div className="md:col-span-2 space-y-4 rounded-lg border border-border bg-muted/60 p-4">
+      <p className="text-sm font-medium text-foreground">{t('iranLocaleTitle')}</p>
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         {options?.currencyDisplay?.length ? (
           <div>
-            <label className="block text-sm text-gray-500 mb-1">{t('iranCurrencyDisplay')}</label>
+            <label className="block text-sm text-muted-foreground mb-1">{t('iranCurrencyDisplay')}</label>
             {isAdmin ? (
               <Select value={currencyDisplay} onValueChange={(v) => onChange({ currencyDisplay: v as CurrencyDisplay })}>
                 <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
@@ -61,14 +59,14 @@ export function LocalePreferencesPanel({ options, currencyDisplay, digits, calen
                 </SelectContent>
               </Select>
             ) : (
-              <p className="font-medium text-gray-900">{t(CURRENCY_DISPLAY_LABELS[currencyDisplay])}</p>
+              <p className="font-medium text-foreground">{t(CURRENCY_DISPLAY_LABELS[currencyDisplay])}</p>
             )}
           </div>
         ) : null}
 
         {options?.digits?.length ? (
           <div>
-            <label className="block text-sm text-gray-500 mb-1">{t('iranNumberDigits')}</label>
+            <label className="block text-sm text-muted-foreground mb-1">{t('iranNumberDigits')}</label>
             {isAdmin ? (
               <Select value={digits} onValueChange={(v) => onChange({ digits: v as DigitMode })}>
                 <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
@@ -79,14 +77,14 @@ export function LocalePreferencesPanel({ options, currencyDisplay, digits, calen
                 </SelectContent>
               </Select>
             ) : (
-              <p className="font-medium text-gray-900">{t(DIGIT_LABELS[digits])}</p>
+              <p className="font-medium text-foreground">{t(DIGIT_LABELS[digits])}</p>
             )}
           </div>
         ) : null}
 
         {options?.calendar?.length ? (
           <div>
-            <label className="block text-sm text-gray-500 mb-1">{t('iranCalendar')}</label>
+            <label className="block text-sm text-muted-foreground mb-1">{t('iranCalendar')}</label>
             {isAdmin ? (
               <Select value={calendar} onValueChange={(v) => onChange({ calendar: v as CalendarMode })}>
                 <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
@@ -97,7 +95,7 @@ export function LocalePreferencesPanel({ options, currencyDisplay, digits, calen
                 </SelectContent>
               </Select>
             ) : (
-              <p className="font-medium text-gray-900">{t(CALENDAR_LABELS[calendar])}</p>
+              <p className="font-medium text-foreground">{t(CALENDAR_LABELS[calendar])}</p>
             )}
           </div>
         ) : null}

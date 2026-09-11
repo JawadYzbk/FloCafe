@@ -171,7 +171,7 @@ function reconcileTotal(
 
 function legacyItemComponents(document: TaxDocument): DecimalTaxComponent[] {
   return (document.items || []).filter(
-    (item) => item.status !== 'cancelled' && item.status !== 'voided' && item.status !== 'void_adjustment',
+    (item) => item.status !== 'cancelled' && item.status !== 'voided' && item.status !== 'void_adjustment' && item.status !== 'refunded',
   ).flatMap((item) => {
     const snapshot = flattenSnapshots(item.tax_snapshot);
     return snapshot.present ? [] : flattenLegacyBreakdown(item.tax_breakdown);
@@ -201,17 +201,9 @@ function documentLegacyComponents(
   });
 }
 
-/**
- * Resolves receipt/report tax components without double-counting mixed orders.
- * A valid item snapshot (including an exempt snapshot with zero components)
- * is authoritative for that item; uncategorized items retain their legacy
- * tax_breakdown. Split bills use their marked child snapshot, then add only
- * document-level legacy residuals that are not already represented.
- */
+/** Resolves receipt/report tax components without double-counting across snapshots. */
 export function resolveTaxComponents(document: TaxDocument): DisplayTaxComponent[] {
-  // Split bills persist child-specific snapshot amounts. Prefer those copies
-  // over the shared order-item snapshots, which describe the source order and
-  // would otherwise swap item tax for full document-level charge tax.
+  // Prefer child-specific split bill snapshot amounts over source order items.
   if (hasSplitAllocatedSnapshot(document.tax_snapshot)) {
     const splitSnapshot = flattenSnapshots(document.tax_snapshot);
     if (splitSnapshot.present) {
@@ -249,7 +241,7 @@ export function resolveTaxComponents(document: TaxDocument): DisplayTaxComponent
   }
 
   const activeItems = document.items?.filter(
-    (item) => item.status !== 'cancelled' && item.status !== 'voided' && item.status !== 'void_adjustment',
+    (item) => item.status !== 'cancelled' && item.status !== 'voided' && item.status !== 'void_adjustment' && item.status !== 'refunded',
   );
 
   if (activeItems && activeItems.length > 0) {

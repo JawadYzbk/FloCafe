@@ -75,13 +75,15 @@ npm run dev
 
 ```sh
 npm run dev              # Build frontend & backend, launch Electron
-node dev-server.js       # Backend only (Express API on :3001, KDS on :3002)
+node dev-server.js       # Backend only (Express API on :3001, KDS on :3002, Server App on :3003)
 npm run dev:frontend     # Frontend development server in browser
 npm run lint             # Lint backend and frontend
 npm run build            # Compile TypeScript backend to dist/
 npm run build:frontend   # Export static Next.js frontend
 npm test                 # Run default test suite
 ```
+
+> **Port configuration:** FloCafe uses ports `3001` (Main API), `3002` (KDS), and `3003` (Server App). If these ports are in use (e.g. by Docker), FloCafe automatically falls back to subsequent available ports. You can also customize them via `PORT`, `KDS_PORT`, and `SERVER_APP_PORT` in `.env`.
 
 ---
 
@@ -98,7 +100,7 @@ Create a branch from `main` with a descriptive prefix:
 - `refactor/` — Code refactoring within approved scope
 - `chore/` — Maintenance tasks
 
-Use clear commit messages. Conventional Commit formatting (e.g., `fix(printer): handle USB disconnect`) is encouraged.
+Use clear commit messages following Conventional Commits (`feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `ci:`, `chore:`). Release notes and `CHANGELOG.md` are automated via `git-cliff` (`npm run changelog`).
 
 ### Scope discipline
 
@@ -153,11 +155,11 @@ FloCafe runs on real business data that must survive software upgrades.
 
 ## Translations and i18n
 
-FloCafe currently provides translations for English (`en`), Spanish (`es`), Brazilian Portuguese (`pt`), and Persian (`fa`, including RTL support).
+FloCafe currently provides translations for English (`en`), Spanish (`es`), French (`fr`), Brazilian Portuguese (`pt`), Filipino (`fil`), Turkish (`tr`), Persian (`fa`, including RTL support), and German (`de`).
 
 - **Existing languages:** Narrowly scoped fixes and improvements to existing translation strings are always welcome. Verify changes with `npm run i18n:check`.
 - **New languages:** Adding an entirely new language requires maintainer coordination through an issue first while the broader internationalization architecture (#372) is being modernized.
-- **Local scaffolding:** Once a new language is approved, run `npm run i18n:add -- de` (using the lowercase two- or three-letter code) to copy the English schema without overwriting an existing file. Add the generated language entry to `frontend/src/lib/i18n/languages.ts`, translate the copied leaves while preserving ICU placeholders/tags, then run `npm run i18n:check`.
+- **Local scaffolding:** Once a new language is approved, run `npm run i18n:add -- ar` (using the lowercase two- or three-letter code) to copy the English schema without overwriting an existing file. Add the generated language entry to `frontend/src/lib/i18n/languages.ts`, translate the copied leaves while preserving ICU placeholders/tags, then run `npm run i18n:check`.
 
 The validation command is fully offline and checks registry/file consistency, exact English key parity, string and ICU validity, placeholder/tag parity, Persian fallback safeguards, and frontend translation-key safety.
 
@@ -188,6 +190,6 @@ For complete authoring instructions, see the [Tax packs developer guide](docs/ta
 
 ## Getting help
 
-- **Operator & general questions:** [GitHub Discussions](https://github.com/FreeOpenSourcePOS/FloCafe/discussions) or [Reddit r/FloPOS](https://www.reddit.com/r/FloPOS/)
+- **Operator & general questions:** [GitHub Discussions](https://github.com/FreeOpenSourcePOS/FloCafe/discussions)
 - **Bug reports & feature requests:** [GitHub Issues](https://github.com/FreeOpenSourcePOS/FloCafe/issues)
 - **Security vulnerabilities:** Report privately per [SECURITY.md](SECURITY.md) (do not open public issues)

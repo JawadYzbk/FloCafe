@@ -2,16 +2,31 @@ import * as assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import type { BrowserWindow } from 'electron';
 
 const Module = require('module');
 const originalLoad = Module._load;
 
 const registered = new Map<string, (...args: any[]) => any>();
+const registeredSync = new Map<string, (...args: any[]) => any>();
 const windows: any[] = [];
+let failExternalOpen = false;
 
 class FakeWebContents {
   handlers = new Map<string, Function[]>();
   windowOpenHandler: ((...args: any[]) => any) | null = null;
+  frame = { frameToken: `frame-${Math.random()}`, detached: false };
+
+  constructor(public readonly ownerWindow: FakeBrowserWindow) {}
+
+  getURL() {
+    return this.ownerWindow.loadedUrl;
+  }
+
+  get mainFrame() {
+    return this.frame;
+  }
+
   on(event: string, cb: Function) {
     const list = this.handlers.get(event) ?? [];
     list.push(cb);
@@ -24,14 +39,21 @@ class FakeWebContents {
 
 class FakeBrowserWindow {
   webPreferences: any;
-  webContents = new FakeWebContents();
+  webContents: FakeWebContents;
   loadedUrl = '';
-  destroyed = false;
-  closeHandlers: Function[] = [];
+
+  static fromWebContents(sender: FakeWebContents) {
+    return sender.ownerWindow;
+  }
+
   constructor(opts: any) {
     this.webPreferences = opts.webPreferences;
+    this.webContents = new FakeWebContents(this);
     windows.push(this);
   }
+
+  destroyed = false;
+  closeHandlers: Function[] = [];
   on(event: string, cb: Function) {
     if (event === 'closed') {
       this.closeHandlers.push(cb);
@@ -54,6 +76,9 @@ Module._load = function (request: string, parent: unknown, isMain: boolean) {
   if (request === 'electron') {
     return {
       ipcMain: {
+        on: (channel: string, listener: (...args: any[]) => any) => {
+          registeredSync.set(channel, listener);
+        },
         handle: (channel: string, listener: (...args: any[]) => any) => {
           registered.set(channel, listener);
         },
@@ -65,7 +90,11 @@ Module._load = function (request: string, parent: unknown, isMain: boolean) {
       },
       app: { getPath: () => '/tmp/flo-kds-test', getVersion: () => '3.2.0', getName: () => 'FloCafe' },
       BrowserWindow: FakeBrowserWindow,
-      shell: { openExternal: () => Promise.resolve() },
+      shell: {
+        openExternal: async () => {
+          if (failExternalOpen) throw new Error('test external-open failure');
+        },
+      },
     };
   }
   if (request === './db') {
@@ -114,7 +143,11 @@ Module._load = function (request: string, parent: unknown, isMain: boolean) {
     };
   }
   if (request === './services/whatsapp') {
-    return { getStatus: () => ({ connected: false, qrCode: null }) };
+    return {
+      getStatus: () => ({ connected: false, qrCode: null }),
+      sanitizeLogText: (error: unknown) => (error instanceof Error ? error.message : String(error))
+        .replace(/https?:\/\/\S+/gi, '[redacted-url]'),
+    };
   }
   return originalLoad.apply(this, arguments as any);
 };
@@ -130,13 +163,51 @@ async function run(): Promise<void> {
 
   log('=== GHSA-jmmq-fjg5-g6px KDS Window & IPC Hardening Verification ===');
 
-  registerIpcHandlers();
+  const mainPosWindow = new FakeBrowserWindow({ webPreferences: {} });
+  registerIpcHandlers(undefined, () => mainPosWindow as unknown as BrowserWindow);
+
+  // The preload's synchronous registration is allowed before Chromium exposes
+  // the localhost URL only for the expected POS window and its current main
+  // frame. Other windows and remote origins remain unauthorized.
+  const documentHandler = registeredSync.get('window-document');
+  assert.ok(documentHandler, 'window-document IPC handler is registered');
+  const earlyDocumentEvent: any = {
+    sender: mainPosWindow.webContents,
+    senderFrame: mainPosWindow.webContents.mainFrame,
+  };
+  documentHandler(earlyDocumentEvent, '123e4567-e89b-42d3-a456-426614174003');
+  assert.deepEqual(earlyDocumentEvent.returnValue, { success: true });
+
+  const otherWindow = new FakeBrowserWindow({ webPreferences: {} });
+  const otherDocumentEvent: any = {
+    sender: otherWindow.webContents,
+    senderFrame: otherWindow.webContents.mainFrame,
+  };
+  documentHandler(otherDocumentEvent, '123e4567-e89b-42d3-a456-426614174004');
+  assert.deepEqual(otherDocumentEvent.returnValue, { error: 'Unauthorized sender' });
+
+  const staleFrameEvent: any = {
+    sender: mainPosWindow.webContents,
+    senderFrame: { frameToken: 'stale-frame', detached: false },
+  };
+  documentHandler(staleFrameEvent, '123e4567-e89b-42d3-a456-426614174005');
+  assert.deepEqual(staleFrameEvent.returnValue, { success: false, error: 'Invalid document registration' });
+
+  mainPosWindow.loadedUrl = 'http://evil.example.com/';
+  const remoteDocumentEvent: any = {
+    sender: mainPosWindow.webContents,
+    senderFrame: mainPosWindow.webContents.mainFrame,
+  };
+  documentHandler(remoteDocumentEvent, '123e4567-e89b-42d3-a456-426614174006');
+  assert.deepEqual(remoteDocumentEvent.returnValue, { error: 'Unauthorized sender' });
+  mainPosWindow.loadedUrl = 'http://localhost:3001/';
 
   const trustedLocalhost = { sender: { getURL: () => 'http://localhost:3001/' } };
   const trusted127 = { sender: { getURL: () => 'http://127.0.0.1:3001/pos' } };
   const untrustedKds = { sender: { getURL: () => 'http://192.168.1.50:3002/kds' } };
   const untrustedExternal = { sender: { getURL: () => 'http://evil.example.com/' } };
   const untrustedSpoofedPrefix = { sender: { getURL: () => 'http://localhost.evil.com/' } };
+  const untrustedCredentialPrefix = { sender: { getURL: () => 'http://localhost:3001@evil.example/' } };
   const untrustedNullSender = { sender: { getURL: () => null } };
 
   // 1. Verify ALL non-PIN-gated handlers enforce sender identity
@@ -147,6 +218,7 @@ async function run(): Promise<void> {
     { channel: 'get-settings', args: [] },
     { channel: 'set-setting', args: ['business_name', 'My Cafe'] },
     { channel: 'whatsapp-get-status', args: [] },
+    { channel: 'whatsapp-open-share', args: ['https://wa.me/15555550100?text=test'] },
     { channel: 'get-kds-info', args: [] },
     { channel: 'open-kds-window', args: [] },
     { channel: 'get-app-info', args: [] },
@@ -171,6 +243,9 @@ async function run(): Promise<void> {
     const spoofRes = await listener(untrustedSpoofedPrefix, ...args);
     assert.deepEqual(spoofRes, { error: 'Unauthorized sender' }, `${channel} rejected spoofed prefix sender`);
 
+    const credentialPrefixRes = await listener(untrustedCredentialPrefix, ...args);
+    assert.deepEqual(credentialPrefixRes, { error: 'Unauthorized sender' }, `${channel} rejected credential-prefix sender`);
+
     const nullRes = await listener(untrustedNullSender, ...args);
     assert.deepEqual(nullRes, { error: 'Unauthorized sender' }, `${channel} rejected null sender`);
 
@@ -183,6 +258,16 @@ async function run(): Promise<void> {
 
     log(`  ✓ ${channel}: successfully blocks untrusted senders and admits trusted origins`);
   }
+
+  const openShareListener = registered.get('whatsapp-open-share')!;
+  const invalidShareRes = await openShareListener(trustedLocalhost, 'https://example.com/');
+  assert.deepEqual(invalidShareRes, { success: false, error: 'Invalid WhatsApp share URL' }, 'WhatsApp opener rejects non-wa.me URLs');
+  failExternalOpen = true;
+  const failedShareRes = await openShareListener(trustedLocalhost, 'https://wa.me/15555550100?text=test');
+  assert.deepEqual(failedShareRes, { success: false, error: 'Failed to open WhatsApp' }, 'WhatsApp opener reports shell failure');
+  failExternalOpen = false;
+  const successfulShareRes = await openShareListener(trustedLocalhost, 'https://wa.me/15555550100?text=test');
+  assert.deepEqual(successfulShareRes, { success: true }, 'WhatsApp opener reports shell success');
 
   // 2. PIN-gated handlers enforce master PIN
   log('\n[Phase 2] Verifying PIN-gated handlers require authorization...');
@@ -208,7 +293,15 @@ async function run(): Promise<void> {
   assert.equal(kdsWindow.webPreferences.preload, undefined, 'KDS window webPreferences.preload is undefined (bridge removed)');
   assert.equal(kdsWindow.webPreferences.contextIsolation, true, 'context isolation remains enabled');
   assert.equal(kdsWindow.webPreferences.nodeIntegration, false, 'node integration remains disabled');
-  assert.equal(kdsWindow.loadedUrl, 'http://192.168.1.50:3002/kds', 'KDS window loads http://192.168.1.50:3002/kds');
+  // gh-513: open-kds-window appends the current palette via appendThemeQueryParam so
+  // the KDS window's pre-paint script learns the theme without preload access.
+  // Assert both the origin/path invariance and that the theme param is one of the
+  // two resolved palettes (robust to the currentEffectiveIsDark default flipping
+  // between releases).
+  assert.ok(
+    /^http:\/\/192\.168\.1\.50:3002\/kds\?theme=(?:light|dark)$/.test(kdsWindow.loadedUrl),
+    `KDS window loads a themed URL (got ${kdsWindow.loadedUrl})`,
+  );
   log('  ✓ BrowserWindow webPreferences: preload=undefined, contextIsolation=true, nodeIntegration=false');
 
   // 4. Navigation confinement to KDS origin and window-open denial

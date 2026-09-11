@@ -22,13 +22,20 @@ This index classifies documentation in `docs/` so contributors and AI agents kno
 | [API.md](API.md) | Endpoint and WebSocket reference for the local Express and KDS servers (`:3001` and `:3002`). | CURRENT |
 | [linux.md](linux.md) | Linux package formats (AppImage, deb, rpm, Snap), FUSE setup, CUPS printing, and system tray behavior. | CURRENT |
 | [printers.md](printers.md) | ESC/POS printer configuration, network/USB/OS-queue/WebUSB connection types, kitchen stations, and troubleshooting. | CURRENT |
+| [printer-hardware-testing-protocol.md](printer-hardware-testing-protocol.md) | Physical hardware validation matrix, testing protocols across platforms, and test report template. | CURRENT |
 | [printing-architecture.md](printing-architecture.md) | Multilingual print pipeline architecture (epic #438): shared print kernel, PrintDocument v1 model, renderer/transport map, language policy and canonical label flow, template trust models, capability/warning semantics, testing guide, and contributor recipes. | CURRENT |
 | [google-drive-setup.md](google-drive-setup.md) | Maintainer setup for the optional Google Drive backup OAuth client. | CURRENT |
 | [mac-app-store-publishing.md](mac-app-store-publishing.md) | Fastlane, Transporter, and GitHub Actions publishing workflow for the Mac App Store build. | CURRENT |
 | [release-process.md](release-process.md) | Desktop release channels, draft verification gates, artifact naming, and explicit stable promotion. | CURRENT |
+| [upgrade-support-matrix.md](upgrade-support-matrix.md) | Evidence matrix for real installed-artifact N → N+1 upgrade coverage and explicit NOT-RUN platform cells. | CURRENT |
+| [release-evidence-index.md](release-evidence-index.md) | Permanent sanitized release-summary contract, 90-day evidence retention, manual boundaries, and #512 integration boundary. | CURRENT |
 | [tax-packs.md](tax-packs.md) | Tax pack schema, authoring guide, cryptographic signing, and catalog distribution workflow. | CURRENT |
 | [i18n.md](i18n.md) | Internationalization guide, translation editing, language scaffolding (`npm run i18n:add`), and RTL layout support. | CURRENT |
 | [merchant-print-templates.md](merchant-print-templates.md) | Merchant print template schema (v1), validation/compatibility policy, provenance and trust model, and bill-template selection identity. Cross-links the compliance `escpos-line-template-v1` contract (#445). | CURRENT |
+| [title-bar-phase1.md](title-bar-phase1.md) | Native-controls title-bar implementation note for the main POS Electron window, including Phase 2 Linux verification and HTML fallback controls (#457). | CURRENT |
+| [title-bar-platform-matrix.md](title-bar-platform-matrix.md) | Cross-platform verification matrix for the custom title bar, runner/local evidence, and findings (#457/#462). | CURRENT |
+| [roles-and-permissions.md](roles-and-permissions.md) | Fixed staff roles, the read-only in-app permission matrix, and its code source of truth. | CURRENT |
+| [business-decisions.md](business-decisions.md) | Running, verifiable log of explicit product/business decisions (e.g. orders are never ownership-gated) that code must not silently contradict. | CURRENT |
 
 ### Active design & forward-looking plans
 
@@ -36,7 +43,7 @@ This index classifies documentation in `docs/` so contributors and AI agents kno
 | --- | --- | --- |
 | [tax-engine-v2-spec.md](tax-engine-v2-spec.md) | Architectural specification for Tax Engine v2, data-only country packs, and future capability plugin boundaries. *(Note: 2026-07-31 amendment establishes that country packs are catalog-only and not auto-bundled).* | ACTIVE DESIGN |
 | [cloud-v2-plan.md](cloud-v2-plan.md) | Client integration plan for FloAdmin v2 cloud coordination. Phase 1 client work is implemented in code; forward-looking multi-device sync and FloAdmin contracts remain in design/specs. | ACTIVE DESIGN / FORWARD-LOOKING |
-| [printing-nonlatin-capabilities.md](printing-nonlatin-capabilities.md) | Capability study and decision record for non-Latin scripts (Arabic/Persian, Hebrew, CJK, Indic) on ESC/POS hardware: approach comparison, recommended capability-tiered raster-fallback architecture (#446), community hardware-test matrix, and test-page raster probe spec. Not yet implemented. | FORWARD-LOOKING |
+| [printing-nonlatin-capabilities.md](printing-nonlatin-capabilities.md) | Capability study and decision record for non-Latin scripts (Arabic/Persian, Hebrew, CJK, Indic) on ESC/POS hardware: approach comparison, Phase 9 capability-gated raster contract, community hardware-test matrix, and diagnostic test-page probe. Broad coverage remains hardware/font-evidence gated. | CURRENT / FORWARD-LOOKING |
 
 ### Historical records
 

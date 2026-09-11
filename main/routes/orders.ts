@@ -1,24 +1,29 @@
 import { createHash } from 'crypto';
 import { Router, Request, Response } from 'express';
-import { getDatabase, generateOrderNumber, now, parseItemJson, parseRowJson, withTxn, verifyPin, getSettingValue, insertOrderItemAddons, attachEffectiveAddons, utcDayBounds, utcTodayDate } from '../db';
+import { getDatabase, generateOrderNumber, now, parseItemJson, parseRowJson, withTxn, verifyPin, getSettingValue, insertOrderItemAddons, attachEffectiveAddons, utcDayBounds, utcTodayDate, recordOrderAudit } from '../db';
 import {
   calculateConfiguredChargeTaxes,
   calculateItemTax,
   combineItemAndChargeTaxes,
   getActiveCountryPack,
   getConfiguredChargeTaxCategories,
+  normalizeChargeAmount,
 } from '../services/tax';
 import { applyPayableRounding } from '../services/tax-engine';
 import { notifyKdsUpdate, notifyOrderUpdated } from '../services/kds';
 import { cloudSync } from '../services/cloud-sync';
-import { validateOrderNotes, validateItemNotes } from './orders-validation';
+import { validateOrderNotes, validateItemNotes, validateProductQuantity } from './orders-validation';
 import { requireRole } from '../middleware/security';
+import { ROLE_ACCESS, hasRole } from '../../shared/role-permissions';
+import { getCurrencyFractionDigits, getCurrencyMinorUnitFactor } from '../countries';
+import { getTenantCurrency } from './bills';
 import expressRateLimit from 'express-rate-limit';
 
 const router = Router();
 const orderReadRateLimit = expressRateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: true, legacyHeaders: false });
 const orderWriteRateLimit = expressRateLimit({ windowMs: 60 * 1000, limit: 60, standardHeaders: true, legacyHeaders: false });
 const MAX_ORDER_IDEMPOTENCY_KEY_LENGTH = 128;
+const OWNER_MANAGER_ROLE_PLACEHOLDERS = ROLE_ACCESS.ownerManager.map(() => '?').join(', ');
 
 function orderIdempotencyKey(req: Request): string | null {
   const raw = req.get('Idempotency-Key');
@@ -62,10 +67,7 @@ const PIN_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
 
 export function checkPinRateLimit(key: string): boolean {
   const now = Date.now();
-  // Bound the in-memory table. Sweep expired entries once it grows past a
-  // threshold so abandoned keys cannot accumulate without limit
-  // (GHSA-9jjq-2fmw-x3mw). The keys are per-client/per-action, so the map is
-  // naturally small, but this keeps a long-running process from drifting.
+  // Sweep expired rate limit entries when map grows beyond threshold.
   if (pinAttempts.size > 500) {
     for (const [k, v] of pinAttempts.entries()) {
       if (now > v.resetAt) pinAttempts.delete(k);
@@ -99,14 +101,7 @@ function syncCustomerTagCounts(db: any, customerId: string, items: { product_id:
     .run(JSON.stringify(counts), now(), customerId);
 }
 
-/**
- * Resolves and validates a submitted order item's add-ons against the catalog
- * (GHSA-jmxx-39wh-4cjx). Client-supplied name/price are never trusted: every
- * add-on must resolve by ID to an active catalog add-on whose group is linked
- * to the product (via addon_group_product). Returns the canonical add-on list
- * (catalog id/name/price + client quantity) used for both subtotal and the
- * order_item_addons snapshot.
- */
+/** Resolves and validates item add-ons against catalog to enforce authoritative pricing. */
 function resolveItemAddons(
   db: ReturnType<typeof getDatabase>,
   productId: string,
@@ -175,9 +170,8 @@ function resolveItemAddons(
   return resolved;
 }
 
-router.get('/', orderReadRateLimit, requireRole('owner', 'manager', 'cashier', 'server'), (req: Request, res: Response) => {
+router.get('/', orderReadRateLimit, requireRole(...ROLE_ACCESS.sales), (req: Request, res: Response) => {
   try {
-    const user = (req as any).user;
     const db = getDatabase();
     const wheres: string[] = [];
     const params: any[] = [];
@@ -196,11 +190,7 @@ router.get('/', orderReadRateLimit, requireRole('owner', 'manager', 'cashier', '
       wheres.push('type = ?');
       params.push(req.query.type);
     }
-    // #208: `today` is the UTC day, as a range filter (was UTC date() that
-    // wrapped the column and blocked `idx_orders_created_at`). `start_date` /
-    // `end_date` add a range filter so the UI can actually load older pages
-    // — combined with the cursor, this is what gives us real pagination
-    // instead of "latest 50 forever".
+    // Filter by UTC day or date range across indexed created_at column.
     if (req.query.today && req.query.today !== '0' && req.query.today !== 'false') {
       const [s, e] = utcDayBounds(utcTodayDate());
       wheres.push('created_at >= ? AND created_at < ?');
@@ -221,10 +211,6 @@ router.get('/', orderReadRateLimit, requireRole('owner', 'manager', 'cashier', '
       wheres.push('table_id = ?');
       params.push(req.query.table_id);
     }
-    if (user.role === 'server') {
-      wheres.push('user_id = ?');
-      params.push(user.userId);
-    }
     // Cursor pagination: `before` / `after` are ORDER BY keys (created_at),
     // composed with `id` to break ties when many orders share a second.
     if (typeof req.query.before_id === 'string' && /^\d+$/.test(req.query.before_id)) {
@@ -237,9 +223,7 @@ router.get('/', orderReadRateLimit, requireRole('owner', 'manager', 'cashier', '
     }
 
     const whereSql = wheres.length > 0 ? `WHERE ${wheres.join(' AND ')}` : '';
-    // #208: cap page size even when clients omit per_page (the original
-    // "unbounded" default made GET /orders on the tables page load the entire
-    // active-order history with the N+1 below).
+    // Limit per-page items with default 50 and maximum 500.
     const requestedPerPage = req.query.per_page ? parseInt(req.query.per_page as string, 10) : NaN;
     const perPage = Number.isInteger(requestedPerPage) && requestedPerPage > 0
       ? Math.min(requestedPerPage, 500)
@@ -257,8 +241,7 @@ router.get('/', orderReadRateLimit, requireRole('owner', 'manager', 'cashier', '
     const pageOrders = hasMore ? orders.slice(0, perPage) : orders;
     const nextCursor = hasMore ? pageOrders[pageOrders.length - 1].id : null;
 
-    // #208: replace the per-order N+1 (5 queries × N) with one IN() per
-    // relation, then assemble. Measured ~300+ queries per poll → ~6.
+    // Batch hydrate relations for page orders.
     const ordersWithRelations = batchHydrateOrders(db, pageOrders);
 
     res.json({
@@ -271,17 +254,10 @@ router.get('/', orderReadRateLimit, requireRole('owner', 'manager', 'cashier', '
   }
 });
 
-/**
- * Batch the relations (items+addons, table, customer, bill+loyalty) for a
- * page of orders into 5 IN() queries instead of N per-order prepared calls.
- * Used by GET /orders and kept here so the orders route owns its own data
- * shape. #208
- */
+/** Batches order relations (items, table, customer, bill) into IN queries. */
 function batchHydrateOrders(db: ReturnType<typeof getDatabase>, orders: any[]) {
   if (orders.length === 0) return [];
-  // Normalize JSON text columns (tax_breakdown/tax_snapshot on orders and
-  // items) so the list endpoint matches GET /orders/:id. parseRowJson is
-  // idempotent, so the /:id path passing an already-parsed row is fine.
+  // Normalize JSON text columns on orders and items.
   const parsedOrders = orders.map(parseRowJson);
   const ids = parsedOrders.map((o) => o.id);
   const tableIds = Array.from(new Set(parsedOrders.map((o: any) => o.table_id).filter(Boolean)));
@@ -289,9 +265,7 @@ function batchHydrateOrders(db: ReturnType<typeof getDatabase>, orders: any[]) {
 
   const orderIdsCsv = `(${ids.map(() => '?').join(',')})`;
   const itemsRows = db.prepare(`SELECT * FROM order_items WHERE order_id IN ${orderIdsCsv} ORDER BY order_id, id`).all(...ids).map(parseItemJson);
-  // #208: a single call to attachEffectiveAddons batches all addons across
-  // all items into one IN() query against order_item_addons. Re-group the
-  // result back by order_id for the per-order payload below.
+  // Attach resolved addons and regroup by order_id.
   const itemsWithAddons = attachEffectiveAddons(db, itemsRows as any[]);
   const itemsByOrder = new Map<number, any[]>();
   for (const it of itemsWithAddons) {
@@ -322,12 +296,37 @@ function batchHydrateOrders(db: ReturnType<typeof getDatabase>, orders: any[]) {
     billsByOrderId.set(parsed.order_id, siblings);
     billsById.set(parsed.id, parsed);
   }
-  const ledgerByBillId = new Map<number, number>();
+  const loyaltyByBillId = new Map<number, { earned: number; redeemed: number }>();
   if (billsById.size > 0) {
     const billIds = Array.from(billsById.keys());
     const ph = billIds.map(() => '?').join(',');
-    const rows = db.prepare(`SELECT bill_id, COALESCE(SUM(amount),0) as total FROM loyalty_ledger WHERE bill_id IN (${ph}) AND type = 'credit' GROUP BY bill_id`).all(...billIds) as { bill_id: number; total: number }[];
-    for (const r of rows) ledgerByBillId.set(r.bill_id, r.total);
+    const rows = db.prepare(`SELECT bill_id, type, COALESCE(SUM(amount),0) as total FROM loyalty_ledger WHERE bill_id IN (${ph}) AND type IN ('credit', 'debit') GROUP BY bill_id, type`).all(...billIds) as { bill_id: number; type: 'credit' | 'debit'; total: number }[];
+    for (const r of rows) {
+      const current = loyaltyByBillId.get(r.bill_id) || { earned: 0, redeemed: 0 };
+      if (r.type === 'credit') current.earned = Number(r.total) || 0;
+      if (r.type === 'debit') current.redeemed = Number(r.total) || 0;
+      loyaltyByBillId.set(r.bill_id, current);
+    }
+  }
+  const loyaltyEnabled = ['true', '1'].includes(getSettingValue('loyalty_enabled') || '');
+  const loyaltyByCustomerId = new Map<string, { credits: number; debits: number }>();
+  const billCustomerIds = Array.from(new Set(Array.from(billsById.values()).map((bill) => bill.customer_id).filter(Boolean)));
+  if (loyaltyEnabled && billCustomerIds.length > 0) {
+    const ph = billCustomerIds.map(() => '?').join(',');
+    const rows = db.prepare(`
+      SELECT customer_id, type, COALESCE(SUM(amount), 0) as total
+      FROM loyalty_ledger
+      WHERE customer_id IN (${ph})
+        AND type IN ('credit', 'debit')
+      GROUP BY customer_id, type
+    `).all(...billCustomerIds) as { customer_id: string | number; type: 'credit' | 'debit'; total: number }[];
+    for (const r of rows) {
+      const key = String(r.customer_id);
+      const current = loyaltyByCustomerId.get(key) || { credits: 0, debits: 0 };
+      if (r.type === 'credit') current.credits = Number(r.total) || 0;
+      if (r.type === 'debit') current.debits = Number(r.total) || 0;
+      loyaltyByCustomerId.set(key, current);
+    }
   }
 
   return parsedOrders.map((order) => {
@@ -337,28 +336,30 @@ function batchHydrateOrders(db: ReturnType<typeof getDatabase>, orders: any[]) {
     const customer = order.customer_id ? customersById.get(order.customer_id) : null;
     const bills = billsByOrderId.get(order.id) || [];
     for (const billRow of bills) {
-      if (billRow.customer_id) billRow.points_earned = ledgerByBillId.get(billRow.id) || 0;
+      if (billRow.customer_id) {
+        const billLoyalty = loyaltyByBillId.get(billRow.id) || { earned: 0, redeemed: 0 };
+        const customerLoyalty = loyaltyByCustomerId.get(String(billRow.customer_id));
+        billRow.points_earned = billLoyalty.earned;
+        billRow.points_redeemed = billLoyalty.redeemed;
+        billRow.points_balance = loyaltyEnabled && customerLoyalty
+          ? Math.max(0, customerLoyalty.credits - customerLoyalty.debits)
+          : null;
+      }
     }
     const bill = bills.find((row) => row.payment_status !== 'paid') || bills[0] || null;
     return { ...order, items: itemList, table, customer, bill, bills };
   });
 }
 
-router.get('/:id', orderReadRateLimit, requireRole('owner', 'manager', 'cashier', 'server'), (req: Request, res: Response) => {
+router.get('/:id', orderReadRateLimit, requireRole(...ROLE_ACCESS.sales), (req: Request, res: Response) => {
   try {
-    const user = (req as any).user;
     const db = getDatabase();
     const order = parseRowJson(db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id));
     if (!order) {
       return res.status(404).json({ error: 'Order not found' });
     }
-    if (user.role === 'server' && (order as any).user_id !== user.userId) {
-      return res.status(403).json({ error: 'Servers can only view their own orders' });
-    }
 
-    // #208: collapse the per-order N+1 (5 queries: items/addons/table/customer/bill/loyalty)
-    // into the same batchHydrateOrders used by the list endpoint. Previously
-    // 6 prepared calls per single detail click.
+    // Hydrate relations using batchHydrateOrders.
     const [hydrated] = batchHydrateOrders(db, [order]);
     res.json({ order: hydrated });
   } catch (error: any) {
@@ -367,21 +368,17 @@ router.get('/:id', orderReadRateLimit, requireRole('owner', 'manager', 'cashier'
   }
 });
 
-router.post('/', orderWriteRateLimit, requireRole('owner', 'manager', 'cashier', 'server'), (req: Request, res: Response) => {
+router.post('/', orderWriteRateLimit, requireRole(...ROLE_ACCESS.sales), (req: Request, res: Response) => {
   try {
     const body = req.body || {};
-    const { table_id, customer_id, type, guest_count, special_instructions, packaging_charge, delivery_charge, items } = body;
+    const { table_id, customer_id, type, guest_count, special_instructions, packaging_charge, delivery_charge, service_charge, items, online_platform, external_order_id } = body;
+    // Carries optional service charge without automatic calculation policy.
     const idempotencyKey = orderIdempotencyKey(req);
     const idempotencyUserId = String((req as any).user.userId);
     const requestHash = idempotencyKey
       ? createHash('sha256').update(JSON.stringify(body)).digest('hex')
       : null;
-    // Always the authenticated caller, never client-supplied — trusting a
-    // client-sent user_id would let staff spoof order attribution, and the
-    // frontend has in fact never sent one, so every order got user_id=NULL.
-    // That silently broke servers' own order visibility (GET /orders scopes
-    // servers to `user_id = <their id>`, which NULL can never match) and any
-    // per-staff sales attribution.
+    // Always use authenticated user ID to ensure correct server visibility and attribution.
     const authenticatedUserId = (req as any).user.userId;
 
     if (!items || items.length === 0) {
@@ -395,11 +392,29 @@ router.post('/', orderWriteRateLimit, requireRole('owner', 'manager', 'cashier',
       return res.status(400).json({ error: 'guest_count must be a whole number between 1 and 99' });
     }
 
-    const pkgCharge = Number(packaging_charge || 0);
-    const delCharge = Number(delivery_charge || 0);
-    if (!Number.isFinite(pkgCharge) || pkgCharge < 0 || !Number.isFinite(delCharge) || delCharge < 0) {
-      return res.status(400).json({ error: 'Packaging and delivery charges must be non-negative numbers' });
+    let pkgCharge: number;
+    let delCharge: number;
+    let serviceCharge: number;
+    try {
+      pkgCharge = normalizeChargeAmount(packaging_charge, 'packaging');
+      delCharge = normalizeChargeAmount(delivery_charge, 'delivery');
+      serviceCharge = normalizeChargeAmount(service_charge, 'service_charge');
+    } catch (error: unknown) {
+      const statusCode = typeof error === 'object' && error !== null && 'statusCode' in error && typeof error.statusCode === 'number'
+        ? error.statusCode
+        : 400;
+      const message = error instanceof Error ? error.message : 'Invalid charge amount';
+      return res.status(statusCode).json({ error: message });
     }
+
+    if (online_platform !== undefined && online_platform !== null && typeof online_platform !== 'string') {
+      return res.status(400).json({ error: 'online_platform must be a string' });
+    }
+    if (external_order_id !== undefined && external_order_id !== null && typeof external_order_id !== 'string') {
+      return res.status(400).json({ error: 'external_order_id must be a string' });
+    }
+    const onlinePlatform = typeof online_platform === 'string' ? online_platform.trim().slice(0, 100) : null;
+    const externalOrderId = typeof external_order_id === 'string' ? external_order_id.trim().slice(0, 100) : null;
 
     const db = getDatabase();
 
@@ -448,13 +463,14 @@ router.post('/', orderWriteRateLimit, requireRole('owner', 'manager', 'cashier',
         country: settings.country || 'IN',
         business_type: settings.business_type || 'restaurant',
         state_code: settings.state_code || '',
+        currency: getTenantCurrency(),
         taxes_enabled: settings.taxes_enabled === 'true',
       };
       const chargeCategories = getConfiguredChargeTaxCategories(tenantInfo.country);
       const chargeContext = {
-        packaging_charge: packaging_charge || 0,
-        delivery_charge: delivery_charge || 0,
-        service_charge: 0,
+        packaging_charge: pkgCharge,
+        delivery_charge: delCharge,
+        service_charge: serviceCharge,
         packaging_tax_category_id: chargeCategories.packaging?.categoryId || null,
         delivery_tax_category_id: chargeCategories.delivery?.categoryId || null,
         service_charge_tax_category_id: chargeCategories.service_charge?.categoryId || null,
@@ -463,12 +479,13 @@ router.post('/', orderWriteRateLimit, requireRole('owner', 'manager', 'cashier',
       const orderResult = db.prepare(`
         INSERT INTO orders (order_number, table_id, customer_id, user_id, type, guest_count, special_instructions,
           packaging_charge, delivery_charge, packaging_tax_category_id, delivery_tax_category_id,
-          service_charge_tax_category_id, status, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+          service_charge, service_charge_tax_category_id, online_platform, external_order_id, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
       `).run(orderNumber, table_id || null, customer_id || null, authenticatedUserId, type, guest_count || null,
-        special_instructions || null, packaging_charge || 0, delivery_charge || 0,
+        special_instructions || null, pkgCharge, delCharge,
         chargeContext.packaging_tax_category_id, chargeContext.delivery_tax_category_id,
-        chargeContext.service_charge_tax_category_id, now(), now());
+        serviceCharge, chargeContext.service_charge_tax_category_id,
+        onlinePlatform || null, externalOrderId || null, now(), now());
 
       const orderId = orderResult.lastInsertRowid;
 
@@ -498,15 +515,11 @@ router.post('/', orderWriteRateLimit, requireRole('owner', 'manager', 'cashier',
 
         const unitPrice = parseFloat(product.price);
         const quantity = item.quantity;
-        // item.discount_amount is intentionally ignored here — discounts are only
-        // applied through the dedicated PATCH discount endpoints, which enforce
-        // discount_mode/max_percentage/max_amount/approval (vuln-0002).
+        // Item discounts are applied via dedicated discount routes, not creation.
         const itemDiscount = 0;
 
         // Validate quantity and price
-        if (!quantity || quantity <= 0 || !Number.isFinite(quantity)) {
-          throw new Error(`Invalid quantity for ${product.name}: must be a positive number`);
-        }
+        validateProductQuantity(product, quantity);
         if (unitPrice < 0 || !Number.isFinite(unitPrice)) {
           throw new Error(`Invalid price for ${product.name}: must be a non-negative number`);
         }
@@ -559,6 +572,9 @@ router.post('/', orderWriteRateLimit, requireRole('owner', 'manager', 'cashier',
       }
 
       const chargeTaxes = calculateConfiguredChargeTaxes(tenantInfo, chargeContext, customer);
+      const currency = getTenantCurrency();
+      const decimals = getCurrencyFractionDigits(currency);
+      const minorFactor = getCurrencyMinorUnitFactor(currency);
       const taxRollup = combineItemAndChargeTaxes({
         itemTaxAmount: totalTax,
         itemExclusiveTaxAmount: exclusiveTax,
@@ -566,10 +582,11 @@ router.post('/', orderWriteRateLimit, requireRole('owner', 'manager', 'cashier',
         itemSnapshots: allTaxSnapshots,
         itemTaxRatio: 1,
         chargeTaxes,
+        minorFactor,
       });
       const preRoundTotal = subtotal + taxRollup.exclusiveTaxAmount
-        + (delivery_charge || 0) + (packaging_charge || 0);
-      const total = Number(preRoundTotal.toFixed(2));
+        + delCharge + pkgCharge + serviceCharge;
+      const total = Number(preRoundTotal.toFixed(decimals));
       const roundOff = 0;
 
       db.prepare(`
@@ -615,7 +632,7 @@ router.post('/', orderWriteRateLimit, requireRole('owner', 'manager', 'cashier',
   }
 });
 
-router.post('/:id/items', orderWriteRateLimit, requireRole('owner', 'manager', 'cashier', 'server'), (req: Request, res: Response) => {
+router.post('/:id/items', orderWriteRateLimit, requireRole(...ROLE_ACCESS.sales), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const body = req.body || {};
@@ -631,14 +648,7 @@ router.post('/:id/items', orderWriteRateLimit, requireRole('owner', 'manager', '
       return res.status(404).json({ error: 'Order not found' });
     }
 
-    const authUser = (req as any).user;
-    if (authUser?.role === 'server' && order.user_id !== authUser.userId) {
-      return res.status(403).json({ error: 'Servers can only modify their own orders' });
-    }
-
-    // Replay before any mutable-order guard. A response-loss retry must return
-    // the committed result even if the order was split or its validation state
-    // changed after the original append.
+    // Return stored idempotent replay if already processed.
     if (idempotencyKey && requestHash) {
       const replayResponse = getStoredOrderReplay(db, idempotencyUserId, idempotencyKey, requestHash);
       if (replayResponse) return res.json(replayResponse);
@@ -658,24 +668,18 @@ router.post('/:id/items', orderWriteRateLimit, requireRole('owner', 'manager', '
       country: settings.country || 'IN',
       business_type: settings.business_type || 'restaurant',
       state_code: settings.state_code || '',
+      currency: getTenantCurrency(),
       taxes_enabled: settings.taxes_enabled === 'true',
     };
 
     const result = withTxn(() => {
-      // Re-fetch and re-validate under the transaction lock: another request (e.g. a
-      // cashier completing/cancelling the order) can race the checks above, which run
-      // before this lock is acquired (#175).
+      // Re-fetch and re-validate order state inside transaction to prevent concurrency races.
       const currentOrder = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id) as any;
       if (!currentOrder) {
         throw Object.assign(new Error('Order not found'), { statusCode: 404 });
       }
-      if (authUser?.role === 'server' && currentOrder.user_id !== authUser.userId) {
-        throw Object.assign(new Error('Servers can only modify their own orders'), { statusCode: 403 });
-      }
 
-      // Re-check idempotency under the transaction lock in case the early
-      // lookup raced the first request. This must remain before mutable-order
-      // guards so a committed append always has a replay path.
+      // Re-check idempotency under transaction lock.
       if (idempotencyKey && requestHash) {
         const replayResponse = getStoredOrderReplay(db, idempotencyUserId, idempotencyKey, requestHash);
         if (replayResponse) return { replayResponse };
@@ -709,6 +713,7 @@ router.post('/:id/items', orderWriteRateLimit, requireRole('owner', 'manager', '
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
       `);
 
+      const insertedItemIds: (number | bigint)[] = [];
       for (const item of items) {
         const product = db.prepare('SELECT * FROM products WHERE id = ?').get(item.product_id) as any;
         if (!product) {
@@ -720,15 +725,11 @@ router.post('/:id/items', orderWriteRateLimit, requireRole('owner', 'manager', '
 
         const unitPrice = parseFloat(product.price);
         const quantity = item.quantity;
-        // item.discount_amount is intentionally ignored here — discounts are only
-        // applied through the dedicated PATCH discount endpoints, which enforce
-        // discount_mode/max_percentage/max_amount/approval (vuln-0002).
+        // Item discounts are applied via dedicated discount routes, not creation.
         const itemDiscount = 0;
 
         // Validate quantity and price
-        if (!quantity || quantity <= 0 || !Number.isFinite(quantity)) {
-          throw new Error(`Invalid quantity for ${product.name}: must be a positive number`);
-        }
+        validateProductQuantity(product, quantity);
         if (unitPrice < 0 || !Number.isFinite(unitPrice)) {
           throw new Error(`Invalid price for ${product.name}: must be a non-negative number`);
         }
@@ -762,6 +763,7 @@ router.post('/:id/items', orderWriteRateLimit, requireRole('owner', 'manager', '
           item.special_instructions || null, itemCreatedAt, itemCreatedAt
         );
         insertOrderItemAddons(db, insertItemResult.lastInsertRowid, item.addons, itemCreatedAt);
+        insertedItemIds.push(insertItemResult.lastInsertRowid);
 
         if (product.track_inventory) {
           db.prepare('UPDATE products SET stock_quantity = stock_quantity - ?, updated_at = ? WHERE id = ?')
@@ -792,12 +794,15 @@ router.post('/:id/items', orderWriteRateLimit, requireRole('owner', 'manager', '
       }
 
       // BUG #12 FIX: Preserve order-level discount (scale percentage proportionally)
+      const currency = getTenantCurrency();
+      const decimals = getCurrencyFractionDigits(currency);
+      const minorFactor = getCurrencyMinorUnitFactor(currency);
       const existingDiscountAmount = currentOrder.discount_amount || 0;
       let newDiscountAmount = existingDiscountAmount;
       if (existingDiscountAmount > 0 && currentOrder.subtotal > 0) {
         if (currentOrder.discount_type === 'percentage') {
           const pct = currentOrder.discount_value || 0;
-          newDiscountAmount = Math.round(subtotal * pct / 100 * 100) / 100;
+          newDiscountAmount = Number((subtotal * pct / 100).toFixed(decimals));
         }
         // amount type: keep same value
       }
@@ -808,14 +813,11 @@ router.post('/:id/items', orderWriteRateLimit, requireRole('owner', 'manager', '
       let taxRatio = 1;
       if (newDiscountAmount > 0 && subtotal > 0) {
         taxRatio = discountedSubtotal / subtotal;
-        newTaxAmount = Math.round(totalTax * taxRatio * 100) / 100;
-        newExclusiveTax = Math.round(exclusiveTax * taxRatio * 100) / 100;
+        newTaxAmount = Number((totalTax * taxRatio).toFixed(decimals));
+        newExclusiveTax = Number((exclusiveTax * taxRatio).toFixed(decimals));
       }
 
-      const chargeTaxes = calculateConfiguredChargeTaxes(tenantInfo, {
-        ...currentOrder,
-        service_charge: 0,
-      }, customer);
+      const chargeTaxes = calculateConfiguredChargeTaxes(tenantInfo, currentOrder, customer);
       const taxRollup = combineItemAndChargeTaxes({
         itemTaxAmount: newTaxAmount,
         itemExclusiveTaxAmount: newExclusiveTax,
@@ -823,10 +825,11 @@ router.post('/:id/items', orderWriteRateLimit, requireRole('owner', 'manager', '
         itemSnapshots: allTaxSnapshots,
         itemTaxRatio: taxRatio,
         chargeTaxes,
+        minorFactor,
       });
       const preRoundTotal = discountedSubtotal + taxRollup.exclusiveTaxAmount
-        + (currentOrder.delivery_charge || 0) + (currentOrder.packaging_charge || 0);
-      const total = Number(preRoundTotal.toFixed(2));
+        + (currentOrder.delivery_charge || 0) + (currentOrder.packaging_charge || 0) + (currentOrder.service_charge || 0);
+      const total = Number(preRoundTotal.toFixed(decimals));
       const roundOff = 0;
 
       // Update order totals and optionally update order-level notes
@@ -844,11 +847,13 @@ router.post('/:id/items', orderWriteRateLimit, requireRole('owner', 'manager', '
       const existingBill = db.prepare("SELECT * FROM bills WHERE order_id = ? AND payment_status != 'paid'").get(req.params.id) as any;
       if (existingBill) {
         const pack = getActiveCountryPack(tenantInfo.country);
-        const { total: billTotal, adjustment: billRoundOff } = applyPayableRounding(total, pack);
+        const { total: billTotal, adjustment: billRoundOff } = applyPayableRounding(total, pack, currency);
         const newBillBalance = Math.max(0, billTotal - (existingBill.paid_amount || 0));
-        db.prepare(`UPDATE bills SET total = ?, balance = ?, tax_amount = ?, tax_breakdown = ?, tax_snapshot = ?, discount_amount = ?, round_off = ?, updated_at = ? WHERE id = ?`)
-          .run(billTotal, newBillBalance, taxRollup.taxAmount, JSON.stringify(taxRollup.breakdowns), taxRollup.snapshotJson, newDiscountAmount, billRoundOff, now(), existingBill.id);
+        db.prepare(`UPDATE bills SET total = ?, balance = ?, tax_amount = ?, tax_breakdown = ?, tax_snapshot = ?, discount_amount = ?, service_charge = ?, round_off = ?, updated_at = ? WHERE id = ?`)
+          .run(billTotal, newBillBalance, taxRollup.taxAmount, JSON.stringify(taxRollup.breakdowns), taxRollup.snapshotJson, newDiscountAmount, currentOrder.service_charge || 0, billRoundOff, now(), existingBill.id);
       }
+
+      recordOrderAudit(db, { orderId: req.params.id as string, actorUserId: idempotencyUserId, action: 'items_added', details: { item_ids: insertedItemIds } });
 
       const updatedOrder = parseRowJson(db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id)) as any;
       const updatedItems = attachEffectiveAddons(db, db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(req.params.id).map(parseItemJson) as any[]);
@@ -871,7 +876,7 @@ router.post('/:id/items', orderWriteRateLimit, requireRole('owner', 'manager', '
   }
 });
 
-router.patch('/:id/status', orderWriteRateLimit, requireRole('owner', 'manager', 'cashier', 'chef', 'server'), (req: Request, res: Response) => {
+router.patch('/:id/status', orderWriteRateLimit, requireRole(...ROLE_ACCESS.orderStatus), (req: Request, res: Response) => {
   try {
     const { status, reason, override_pin, free_table } = req.body;
 
@@ -887,9 +892,7 @@ router.patch('/:id/status', orderWriteRateLimit, requireRole('owner', 'manager',
     // reason is optional for cancellation
 
     const db = getDatabase();
-    // Keep the pre-transaction lookup limited to not-found reporting. All
-    // order/item-dependent authorization and policy decisions are repeated
-    // from currentOrder inside the authoritative transaction below.
+    // Validate order existence before beginning authoritative transaction.
     const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id);
     if (!order) {
       return res.status(404).json({ error: 'Order not found' });
@@ -907,11 +910,8 @@ router.patch('/:id/status', orderWriteRateLimit, requireRole('owner', 'manager',
       const currentUser = authUser?.userId
         ? db.prepare('SELECT role, is_active FROM users WHERE id = ?').get(authUser.userId) as { role: string; is_active: number } | undefined
         : undefined;
-      if (!currentUser || currentUser.is_active !== 1 || !['owner', 'manager', 'cashier', 'chef', 'server'].includes(currentUser.role)) {
+      if (!currentUser || currentUser.is_active !== 1 || !hasRole(currentUser.role, ROLE_ACCESS.orderStatus)) {
         throw Object.assign(new Error('Insufficient permissions'), { statusCode: 403 });
-      }
-      if (currentUser.role === 'server' && String(currentOrder.user_id) !== String(authUser.userId)) {
-        throw Object.assign(new Error('Servers can only modify their own orders'), { statusCode: 403 });
       }
 
       if (currentOrder.status === status) {
@@ -947,27 +947,27 @@ router.patch('/:id/status', orderWriteRateLimit, requireRole('owner', 'manager',
       const currentStatusIndex = statusOrder.indexOf(currentOrder.status);
       const requiresOverride = (currentStatusIndex > 0 || hasItemsInProgress) && status === 'cancelled';
 
+      let approvedByUserId: string | undefined;
       if (requiresOverride) {
         if (!override_pin) {
           throw Object.assign(new Error('Manager PIN required to cancel order in progress'), { statusCode: 400 });
         }
 
         const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
-        // Key is per-client/per-action, deliberately NOT per-order: a caller
-        // must not get a fresh attempt window by rotating order identifiers
-        // (GHSA-9jjq-2fmw-x3mw).
+        // Rate-limit cancellation attempts per client.
         const rateLimitKey = `pin:${clientIp}:order-cancel`;
         if (!checkPinRateLimit(rateLimitKey)) {
           throw Object.assign(new Error('Too many PIN attempts. Try again in 15 minutes.'), { statusCode: 429 });
         }
 
-        const user = db.prepare("SELECT * FROM users WHERE is_active = 1 AND pin_hash IS NOT NULL AND role IN ('owner', 'manager')")
-          .all()
-          .find((u: any) => verifyPin(u.pin_hash, override_pin));
+        const user = db.prepare(`SELECT * FROM users WHERE is_active = 1 AND pin_hash IS NOT NULL AND role IN (${OWNER_MANAGER_ROLE_PLACEHOLDERS})`)
+          .all(...ROLE_ACCESS.ownerManager)
+          .find((u: any) => verifyPin(u.pin_hash, override_pin)) as any;
 
         if (!user) {
           throw Object.assign(new Error('Invalid manager PIN'), { statusCode: 403 });
         }
+        approvedByUserId = user.id;
       }
 
       switch (status) {
@@ -1003,7 +1003,7 @@ router.patch('/:id/status', orderWriteRateLimit, requireRole('owner', 'manager',
           // Select only items eligible for restocking (exclude already cancelled, voided, or accounting adjustments)
           const eligibleItems = db.prepare(`
             SELECT * FROM order_items
-            WHERE order_id = ? AND status NOT IN ('cancelled', 'voided', 'void_adjustment')
+            WHERE order_id = ? AND status NOT IN ('cancelled', 'voided', 'void_adjustment', 'refunded')
           `).all(req.params.id) as any[];
 
           for (const item of eligibleItems) {
@@ -1016,7 +1016,7 @@ router.patch('/:id/status', orderWriteRateLimit, requireRole('owner', 'manager',
 
           db.prepare(`
             UPDATE order_items SET status = 'cancelled', updated_at = ?
-            WHERE order_id = ? AND status NOT IN ('cancelled', 'voided', 'void_adjustment')
+            WHERE order_id = ? AND status NOT IN ('cancelled', 'voided', 'void_adjustment', 'refunded')
           `).run(nowStr, req.params.id);
 
           db.prepare('UPDATE orders SET status = ?, cancelled_at = ?, cancellation_reason = ?, updated_at = ? WHERE id = ?')
@@ -1029,6 +1029,13 @@ router.patch('/:id/status', orderWriteRateLimit, requireRole('owner', 'manager',
           break;
         }
       }
+
+      recordOrderAudit(db, {
+        orderId: req.params.id as string,
+        actorUserId: authUser.userId,
+        action: 'status_changed',
+        details: { from: currentOrder.status, to: status, ...(approvedByUserId && { approved_by: approvedByUserId }) },
+      });
 
       const updatedOrder = parseRowJson(db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id)) as any;
       const orderItems = attachEffectiveAddons(db, db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(req.params.id).map(parseItemJson) as any[]);
@@ -1049,7 +1056,7 @@ router.patch('/:id/status', orderWriteRateLimit, requireRole('owner', 'manager',
   }
 });
 
-router.patch('/:id/customer', orderWriteRateLimit, requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.patch('/:id/customer', orderWriteRateLimit, requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id) as any;
@@ -1093,7 +1100,7 @@ router.patch('/:id/customer', orderWriteRateLimit, requireRole('owner', 'manager
   }
 });
 
-router.patch('/:id/convert-to-takeaway', orderWriteRateLimit, requireRole('owner', 'manager', 'cashier', 'server'), (req: Request, res: Response) => {
+router.patch('/:id/convert-to-takeaway', orderWriteRateLimit, requireRole(...ROLE_ACCESS.sales), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const nowStr = now();
@@ -1136,7 +1143,7 @@ router.patch('/:id/convert-to-takeaway', orderWriteRateLimit, requireRole('owner
   }
 });
 
-router.patch('/:id/discount', orderWriteRateLimit, requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.patch('/:id/discount', orderWriteRateLimit, requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id) as any;
@@ -1165,6 +1172,7 @@ router.patch('/:id/discount', orderWriteRateLimit, requireRole('owner', 'manager
     }
 
     // Check if approval is required
+    let approvedByUserId: string | undefined;
     if (discount_value > 0) {
       const requiresApproval = getSettingValue('discount_requires_approval') === 'true';
       if (requiresApproval) {
@@ -1177,18 +1185,22 @@ router.patch('/:id/discount', orderWriteRateLimit, requireRole('owner', 'manager
         if (!checkPinRateLimit(rateLimitKey)) {
           return res.status(429).json({ error: 'Too many PIN attempts. Try again in 15 minutes.' });
         }
-        const user = db.prepare("SELECT * FROM users WHERE is_active = 1 AND pin_hash IS NOT NULL AND role IN ('owner', 'manager')")
-          .all()
-          .find((u: any) => verifyPin(u.pin_hash, override_pin));
+        const user = db.prepare(`SELECT * FROM users WHERE is_active = 1 AND pin_hash IS NOT NULL AND role IN (${OWNER_MANAGER_ROLE_PLACEHOLDERS})`)
+          .all(...ROLE_ACCESS.ownerManager)
+          .find((u: any) => verifyPin(u.pin_hash, override_pin)) as any;
         if (!user) {
           return res.status(403).json({ error: 'Invalid manager PIN' });
         }
+        approvedByUserId = user.id;
       }
     }
 
     // Check discount mode
     if (discount_value > 0) {
       const discountMode = getSettingValue('discount_mode') || 'percentage';
+      if (discountMode === 'none') {
+        return res.status(400).json({ error: 'Discounts are disabled' });
+      }
       if (discountMode === 'flat' && discount_type === 'percentage') {
         return res.status(400).json({ error: 'Percentage discounts are disabled' });
       }
@@ -1215,13 +1227,12 @@ router.patch('/:id/discount', orderWriteRateLimit, requireRole('owner', 'manager
       country: getSettingValue('country') || 'IN',
       business_type: getSettingValue('business_type') || 'restaurant',
       state_code: getSettingValue('state_code') || '',
+      currency: getTenantCurrency(),
       taxes_enabled: getSettingValue('taxes_enabled') === 'true',
     };
-    // BUG #6 FIX: Wrap discount + tax + bill sync in a transaction
+    // Wrap discount, tax recalculation, and bill sync in transaction.
     const result = withTxn(() => {
-      // Re-fetch and re-validate under the transaction lock: another request (e.g. a
-      // concurrent item add/void, or the order being completed/cancelled) can race the
-      // checks above and change status/subtotal before this lock is acquired (#175).
+      // Re-fetch and re-validate under transaction lock to prevent races with concurrent edits.
       const currentOrder = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id) as any;
       if (!currentOrder) {
         throw Object.assign(new Error('Order not found'), { statusCode: 404 });
@@ -1233,6 +1244,9 @@ router.patch('/:id/discount', orderWriteRateLimit, requireRole('owner', 'manager
       const customer = currentOrder.customer_id
         ? db.prepare('SELECT * FROM customers WHERE id = ?').get(currentOrder.customer_id) as any
         : null;
+      const currency = getTenantCurrency();
+      const decimals = getCurrencyFractionDigits(currency);
+      const minorFactor = getCurrencyMinorUnitFactor(currency);
 
       // Calculate discount amount
       let discountAmount = 0;
@@ -1242,12 +1256,10 @@ router.patch('/:id/discount', orderWriteRateLimit, requireRole('owner', 'manager
         } else {
           discountAmount = Math.min(discount_value, currentOrder.subtotal);
         }
-        discountAmount = Math.round(discountAmount * 100) / 100;
+        discountAmount = Number(discountAmount.toFixed(decimals));
       }
 
-      // Always recalculate tax from item-level data (not by scaling the already-discounted
-      // order.tax_amount from the DB), otherwise repeated discount updates compound the
-      // reduction each time this endpoint is called.
+      // Recalculate tax from item-level data to avoid compounding on repeated discount edits.
       const activeItems = db.prepare("SELECT * FROM order_items WHERE order_id = ? AND status != 'cancelled'").all(req.params.id) as any[];
       let freshTax = 0;
       let exclusiveTax = 0;
@@ -1272,15 +1284,12 @@ router.patch('/:id/discount', orderWriteRateLimit, requireRole('owner', 'manager
       if (discountAmount > 0 && currentOrder.subtotal > 0) {
         const discountedSubtotal = Math.max(0, currentOrder.subtotal - discountAmount);
         taxRatio = discountedSubtotal / currentOrder.subtotal;
-        newTaxAmount = Math.round(freshTax * taxRatio * 100) / 100;
-        newExclusiveTax = Math.round(exclusiveTax * taxRatio * 100) / 100;
+        newTaxAmount = Number((freshTax * taxRatio).toFixed(decimals));
+        newExclusiveTax = Number((exclusiveTax * taxRatio).toFixed(decimals));
       }
 
       const discountedSubtotal = Math.max(0, currentOrder.subtotal - discountAmount);
-      const chargeTaxes = calculateConfiguredChargeTaxes(tenantInfo, {
-        ...currentOrder,
-        service_charge: 0,
-      }, customer);
+      const chargeTaxes = calculateConfiguredChargeTaxes(tenantInfo, currentOrder, customer);
       const taxRollup = combineItemAndChargeTaxes({
         itemTaxAmount: newTaxAmount,
         itemExclusiveTaxAmount: newExclusiveTax,
@@ -1288,10 +1297,11 @@ router.patch('/:id/discount', orderWriteRateLimit, requireRole('owner', 'manager
         itemSnapshots: allTaxSnapshots,
         itemTaxRatio: taxRatio,
         chargeTaxes,
+        minorFactor,
       });
       const preRoundTotal = discountedSubtotal + taxRollup.exclusiveTaxAmount
-        + (currentOrder.packaging_charge || 0) + (currentOrder.delivery_charge || 0);
-      const newTotal = Number(preRoundTotal.toFixed(2));
+        + (currentOrder.packaging_charge || 0) + (currentOrder.delivery_charge || 0) + (currentOrder.service_charge || 0);
+      const newTotal = Number(preRoundTotal.toFixed(decimals));
       const roundOff = 0;
 
       db.prepare(`
@@ -1310,20 +1320,27 @@ router.patch('/:id/discount', orderWriteRateLimit, requireRole('owner', 'manager
         .get(req.params.id, 'paid') as any;
       if (existingBill) {
         const pack = getActiveCountryPack(tenantInfo.country);
-        const { total: billTotal, adjustment: billRoundOff } = applyPayableRounding(newTotal, pack);
+        const { total: billTotal, adjustment: billRoundOff } = applyPayableRounding(newTotal, pack, currency);
         const newBillBalance = Math.max(0, billTotal - (existingBill.paid_amount || 0));
         db.prepare(`
           UPDATE bills SET discount_amount = ?, discount_type = ?, discount_value = ?,
-            discount_reason = ?, tax_amount = ?, tax_breakdown = ?, tax_snapshot = ?, total = ?, balance = ?, round_off = ?, updated_at = ?
+            discount_reason = ?, tax_amount = ?, tax_breakdown = ?, tax_snapshot = ?, total = ?, balance = ?, service_charge = ?, round_off = ?, updated_at = ?
           WHERE id = ?
         `).run(
           discountAmount,
           discount_value > 0 ? discount_type : null,
           discount_value > 0 ? discount_value : null,
           discount_value > 0 ? (discount_reason || null) : null,
-          taxRollup.taxAmount, JSON.stringify(taxRollup.breakdowns), taxRollup.snapshotJson, billTotal, newBillBalance, billRoundOff, now(), existingBill.id
+          taxRollup.taxAmount, JSON.stringify(taxRollup.breakdowns), taxRollup.snapshotJson, billTotal, newBillBalance, currentOrder.service_charge || 0, billRoundOff, now(), existingBill.id
         );
       }
+
+      recordOrderAudit(db, {
+        orderId: req.params.id as string,
+        actorUserId: (req as any).user.userId,
+        action: 'order_discount_applied',
+        details: { discount_type, discount_value, ...(approvedByUserId && { approved_by: approvedByUserId }) },
+      });
 
       const updatedOrder = parseRowJson(db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id)) as any;
       return updatedOrder;
@@ -1337,7 +1354,7 @@ router.patch('/:id/discount', orderWriteRateLimit, requireRole('owner', 'manager
   }
 });
 
-router.patch('/:id/items/:itemId/discount', orderWriteRateLimit, requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.patch('/:id/items/:itemId/discount', orderWriteRateLimit, requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id) as any;
@@ -1357,6 +1374,9 @@ router.patch('/:id/items/:itemId/discount', orderWriteRateLimit, requireRole('ow
     if (!item) {
       return res.status(404).json({ error: 'Item not found' });
     }
+    if (['cancelled', 'voided', 'void_adjustment', 'refunded'].includes(item.status)) {
+      return res.status(400).json({ error: 'Cannot apply discount to a cancelled, voided, or refunded item' });
+    }
 
     const { discount_type, discount_value } = req.body;
 
@@ -1371,6 +1391,7 @@ router.patch('/:id/items/:itemId/discount', orderWriteRateLimit, requireRole('ow
     }
 
     // Check if approval is required
+    let approvedByUserId: string | undefined;
     const requiresApproval = getSettingValue('discount_requires_approval') === 'true';
     if (requiresApproval) {
       const { override_pin } = req.body;
@@ -1382,16 +1403,20 @@ router.patch('/:id/items/:itemId/discount', orderWriteRateLimit, requireRole('ow
       if (!checkPinRateLimit(rateLimitKey)) {
         return res.status(429).json({ error: 'Too many PIN attempts. Try again in 15 minutes.' });
       }
-      const user = db.prepare("SELECT * FROM users WHERE is_active = 1 AND pin_hash IS NOT NULL AND role IN ('owner', 'manager')")
-        .all()
-        .find((u: any) => verifyPin(u.pin_hash, override_pin));
+      const user = db.prepare(`SELECT * FROM users WHERE is_active = 1 AND pin_hash IS NOT NULL AND role IN (${OWNER_MANAGER_ROLE_PLACEHOLDERS})`)
+        .all(...ROLE_ACCESS.ownerManager)
+        .find((u: any) => verifyPin(u.pin_hash, override_pin)) as any;
       if (!user) {
         return res.status(403).json({ error: 'Invalid manager PIN' });
       }
+      approvedByUserId = user.id;
     }
 
     // Check discount mode
     const discountMode = getSettingValue('discount_mode') || 'percentage';
+    if (discountMode === 'none') {
+      return res.status(400).json({ error: 'Discounts are disabled' });
+    }
     if (discountMode === 'flat' && discount_type === 'percentage') {
       return res.status(400).json({ error: 'Percentage discounts are disabled' });
     }
@@ -1416,6 +1441,9 @@ router.patch('/:id/items/:itemId/discount', orderWriteRateLimit, requireRole('ow
     const addonRows = db.prepare('SELECT price, quantity FROM order_item_addons WHERE order_item_id = ?').all(item.id) as { price: number; quantity?: number }[];
     const addonTotal = addonRows.reduce((sum, addon) => sum + (addon.price || 0) * (addon.quantity || 1) * item.quantity, 0);
     const itemBaseTotal = item.unit_price * item.quantity + addonTotal;
+    const currency = getTenantCurrency();
+    const decimals = getCurrencyFractionDigits(currency);
+    const minorFactor = getCurrencyMinorUnitFactor(currency);
 
     let discountAmount: number;
     if (discount_type === 'percentage') {
@@ -1423,7 +1451,7 @@ router.patch('/:id/items/:itemId/discount', orderWriteRateLimit, requireRole('ow
     } else {
       discountAmount = Math.min(discount_value, itemBaseTotal);
     }
-    discountAmount = Math.round(discountAmount * 100) / 100;
+    discountAmount = Number(discountAmount.toFixed(decimals));
 
     // Recalculate item subtotal after discount
     const newSubtotal = Math.max(0, itemBaseTotal - discountAmount);
@@ -1437,6 +1465,7 @@ router.patch('/:id/items/:itemId/discount', orderWriteRateLimit, requireRole('ow
       country: settingsMap.country || 'IN',
       business_type: settingsMap.business_type || 'restaurant',
       state_code: settingsMap.state_code || '',
+      currency: getTenantCurrency(),
       taxes_enabled: settingsMap.taxes_enabled === 'true',
     };
     const taxResult = calculateItemTax(tenantInfo, product, newSubtotal, customer);
@@ -1457,11 +1486,8 @@ router.patch('/:id/items/:itemId/discount', orderWriteRateLimit, requireRole('ow
         newTaxSnapshotJson, taxResult.tax_type, newTotal, now(), req.params.itemId,
       );
 
-      // Update order totals (preserve existing order-level discount)
-      // Note: status != 'cancelled' — a cancelled item's tax must not re-enter
-      // the order total here, same filter every other recompute site in this
-      // file already uses (BUG #3 FIX above, index.ts cancel/restore below).
-      const allItems = db.prepare("SELECT * FROM order_items WHERE order_id = ? AND status != 'cancelled'").all(req.params.id) as any[];
+      // Update order totals excluding cancelled, voided, or refunded items.
+      const allItems = db.prepare("SELECT * FROM order_items WHERE order_id = ? AND status NOT IN ('cancelled', 'voided', 'void_adjustment', 'refunded')").all(req.params.id) as any[];
       let orderSubtotal = 0;
       let orderTax = 0;
       let exclusiveOrderTax = 0;
@@ -1487,7 +1513,7 @@ router.patch('/:id/items/:itemId/discount', orderWriteRateLimit, requireRole('ow
       let newOrderDiscount = existingDiscountAmount;
       if (existingDiscountAmount > 0 && order.subtotal > 0) {
         // Scale discount proportionally to new subtotal
-        newOrderDiscount = Math.round(existingDiscountAmount * (orderSubtotal / order.subtotal) * 100) / 100;
+        newOrderDiscount = Number((existingDiscountAmount * (orderSubtotal / order.subtotal)).toFixed(decimals));
       }
 
       // Recalculate tax on discounted subtotal
@@ -1497,14 +1523,11 @@ router.patch('/:id/items/:itemId/discount', orderWriteRateLimit, requireRole('ow
       let taxRatio = 1;
       if (newOrderDiscount > 0 && orderSubtotal > 0) {
         taxRatio = discountedSubtotal / orderSubtotal;
-        newOrderTax = Math.round(orderTax * taxRatio * 100) / 100;
-        newExclusiveOrderTax = Math.round(exclusiveOrderTax * taxRatio * 100) / 100;
+        newOrderTax = Number((orderTax * taxRatio).toFixed(decimals));
+        newExclusiveOrderTax = Number((exclusiveOrderTax * taxRatio).toFixed(decimals));
       }
 
-      const chargeTaxes = calculateConfiguredChargeTaxes(tenantInfo, {
-        ...order,
-        service_charge: 0,
-      }, customer);
+      const chargeTaxes = calculateConfiguredChargeTaxes(tenantInfo, order, customer);
       const taxRollup = combineItemAndChargeTaxes({
         itemTaxAmount: newOrderTax,
         itemExclusiveTaxAmount: newExclusiveOrderTax,
@@ -1512,10 +1535,11 @@ router.patch('/:id/items/:itemId/discount', orderWriteRateLimit, requireRole('ow
         itemSnapshots: allTaxSnapshots,
         itemTaxRatio: taxRatio,
         chargeTaxes,
+        minorFactor,
       });
       const preRoundTotal = discountedSubtotal + taxRollup.exclusiveTaxAmount
-        + (order.packaging_charge || 0) + (order.delivery_charge || 0);
-      const orderTotal = Number(preRoundTotal.toFixed(2));
+        + (order.packaging_charge || 0) + (order.delivery_charge || 0) + (order.service_charge || 0);
+      const orderTotal = Number(preRoundTotal.toFixed(decimals));
       const roundOff = 0;
 
       db.prepare(`
@@ -1526,11 +1550,19 @@ router.patch('/:id/items/:itemId/discount', orderWriteRateLimit, requireRole('ow
       const existingBill = db.prepare("SELECT * FROM bills WHERE order_id = ? AND payment_status != 'paid'").get(req.params.id) as any;
       if (existingBill) {
         const pack = getActiveCountryPack(tenantInfo.country);
-        const { total: billTotal, adjustment: billRoundOff } = applyPayableRounding(orderTotal, pack);
+        const { total: billTotal, adjustment: billRoundOff } = applyPayableRounding(orderTotal, pack, currency);
         const newBillBalance = Math.max(0, billTotal - (existingBill.paid_amount || 0));
-        db.prepare(`UPDATE bills SET total = ?, balance = ?, tax_amount = ?, tax_breakdown = ?, tax_snapshot = ?, discount_amount = ?, round_off = ?, updated_at = ? WHERE id = ?`)
-          .run(billTotal, newBillBalance, taxRollup.taxAmount, JSON.stringify(taxRollup.breakdowns), taxRollup.snapshotJson, newOrderDiscount, billRoundOff, now(), existingBill.id);
+        db.prepare(`UPDATE bills SET total = ?, balance = ?, tax_amount = ?, tax_breakdown = ?, tax_snapshot = ?, discount_amount = ?, service_charge = ?, round_off = ?, updated_at = ? WHERE id = ?`)
+          .run(billTotal, newBillBalance, taxRollup.taxAmount, JSON.stringify(taxRollup.breakdowns), taxRollup.snapshotJson, newOrderDiscount, order.service_charge || 0, billRoundOff, now(), existingBill.id);
       }
+
+      recordOrderAudit(db, {
+        orderId: req.params.id as string,
+        orderItemId: req.params.itemId as string,
+        actorUserId: (req as any).user.userId,
+        action: 'item_discount_applied',
+        details: { discount_type, discount_value, ...(approvedByUserId && { approved_by: approvedByUserId }) },
+      });
 
       return db.prepare('SELECT * FROM order_items WHERE id = ?').get(req.params.itemId) as any;
     });

@@ -1,27 +1,30 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useAuthStore } from '@/store/auth';
 import { usePosSettingsStore, type PaperSize, type BillTemplate } from '@/store/pos-settings';
+import { useThemeMode, type ThemeMode } from '@/store/theme';
 import { LANGUAGES, type Language } from '@/lib/i18n';
 import type { KotLanguagePolicy, PrimaryLanguageSelection, ReceiptLanguagePolicy } from '@print/types';
 import {
   parseStoredKotLanguagePolicy,
   parseStoredReceiptLanguagePolicy,
 } from '@/lib/print-language-policies';
-import { usePrinterStore, usePrinterStatusSync } from '@/hooks/usePrinter';
-import { Settings, Building2, CreditCard, Monitor, Users, Gift, Printer, Share2, FileText, Lock, Smartphone, RefreshCw, Copy, Check, Wifi, Usb, Trash2, Plus, Star, TestTube2, ChefHat, QrCode, CheckCircle2, Database, Cloud, CloudOff, Zap, Percent, KeyRound, AlertTriangle, Wrench, HardDrive, UploadCloud, Hash, ChevronDown } from 'lucide-react';
+import { usePrinterStore } from '@/hooks/usePrinter';
+import { Settings, Building2, CreditCard, Monitor, Users, Gift, Printer, Share2, FileText, Lock, Smartphone, RefreshCw, Copy, Check, Wifi, Usb, Trash2, Plus, Star, TestTube2, ChefHat, QrCode, CheckCircle2, Database, Cloud, CloudOff, Zap, Percent, KeyRound, AlertTriangle, Wrench, HardDrive, UploadCloud, Hash, ChevronDown, SunMoon } from 'lucide-react';
 import { Tabs, TabsContent } from '@/components/ui/tabs';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import api from '@/lib/api';
+import axios from 'axios';
 import toast from 'react-hot-toast';
 import { COUNTRIES, getCountryByCode, getCurrencySymbol, getLocalizedCountryName, sortCountriesByLocalizedName, type CurrencyDisplay, type DigitMode, type CalendarMode } from '@/lib/countries';
 import { dialCodeFor, normalizeOptionalPhone } from '@/lib/phone';
 import { useConfirm } from '@/hooks/use-confirm';
 import { MasterPinPrompt } from '@/components/settings/MasterPinPrompt';
+import BetaChannelToggle from '@/components/settings/BetaChannelToggle';
 import { HealthCheckDialog } from '@/components/settings/HealthCheckDialog';
 import { InitializeDatabaseDialog } from '@/components/settings/InitializeDatabaseDialog';
 import { WhatsAppEnableCard } from '@/components/settings/WhatsAppEnableCard';
@@ -38,6 +41,7 @@ import { useFormatDate } from '@/hooks/useFormatDate';
 import { useUpdateStatus } from '@/hooks/useUpdateStatus';
 import { TENANT_STATUS_LABEL_KEYS } from '@/lib/i18n-enums';
 import { isTemplateCardSelected, type BillTemplateSelectionSource } from '@/lib/bill-template-picker';
+import { ROLE_ACCESS, hasRole } from '@shared/role-permissions';
 
 // Registry-derived selectable UI languages (from LANGUAGES where selectable: true).
 const SELECTABLE_LANGUAGES: Language[] = (Object.keys(LANGUAGES) as Language[]).filter(
@@ -77,6 +81,10 @@ function tenantStatusLabel(status: string | undefined, tCommon: (key: 'active' |
 }
 
 const CLOUD_ACCOUNT_STATUS_CHANGED_EVENT = 'flo:cloud-account-status-changed';
+
+function isRequestCancelled(error: unknown): boolean {
+  return axios.isCancel(error);
+}
 
 function notifyCloudAccountStatusChanged(): void {
   if (typeof window !== 'undefined') window.dispatchEvent(new Event(CLOUD_ACCOUNT_STATUS_CHANGED_EVENT));
@@ -149,10 +157,10 @@ function Toggle({ value, onChange }: { value: boolean; onChange: (v: boolean) =>
     <button
       type="button"
       onClick={() => onChange(!value)}
-      className={`relative w-11 h-6 rounded-full transition-colors shrink-0 ${value ? 'bg-brand' : 'bg-gray-300'}`}
+      className={`relative w-11 h-6 rounded-full transition-colors shrink-0 ${value ? 'bg-brand' : 'bg-gray-300 dark:bg-input'}`}
     >
       {/* start-0.5 + rtl:-translate-x-5 keeps the knob at the inline-start and slides it toward the inline-end in both directions. */}
-      <span className={`absolute top-0.5 start-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform ${value ? 'translate-x-5 rtl:-translate-x-5' : 'translate-x-0'}`} />
+      <span className={`absolute top-0.5 start-0.5 w-5 h-5 bg-card rounded-full shadow transition-transform ${value ? 'translate-x-5 rtl:-translate-x-5' : 'translate-x-0'}`} />
     </button>
   );
 }
@@ -173,6 +181,39 @@ function invoicePreviewSegment(period: InvoiceResetPeriod, month: number, day: n
   return `${yyyy}${mm}${dd}`;
 }
 
+// Sanitize prefix on load to alphanumeric characters so legacy values pass save validation.
+function sanitizeStoredNumberPrefix(value: string | null | undefined): string {
+  return (value ?? '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+const BUSINESS_DAY_START_OPTIONS = [
+  { value: '00:00', label: '00:00 (12:00 AM)' },
+  { value: '00:30', label: '00:30 (12:30 AM)' },
+  { value: '01:00', label: '01:00 (1:00 AM)' },
+  { value: '01:30', label: '01:30 (1:30 AM)' },
+  { value: '02:00', label: '02:00 (2:00 AM)' },
+  { value: '02:30', label: '02:30 (2:30 AM)' },
+  { value: '03:00', label: '03:00 (3:00 AM)' },
+  { value: '03:30', label: '03:30 (3:30 AM)' },
+  { value: '04:00', label: '04:00 (4:00 AM)' },
+  { value: '04:30', label: '04:30 (4:30 AM)' },
+  { value: '05:00', label: '05:00 (5:00 AM)' },
+  { value: '05:30', label: '05:30 (5:30 AM)' },
+  { value: '06:00', label: '06:00 (6:00 AM)' },
+  { value: '06:30', label: '06:30 (6:30 AM)' },
+  { value: '07:00', label: '07:00 (7:00 AM)' },
+  { value: '07:30', label: '07:30 (7:30 AM)' },
+  { value: '08:00', label: '08:00 (8:00 AM)' },
+  { value: '08:30', label: '08:30 (8:30 AM)' },
+  { value: '09:00', label: '09:00 (9:00 AM)' },
+  { value: '09:30', label: '09:30 (9:30 AM)' },
+  { value: '10:00', label: '10:00 (10:00 AM)' },
+  { value: '10:30', label: '10:30 (10:30 AM)' },
+  { value: '11:00', label: '11:00 (11:00 AM)' },
+  { value: '11:30', label: '11:30 (11:30 AM)' },
+];
+
+
 function SettingsNavItem({
   label, value, active, onClick, indent, attention,
 }: {
@@ -192,7 +233,7 @@ function SettingsNavItem({
         indent ? 'ps-5 pe-2 border-s-2 ms-1 text-xs md:ms-0' : 'px-3',
         isActive
           ? 'bg-brand/10 text-brand font-semibold' + (indent ? ' border-brand' : '')
-          : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900' + (indent ? ' border-transparent' : ''),
+          : 'text-muted-foreground hover:bg-muted hover:text-foreground' + (indent ? ' border-transparent' : ''),
       ].join(' ')}
     >
       <span className="min-w-0 truncate">{label}</span>
@@ -209,11 +250,14 @@ function KdsDefaultViewCard() {
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    api.get('/settings/kds').then((res) => {
+    const controller = new AbortController();
+    api.get('/settings/kds', { signal: controller.signal }).then((res) => {
+      if (controller.signal.aborted) return;
       const v = res.data?.kds_default_view === 'kanban' ? 'kanban' : 'tabs';
       setView(v);
       setSavedView(v);
     }).catch(() => {});
+    return () => controller.abort();
   }, []);
 
   const dirty = view !== savedView;
@@ -234,12 +278,12 @@ function KdsDefaultViewCard() {
   }
 
   return (
-    <div className="bg-white rounded-xl border border-gray-100 p-6">
+    <div className="bg-card rounded-xl border border-border p-6">
       <div className="flex items-center gap-2 mb-4">
-        <Monitor size={20} className="text-gray-500" />
-        <h2 className="font-semibold text-gray-900">{t('kdsDefaultView')}</h2>
+        <Monitor size={20} className="text-muted-foreground" />
+        <h2 className="font-semibold text-foreground">{t('kdsDefaultView')}</h2>
       </div>
-      <p className="text-sm text-gray-500 mb-5">{t('kdsDefaultViewHint')}</p>
+      <p className="text-sm text-muted-foreground mb-5">{t('kdsDefaultViewHint')}</p>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <button
@@ -248,14 +292,14 @@ function KdsDefaultViewCard() {
           className={`text-start rounded-lg border-2 px-4 py-3 transition ${
             view === 'tabs'
               ? 'border-brand bg-brand/5'
-              : 'border-gray-200 hover:border-gray-300'
+              : 'border-border hover:border-gray-300 dark:border-border'
           }`}
         >
           <div className="flex items-center gap-2 mb-1">
             <input type="radio" readOnly checked={view === 'tabs'} className="text-brand" />
-            <span className="font-medium text-gray-900">{t('kdsDefaultViewTabs')}</span>
+            <span className="font-medium text-foreground">{t('kdsDefaultViewTabs')}</span>
           </div>
-          <p className="text-xs text-gray-500 ms-6">{t('kdsDefaultViewTabsHint')}</p>
+          <p className="text-xs text-muted-foreground ms-6">{t('kdsDefaultViewTabsHint')}</p>
         </button>
         <button
           type="button"
@@ -263,18 +307,18 @@ function KdsDefaultViewCard() {
           className={`text-start rounded-lg border-2 px-4 py-3 transition ${
             view === 'kanban'
               ? 'border-brand bg-brand/5'
-              : 'border-gray-200 hover:border-gray-300'
+              : 'border-border hover:border-gray-300 dark:border-border'
           }`}
         >
           <div className="flex items-center gap-2 mb-1">
             <input type="radio" readOnly checked={view === 'kanban'} className="text-brand" />
-            <span className="font-medium text-gray-900">{t('kdsDefaultViewKanban')}</span>
+            <span className="font-medium text-foreground">{t('kdsDefaultViewKanban')}</span>
           </div>
-          <p className="text-xs text-gray-500 ms-6">{t('kdsDefaultViewKanbanHint')}</p>
+          <p className="text-xs text-muted-foreground ms-6">{t('kdsDefaultViewKanbanHint')}</p>
         </button>
       </div>
 
-      <div className="flex justify-end mt-5 pt-4 border-t border-gray-100">
+      <div className="flex justify-end mt-5 pt-4 border-t border-border">
         <button
           type="button"
           onClick={save}
@@ -295,7 +339,6 @@ export default function SettingsPage() {
   const posSettings = usePosSettingsStore();
   const whatsappEnabled = posSettings.whatsappEnabled;
   const { printMethod, setPrintMethod, refreshHardwarePrinter } = usePrinterStore();
-  usePrinterStatusSync();
   const t = useTranslations('settings');
   const tCommon = useTranslations('common');
   const locale = useLocale();
@@ -305,14 +348,16 @@ export default function SettingsPage() {
   const language = posSettings.language;
   const setLanguage = posSettings.setLanguage;
   const { formatDate, formatTime, formatDateTime } = useFormatDate();
-  const isAdmin = currentTenant?.role === 'admin' || currentTenant?.role === 'owner';
-  const canViewTaxConfiguration = currentTenant?.role === 'owner' || currentTenant?.role === 'manager';
+  const isAdmin = hasRole(currentTenant?.role, ROLE_ACCESS.ownerManager);
+  const isOwner = hasRole(currentTenant?.role, ROLE_ACCESS.owner);
+  const canViewTaxConfiguration = isAdmin;
   const { confirm, ConfirmDialog } = useConfirm();
 
   const [loyaltyEnabled, setLoyaltyEnabled] = useState(false);
   const [savedLoyaltyEnabled, setSavedLoyaltyEnabled] = useState(false);
   const [globalCashbackPercent, setGlobalCashbackPercent] = useState('0');
   const [savedGlobalCashbackPercent, setSavedGlobalCashbackPercent] = useState('0');
+  const loyaltyFormRef = useRef({ loyaltyEnabled, globalCashbackPercent });
   const [globalRateCandidates, setGlobalRateCandidates] = useState(0);
   const [applyingGlobalRate, setApplyingGlobalRate] = useState(false);
   const [savingLoyalty, setSavingLoyalty] = useState(false);
@@ -328,6 +373,7 @@ export default function SettingsPage() {
   const [savedDiscountMode, setSavedDiscountMode] = useState('percentage');
   const [discountRequiresApproval, setDiscountRequiresApproval] = useState(false);
   const [savedDiscountRequiresApproval, setSavedDiscountRequiresApproval] = useState(false);
+  const discountFormRef = useRef({ discountMaxPct, discountMaxAmount, discountMode, discountRequiresApproval });
   const [savingDiscount, setSavingDiscount] = useState(false);
 
   // Table info dialog
@@ -336,21 +382,91 @@ export default function SettingsPage() {
 
   const searchParams = useSearchParams();
   const requestedTab = searchParams?.get('tab') || 'store';
-  // ── DB tools: master PIN, health check, initialize ──────────────────────
-  // activeTab/healthCheckOpen/initializeDbOpen/pinGate read their initial value from the
-  // ?tab=/?action= deep-link params directly. activeTab also stays synchronized below when
-  // the sidebar changes the query string without remounting this page.
+  const requestedAction = searchParams?.get('action');
+  // Deep-link query param state for active tab and database actions.
   const [activeTab, setActiveTab] = useState(requestedTab);
+  const activeTabRef = useRef(activeTab);
+  const hydrationTouchVersions = useRef(new Map<string, number>());
+  const markHydrationTouched = (field: string) => {
+    hydrationTouchVersions.current.set(field, (hydrationTouchVersions.current.get(field) || 0) + 1);
+  };
+  const loadedSettingsTabs = useRef(new Set<string>());
+  const settingsTabLoadPromises = useRef(new Map<string, Promise<void>>());
+  const settingsTabLoadControllers = useRef(new Map<string, AbortController>());
+  const mobileAccessRequestGeneration = useRef(0);
+  const mobileAccessRequestController = useRef<AbortController | null>(null);
+  const businessHydrationPromise = useRef<Promise<void> | null>(null);
+  const businessHydrationTenant = useRef<number | null>(null);
+  const businessHydrated = useRef(false);
+  const cloudHydrationPromise = useRef<Promise<void> | null>(null);
+  const cloudHydrationTenant = useRef<number | null>(null);
+  const cloudHydrationGeneration = useRef(0);
+  const cloudHydrated = useRef(false);
+  const cloudHydrationSucceeded = useRef(false);
+  const cloudRegistrationStatus = useRef('unregistered');
+  const healthCheckLoaded = useRef<string | null>(null);
   const [masterPinStatus, setMasterPinStatus] = useState<{ available: boolean; isSet: boolean; schemaVersion: number | null }>({ available: false, isSet: false, schemaVersion: null });
   const [healthCheckOpen, setHealthCheckOpen] = useState(() => searchParams?.get('action') === 'health-check');
   const [healthReport, setHealthReport] = useState<HealthCheckReport | null>(null);
   const [applyingFixes, setApplyingFixes] = useState(false);
   const [initializeDbOpen, setInitializeDbOpen] = useState(() => searchParams?.get('action') === 'initialize-db');
   const [shakeSaveBar, setShakeSaveBar] = useState(false);
+  const [savingAllSettings, setSavingAllSettings] = useState(false);
+  const [saveAllHydrationRun, setSaveAllHydrationRun] = useState(0);
+  const savingAllSettingsInFlight = useRef(false);
 
-  // Sidebar links can change only the query string while this page stays mounted.
-  // Keep the rendered Settings tab in sync with those deep-link changes (including
-  // returning to the default Store tab when ?tab= is removed).
+  const themeMode = useThemeMode((s) => s.mode);
+  const setThemeMode = useThemeMode((s) => s.setMode);
+  const markUserSelectedTheme = useThemeMode((s) => s.markUserSelected);
+
+  // Last persisted theme value used as rollback target on failed saves.
+  const lastCommitted = useRef<ThemeMode>('system');
+  // Set the moment the user touches a control; hydration must not clobber a
+  // later user choice with the stale DB row.
+  const userTouched = useRef(false);
+  // Hydration may race an in-flight save; seq snapshots order the winner.
+  const saveSeq = useRef(0);
+  // Armed when a save fails outright; the next hydration applies server truth.
+  const needsServerTruth = useRef(false);
+  const [savingTheme, setSavingTheme] = useState(false);
+
+  // Optimistically updates theme store and rolls back on API failure.
+  const saveThemeMode = async (next: ThemeMode) => {
+    if (savingTheme) return;
+    const previous = lastCommitted.current;
+    const seq = ++saveSeq.current;
+    userTouched.current = true;
+    setSavingTheme(true);
+    markUserSelectedTheme();
+    setThemeMode(next);
+    try {
+      await api.put('/settings/theme_mode', { value: next });
+      lastCommitted.current = next;
+    } catch {
+      setThemeMode(previous);
+      toast.error(t('saveFailed'));
+      if (saveSeq.current === seq) {
+        try {
+          const res = await api.get('/settings/theme_mode');
+          const serverValue = res.data?.setting?.value;
+          if (
+            serverValue === 'light' ||
+            serverValue === 'dark' ||
+            serverValue === 'system'
+          ) {
+            setThemeMode(serverValue);
+            lastCommitted.current = serverValue;
+          }
+        } catch {
+          needsServerTruth.current = true;
+        }
+      }
+    } finally {
+      setSavingTheme(false);
+    }
+  };
+
+  // Sync active settings tab when query string changes while mounted.
   useEffect(() => {
     // This is navigation state arriving from Next.js, not an async data effect.
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -385,8 +501,7 @@ export default function SettingsPage() {
     | null;
   const [pinGate, setPinGate] = useState<PinGate>(() => searchParams?.get('action') === 'master-pin' ? { mode: 'set' } : null);
   const [backups, setBackups] = useState<BackupInfo[]>([]);
-  // The mount effect below always fetches backups unconditionally, so this starts true
-  // rather than being set synchronously inside that effect.
+  // Starts true until the Data tab performs its first load.
   const [backupsLoading, setBackupsLoading] = useState(true);
   const [cloudAccount, setCloudAccount] = useState<{ email?: string | null; cloud_account_available?: boolean; verified?: boolean; verified_at?: string | null; verification_sent_at?: string | null; product_updates?: boolean; marketing?: boolean; deletion_request?: { id?: string; status?: 'pending' | 'processing' | 'approved' | 'completed' | 'deleted' | 'failed' | 'rejected' | 'cancelled'; requested_at?: string; reviewed_at?: string | null; decision_note?: string | null } | null } | null>(null);
   const [cloudAccountBusy, setCloudAccountBusy] = useState(false);
@@ -398,34 +513,46 @@ export default function SettingsPage() {
   const cloudDeletionNeedsResolution = ['pending', 'processing', 'failed'].includes(cloudDeletionStatus);
   const cloudDeletionCanCancel = ['pending', 'processing'].includes(cloudDeletionStatus) && Boolean(cloudAccount?.deletion_request?.id);
 
-  const fetchCloudAccount = async () => {
+  const fetchCloudAccount = async (signal?: AbortSignal): Promise<boolean> => {
     try {
-      const { data } = await api.get('/settings/cloud/account');
+      const { data } = await api.get('/settings/cloud/account', signal ? { signal } : undefined);
+      if (signal?.aborted) return false;
       setCloudAccount(data);
       setCloudAccountLoadFailed(false);
-    } catch {
+      return true;
+    } catch (error) {
+      if (isRequestCancelled(error)) return false;
       setCloudAccountLoadFailed(true);
+      return false;
     }
   };
 
-  const fetchMasterPinStatus = async () => {
+  const fetchMasterPinStatus = async (signal?: AbortSignal): Promise<boolean> => {
     try {
-      const { data } = await api.get('/db-tools/master-pin/status');
+      const { data } = await api.get('/db-tools/master-pin/status', signal ? { signal } : undefined);
+      if (signal?.aborted) return false;
       setMasterPinStatus(data);
-    } catch {
+      return true;
+    } catch (error) {
+      if (isRequestCancelled(error)) return false;
       // ignore — card just shows "Unknown" state until retried
+      return false;
     }
   };
 
-  const fetchBackups = async () => {
+  const fetchBackups = async (signal?: AbortSignal): Promise<boolean> => {
     setBackupsLoading(true);
     try {
-      const { data } = await api.get('/db-tools/backups');
+      const { data } = await api.get('/db-tools/backups', signal ? { signal } : undefined);
+      if (signal?.aborted) return false;
       setBackups(data.backups ?? []);
-    } catch {
+      return true;
+    } catch (error) {
+      if (isRequestCancelled(error)) return false;
       // ignore — history card just shows empty state until retried
+      return false;
     } finally {
-      setBackupsLoading(false);
+      if (!signal?.aborted) setBackupsLoading(false);
     }
   };
 
@@ -439,39 +566,6 @@ export default function SettingsPage() {
       setHealthCheckOpen(false);
     }
   };
-
-  useEffect(() => {
-    api.get('/db-tools/master-pin/status')
-      .then(({ data }) => setMasterPinStatus(data))
-      .catch(() => {
-        // ignore — card just shows "Unknown" state until retried
-      });
-
-    api.get('/db-tools/backups')
-      .then(({ data }) => setBackups(data.backups ?? []))
-      .catch(() => {
-        // ignore — history card just shows empty state until retried
-      })
-      .finally(() => setBackupsLoading(false));
-    if (currentTenant?.role === 'owner') {
-      api.get('/settings/cloud/account')
-        .then(({ data }) => {
-          setCloudAccount(data);
-          setCloudAccountLoadFailed(false);
-        })
-        .catch(() => setCloudAccountLoadFailed(true));
-    }
-
-    if (searchParams?.get('action') === 'health-check') {
-      api.get('/db-tools/health-check')
-        .then(({ data }) => setHealthReport(data))
-        .catch(() => {
-          toast.error(t('healthCheckFailed'));
-          setHealthCheckOpen(false);
-        });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   const applySafeFixes = async () => {
     setApplyingFixes(true);
@@ -627,11 +721,7 @@ export default function SettingsPage() {
     setPinGate({ mode: 'backup' });
   };
 
-  // Lets the owner pick a custom save location (external drive, cloud-synced
-  // folder, etc.) via the same native save dialog the File menu's "Export
-  // Backup" action already uses. A backup saved this way does not appear in
-  // the Backup History list below — same as it never has for the menu
-  // action — since it's outside the managed backups/ directory. See #120.
+  // Prompt native file dialog to export a backup to a custom directory.
   const handleChooseBackupLocation = async () => {
     if (masterPinStatus.available && !masterPinStatus.isSet) {
       toast.error(t('masterPinRequiredForBackup'));
@@ -724,18 +814,24 @@ export default function SettingsPage() {
     qr_data_url: string | null;
     ips_data?: { ip: string; url: string; qr_data: string | null }[];
   } | null>(null);
-  // The mount effect below always fetches this unconditionally, so this starts true rather
-  // than being set synchronously inside that effect (fetchKdsInfo, used by the manual
-  // "refresh" button, still sets it explicitly for that path).
+  // Starts true until the KDS tab performs its first load; fetchKdsInfo
+  // sets it explicitly for manual refresh.
   const [kdsInfoLoading, setKdsInfoLoading] = useState(true);
 
-  const fetchKdsInfo = () => {
+  const fetchKdsInfo = async (signal?: AbortSignal): Promise<boolean> => {
     setKdsInfoLoading(true);
-    api.get('/kds-info').then((res) => {
+    try {
+      const res = await api.get('/kds-info', signal ? { signal } : undefined);
+      if (signal?.aborted) return false;
       setKdsInfo(res.data);
-    }).catch(() => {
-      toast.error(t('kdsInfoFetchFailed'));
-    }).finally(() => setKdsInfoLoading(false));
+      return true;
+    } catch (error) {
+      if (isRequestCancelled(error)) return false;
+      if (!signal?.aborted) toast.error(t('kdsInfoFetchFailed'));
+      return false;
+    } finally {
+      if (!signal?.aborted) setKdsInfoLoading(false);
+    }
   };
 
   // ── Server App pairing (tableside ordering) ───────────────────────────────
@@ -787,24 +883,9 @@ export default function SettingsPage() {
     available: boolean;
   };
   const [moreApps, setMoreApps] = useState<MoreApp[]>([]);
-  // The mount effect below always fetches this unconditionally, so this starts true rather
-  // than being set synchronously inside that effect.
+  // Starts true until the About tab performs its first load.
   const [moreAppsLoading, setMoreAppsLoading] = useState(true);
   const [revflo, setRevflo] = useState<MoreApp | null>(null);
-
-  useEffect(() => {
-    api.get('/more-apps').then((res) => {
-      setMoreApps(res.data.apps || []);
-    }).catch(() => {
-      // Silent — this tab is informational, not critical
-    }).finally(() => setMoreAppsLoading(false));
-
-    api.get('/more-apps/revflo').then((res) => {
-      setRevflo(res.data.app || null);
-    }).catch(() => {
-      // Silent — the card still shows the pairing code without the QR promo
-    });
-  }, []);
 
   // ── Updates ─────────────────────────────────────────────────────────────────
   const { updateStatus, appVersion, isElectron, checkForUpdates: handleCheckUpdates } = useUpdateStatus();
@@ -813,6 +894,7 @@ export default function SettingsPage() {
   type HwPrinter = {
     id: string; name: string; connection_type: 'network' | 'usb' | 'webusb';
     ip_address?: string; port?: number;
+    cash_drawer_pulse_enabled: number;
     paper_width: string; is_default: number; profile_id?: string; profile_name?: string;
   };
 
@@ -840,9 +922,8 @@ export default function SettingsPage() {
   const [savingPrinter, setSavingPrinter] = useState(false);
   const [testingPrinterId, setTestingPrinterId] = useState<string | null>(null);
   const [detectedPrinters, setDetectedPrinters] = useState<DetectedPrinter[]>([]);
-  // The mount effect below always detects printers unconditionally, so this starts true
-  // rather than being set synchronously inside that effect (fetchDetectedPrinters, used by
-  // the manual "refresh" button, still sets it explicitly for that path).
+  // Starts true until the Printers tab performs its first load; fetchDetectedPrinters
+  // sets it explicitly for manual refresh.
   const [detectingPrinters, setDetectingPrinters] = useState(true);
   const [addingDetectedName, setAddingDetectedName] = useState<string | null>(null);
   const [installedPrintersOpen, setInstalledPrintersOpen] = useState(false);
@@ -860,16 +941,35 @@ export default function SettingsPage() {
     return t('printColumnsShort', { cols });
   };
 
-  const fetchPrinters = () => {
-    api.get('/printers').then((res) => setHwPrinters(res.data.printers || [])).catch(() => {});
+  // Surface specific printer failure reasons from backend instead of
+  // a generic toast when available.
+  const printerErrorMessage = (err: unknown, fallback: string): string => {
+    if (axios.isAxiosError(err)) {
+      const apiError = err.response?.data?.error;
+      if (typeof apiError === 'string' && apiError.trim()) return `${fallback}: ${apiError}`;
+    }
+    return fallback;
   };
 
-  const fetchDetectedPrinters = () => {
+  const fetchPrinters = async (signal?: AbortSignal) => {
+    try {
+      const res = await api.get('/printers', signal ? { signal } : undefined);
+      if (!signal?.aborted) setHwPrinters(res.data.printers || []);
+    } catch (error) {
+      if (!isRequestCancelled(error)) return;
+    }
+  };
+
+  const fetchDetectedPrinters = async (signal?: AbortSignal) => {
     setDetectingPrinters(true);
-    api.get('/printers/detect')
-      .then((res) => setDetectedPrinters(res.data.printers || []))
-      .catch(() => setDetectedPrinters([]))
-      .finally(() => setDetectingPrinters(false));
+    try {
+      const res = await api.get('/printers/detect', signal ? { signal } : undefined);
+      if (!signal?.aborted) setDetectedPrinters(res.data.printers || []);
+    } catch (error) {
+      if (!signal?.aborted && !isRequestCancelled(error)) setDetectedPrinters([]);
+    } finally {
+      if (!signal?.aborted) setDetectingPrinters(false);
+    }
   };
 
   const quickAddDetected = async (p: DetectedPrinter) => {
@@ -938,8 +1038,8 @@ export default function SettingsPage() {
       fetchPrinters();
       refreshHardwarePrinter();
       setShowPrinterForm(false);
-    } catch {
-      toast.error(t('printerSaveFailed'));
+    } catch (err) {
+      toast.error(printerErrorMessage(err, t('printerSaveFailed')));
     } finally {
       setSavingPrinter(false);
     }
@@ -973,8 +1073,8 @@ export default function SettingsPage() {
     try {
       await api.post(`/printers/${printer.id}/test`);
       toast.success(t('testPrintSent'));
-    } catch {
-      toast.error(t('testPrintFailed'));
+    } catch (err) {
+      toast.error(printerErrorMessage(err, t('testPrintFailed')));
     } finally {
       setTestingPrinterId(null);
     }
@@ -999,19 +1099,36 @@ export default function SettingsPage() {
   }>({ name: '', category_ids: [], printer_id: '', user_ids: [] });
   const [savingStation, setSavingStation] = useState(false);
 
-  const fetchStations = () => {
-    api.get('/kitchen-stations').then((res) => setStations(res.data.kitchenStations || [])).catch(() => {});
-  };
-  const fetchStationCategories = () => {
-    api.get('/categories').then((res) => setStationCategories(res.data.categories || [])).catch(() => {});
-  };
-  const fetchStationStaff = () => {
-    api.get('/staff').then((res) => setStationStaff(res.data.staff || [])).catch(() => {});
-  };
-  const fetchStationUsers = async (stationId: string) => {
+  const fetchStations = async (signal?: AbortSignal): Promise<boolean> => {
     try {
-      const res = await api.get(`/kitchen-stations/${stationId}`);
-      setStationUsersByStation((prev) => ({ ...prev, [stationId]: res.data.kitchenStation.users || [] }));
+      const res = await api.get('/kitchen-stations', signal ? { signal } : undefined);
+      if (signal?.aborted) return false;
+      setStations(res.data.kitchenStations || []);
+      return true;
+    } catch { return false; }
+  };
+  const fetchStationCategories = async (signal?: AbortSignal): Promise<boolean> => {
+    try {
+      const res = await api.get('/categories', signal ? { signal } : undefined);
+      if (signal?.aborted) return false;
+      setStationCategories(res.data.categories || []);
+      return true;
+    } catch { return false; }
+  };
+  const fetchStationStaff = async (signal?: AbortSignal): Promise<boolean> => {
+    try {
+      const res = await api.get('/staff', signal ? { signal } : undefined);
+      if (signal?.aborted) return false;
+      setStationStaff(res.data.staff || []);
+      return true;
+    } catch { return false; }
+  };
+  const fetchStationUsers = async (stationId: string, signal?: AbortSignal) => {
+    try {
+      const res = await api.get(`/kitchen-stations/${stationId}`, signal ? { signal } : undefined);
+      if (!signal?.aborted) {
+        setStationUsersByStation((prev) => ({ ...prev, [stationId]: res.data.kitchenStation.users || [] }));
+      }
     } catch { /* ignore */ }
   };
 
@@ -1088,21 +1205,36 @@ export default function SettingsPage() {
   };
 
   useEffect(() => {
+    if (activeTab !== 'kds') return;
+    const controller = new AbortController();
     stations.forEach((s) => {
-      if (!stationUsersByStation[s.id]) fetchStationUsers(s.id);
+      if (!stationUsersByStation[s.id]) fetchStationUsers(s.id, controller.signal);
     });
+    return () => controller.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [stations]);
+  }, [stations, activeTab]);
+
+  // Cash drawer pulse: active custom payment methods (beyond built-in cash/card)
+  const [pulseCustomMethods, setPulseCustomMethods] = useState<string[]>([]);
+  useEffect(() => {
+    if (activeTab !== 'receipts-printers') return;
+    const controller = new AbortController();
+    api.get('/payment-methods', { signal: controller.signal }).then(({ data }) => {
+      setPulseCustomMethods((data.payment_methods || []).map((m: { name: string }) => m.name));
+    }).catch((error) => {
+      if (isRequestCancelled(error)) return;
+      toast.error(t('loadFailed'));
+    });
+    return () => controller.abort();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab]);
 
   // Mobile App Pairing
   const [pairingCode, setPairingCode] = useState<string | null>(null);
   const [pairingExpiresAt, setPairingExpiresAt] = useState<string | null>(null);
   const [pairingQrDataUrl, setPairingQrDataUrl] = useState<string | null>(null);
-  // Defaults to true (not false) so the "Generate Pairing Code" button can't
-  // render — and be clicked — before the /settings/cloud fetch below has told
-  // us whether this store is actually registered. Clicking it in that window
-  // used to hit the backend while registration status was still unknown and
-  // fail with a generic error even on stores that end up fully registered.
+  // Defaults true so button cannot be clicked before registration status
+  // is known from /settings/cloud.
   const [pairingUnavailable, setPairingUnavailable] = useState(true);
   const [rotatingCode, setRotatingCode] = useState(false);
   const [copiedCode, setCopiedCode] = useState(false);
@@ -1116,6 +1248,10 @@ export default function SettingsPage() {
   // Printing local state (buffered — saved only on explicit Save)
   type PrintingForm = {
     printerEnabled: boolean; printerPaperSize: PaperSize;
+    // Undefined until loaded or explicitly toggled to avoid overwriting
+    // existing setting on save.
+    cashDrawerPulseEnabled: boolean | undefined;
+    cashDrawerPulseMethods: string[];
     printMethod: 'escpos' | 'browser';
     autoPrintKot: boolean; autoPrintBill: boolean;
     whatsappShareEnabled: boolean;
@@ -1125,6 +1261,8 @@ export default function SettingsPage() {
     // Print language policies (#441): 'inherit'/'none' sentinels or registry codes.
     receiptPrimaryLanguage: string; // 'inherit' | selectable code
     receiptSecondLanguage: string; // 'none' | selectable code
+    zReportPrimaryLanguage: string; // 'inherit' | selectable code
+    zReportSecondLanguage: string; // 'none' | selectable code
     kotLanguage: string; // 'inherit' | selectable code
     billShowName: boolean; billShowAddress: boolean; billShowPhone: boolean; billShowTaxId: boolean;
     billShowTaxBreakdown: boolean; billShowCustomerName: boolean; billShowCustomerPhone: boolean; billShowTableNumber: boolean;
@@ -1132,6 +1270,8 @@ export default function SettingsPage() {
   const initPrinting = (): PrintingForm => ({
     printerEnabled: posSettings.printerEnabled,
     printerPaperSize: posSettings.printerPaperSize,
+    cashDrawerPulseEnabled: undefined,
+    cashDrawerPulseMethods: ['cash', 'card'],
     printMethod: printMethod as 'escpos' | 'browser',
     autoPrintKot: posSettings.autoPrintKot,
     autoPrintBill: posSettings.autoPrintBill,
@@ -1143,6 +1283,8 @@ export default function SettingsPage() {
       ? posSettings.billLanguagePolicy.primary.language
       : 'inherit',
     receiptSecondLanguage: posSettings.billLanguagePolicy.additional[0] ?? 'none',
+    zReportPrimaryLanguage: 'inherit',
+    zReportSecondLanguage: 'none',
     kotLanguage: posSettings.kotLanguagePolicy.primary.mode === 'fixed'
       ? posSettings.kotLanguagePolicy.primary.language
       : 'inherit',
@@ -1157,66 +1299,102 @@ export default function SettingsPage() {
   });
   const [printingForm, setPrintingForm] = useState<PrintingForm>(initPrinting);
   const [savedPrinting, setSavedPrinting] = useState<PrintingForm>(initPrinting);
+  const printingFormRef = useRef(printingForm);
+  const mergeHydratedPrinting = (patch: Partial<PrintingForm>, initial: PrintingForm, touchedAtHydrationStart = new Map<string, number>()) => {
+    setPrintingForm((previous) => {
+      const applicablePatch = Object.fromEntries(
+        Object.entries(patch).filter(([key]) => {
+          const field = key as keyof PrintingForm;
+          const touchedAfterStart = (hydrationTouchVersions.current.get(key) || 0) > (touchedAtHydrationStart.get(key) || 0);
+          return !touchedAfterStart && Object.is(previous[field], initial[field]);
+        }),
+      ) as Partial<PrintingForm>;
+      return { ...previous, ...applicablePatch };
+    });
+  };
+  const [cashDrawerMethodsOpen, setCashDrawerMethodsOpen] = useState(false);
+  const [zReportLanguagePolicyLoaded, setZReportLanguagePolicyLoaded] = useState(false);
+  const [savingPrinting, setSavingPrinting] = useState(false);
+  const printingSaveInFlight = useRef(false);
   const savePrinting = async (silent: boolean = false) => {
-    // Build typed policies from the form and mirror them into the store for
-    // renderer-side reads (renderers adopt them in #442+).
-    const receiptPrimary: PrimaryLanguageSelection = printingForm.receiptPrimaryLanguage === 'inherit'
-      ? { mode: 'inherit' }
-      : { mode: 'fixed', language: printingForm.receiptPrimaryLanguage };
-    const dedupedSecond = printingForm.receiptSecondLanguage !== 'none'
-      && !(receiptPrimary.mode === 'fixed' && receiptPrimary.language === printingForm.receiptSecondLanguage)
-      ? printingForm.receiptSecondLanguage
-      : null;
-    const billLanguagePolicy: ReceiptLanguagePolicy = dedupedSecond !== null
-      ? { primary: receiptPrimary, additional: [dedupedSecond] as const }
-      : { primary: receiptPrimary, additional: [] as const };
-    const kotLanguagePolicy: KotLanguagePolicy = {
-      primary: printingForm.kotLanguage === 'inherit' ? { mode: 'inherit' } : { mode: 'fixed', language: printingForm.kotLanguage },
-      additional: [] as const,
-    };
-    posSettings.setPrinterEnabled(printingForm.printerEnabled);
-    posSettings.setPrinterPaperSize(printingForm.printerPaperSize);
-    setPrintMethod(printingForm.printMethod);
-    posSettings.setAutoPrintKot(printingForm.autoPrintKot);
-    posSettings.setAutoPrintBill(printingForm.autoPrintBill);
-    posSettings.setWhatsappShareEnabled(printingForm.whatsappShareEnabled);
-    posSettings.setPrinterUseUnicode(printingForm.printerUseUnicode);
-    posSettings.setPrinterArabicShaping(printingForm.printerArabicShaping);
-    posSettings.setPrinterTrimDecimals(printingForm.printerTrimDecimals);
-    posSettings.setBillLanguagePolicy(billLanguagePolicy);
-    posSettings.setKotLanguagePolicy(kotLanguagePolicy);
-    posSettings.setBillShowName(printingForm.billShowName);
-    posSettings.setBillShowAddress(printingForm.billShowAddress);
-    posSettings.setBillShowPhone(printingForm.billShowPhone);
-    posSettings.setBillShowTaxId(printingForm.billShowTaxId);
-    posSettings.setBillShowTaxBreakdown(printingForm.billShowTaxBreakdown);
-    posSettings.setBillShowCustomerName(printingForm.billShowCustomerName);
-    posSettings.setBillShowCustomerPhone(printingForm.billShowCustomerPhone);
-    posSettings.setBillShowTableNumber(printingForm.billShowTableNumber);
-    await Promise.all([
-      api.put('/settings/printer_trim_decimals', { value: printingForm.printerTrimDecimals ? 'true' : 'false' }),
-      api.put('/settings/bill_language_policy', { value: JSON.stringify(billLanguagePolicy) }),
-      api.put('/settings/kot_language_policy', { value: JSON.stringify(kotLanguagePolicy) }),
-      ...([
-        ['bill_show_name', printingForm.billShowName],
-        ['bill_show_address', printingForm.billShowAddress],
-        ['bill_show_phone', printingForm.billShowPhone],
-        ['bill_show_tax_id', printingForm.billShowTaxId],
-        ['bill_show_tax_breakdown', printingForm.billShowTaxBreakdown],
-        ['bill_show_customer_name', printingForm.billShowCustomerName],
-        ['bill_show_customer_phone', printingForm.billShowCustomerPhone],
-        ['bill_show_table_number', printingForm.billShowTableNumber],
-      ] as const).map(([key, value]) => api.put(`/settings/${key}`, { value: value ? 'true' : 'false' })),
-    ]);
-    setSavedPrinting(printingForm);
-    if (!silent) toast.success(t('printingSettingsSaved'));
+    if (printingSaveInFlight.current) return;
+    printingSaveInFlight.current = true;
+    setSavingPrinting(true);
+    const formSnapshot = printingForm;
+    try {
+      const receiptPrimary: PrimaryLanguageSelection = formSnapshot.receiptPrimaryLanguage === 'inherit'
+        ? { mode: 'inherit' }
+        : { mode: 'fixed', language: formSnapshot.receiptPrimaryLanguage };
+      const dedupedSecond = formSnapshot.receiptSecondLanguage !== 'none'
+        && !(receiptPrimary.mode === 'fixed' && receiptPrimary.language === formSnapshot.receiptSecondLanguage)
+        ? formSnapshot.receiptSecondLanguage
+        : null;
+      const billLanguagePolicy: ReceiptLanguagePolicy = dedupedSecond !== null
+        ? { primary: receiptPrimary, additional: [dedupedSecond] as const }
+        : { primary: receiptPrimary, additional: [] as const };
+      const kotLanguagePolicy: KotLanguagePolicy = {
+        primary: formSnapshot.kotLanguage === 'inherit' ? { mode: 'inherit' } : { mode: 'fixed', language: formSnapshot.kotLanguage },
+        additional: [] as const,
+      };
+      const zReportPrimary: PrimaryLanguageSelection = formSnapshot.zReportPrimaryLanguage === 'inherit'
+        ? { mode: 'inherit' }
+        : { mode: 'fixed', language: formSnapshot.zReportPrimaryLanguage };
+      const zReportSecond = formSnapshot.zReportSecondLanguage !== 'none'
+        && !(zReportPrimary.mode === 'fixed' && zReportPrimary.language === formSnapshot.zReportSecondLanguage)
+        ? formSnapshot.zReportSecondLanguage
+        : null;
+      const zReportLanguagePolicy: ReceiptLanguagePolicy = zReportSecond !== null
+        ? { primary: zReportPrimary, additional: [zReportSecond] as const }
+        : { primary: zReportPrimary, additional: [] as const };
+      const printingPayload = {
+        printer_trim_decimals: formSnapshot.printerTrimDecimals,
+        bill_language_policy: billLanguagePolicy,
+        kot_language_policy: kotLanguagePolicy,
+        ...(zReportLanguagePolicyLoaded ? { z_report_language_policy: zReportLanguagePolicy } : {}),
+        bill_show_name: formSnapshot.billShowName,
+        bill_show_address: formSnapshot.billShowAddress,
+        bill_show_phone: formSnapshot.billShowPhone,
+        bill_show_tax_id: formSnapshot.billShowTaxId,
+        bill_show_tax_breakdown: formSnapshot.billShowTaxBreakdown,
+        bill_show_customer_name: formSnapshot.billShowCustomerName,
+        bill_show_customer_phone: formSnapshot.billShowCustomerPhone,
+        bill_show_table_number: formSnapshot.billShowTableNumber,
+        ...(formSnapshot.cashDrawerPulseEnabled !== undefined ? {
+          cash_drawer_pulse_enabled: formSnapshot.cashDrawerPulseEnabled,
+          cash_drawer_pulse_methods: formSnapshot.cashDrawerPulseMethods,
+        } : {}),
+      };
+      await api.put('/settings/printing', printingPayload);
+      posSettings.setPrinterEnabled(formSnapshot.printerEnabled);
+      posSettings.setPrinterPaperSize(formSnapshot.printerPaperSize);
+      setPrintMethod(formSnapshot.printMethod);
+      posSettings.setAutoPrintKot(formSnapshot.autoPrintKot);
+      posSettings.setAutoPrintBill(formSnapshot.autoPrintBill);
+      posSettings.setWhatsappShareEnabled(formSnapshot.whatsappShareEnabled);
+      posSettings.setPrinterUseUnicode(formSnapshot.printerUseUnicode);
+      posSettings.setPrinterArabicShaping(formSnapshot.printerArabicShaping);
+      posSettings.setPrinterTrimDecimals(formSnapshot.printerTrimDecimals);
+      posSettings.setBillLanguagePolicy(billLanguagePolicy);
+      posSettings.setKotLanguagePolicy(kotLanguagePolicy);
+      posSettings.setBillShowName(formSnapshot.billShowName);
+      posSettings.setBillShowAddress(formSnapshot.billShowAddress);
+      posSettings.setBillShowPhone(formSnapshot.billShowPhone);
+      posSettings.setBillShowTaxId(formSnapshot.billShowTaxId);
+      posSettings.setBillShowTaxBreakdown(formSnapshot.billShowTaxBreakdown);
+      posSettings.setBillShowCustomerName(formSnapshot.billShowCustomerName);
+      posSettings.setBillShowCustomerPhone(formSnapshot.billShowCustomerPhone);
+      posSettings.setBillShowTableNumber(formSnapshot.billShowTableNumber);
+      setSavedPrinting(formSnapshot);
+      if (!silent) toast.success(t('printingSettingsSaved'));
+    } finally {
+      printingSaveInFlight.current = false;
+      setSavingPrinting(false);
+    }
   };
   const resetPrinting = () => setPrintingForm(savedPrinting);
 
-  // Bill template local state. billTemplateSource carries the resolved
-  // selection identity alongside the bare id so a pack template_id that
-  // collides with a core name (classic/compact) keeps its {source: 'pack'}
-  // qualifier through both display-selection and save round-trips (#447).
+  // Bill template local state; billTemplateSource preserves pack
+  // qualifier if ID collides with core template names.
   type BillTemplateForm = {
     billTemplate: BillTemplate;
     billTemplateSource: BillTemplateSelectionSource;
@@ -1229,14 +1407,14 @@ export default function SettingsPage() {
   });
   const [billForm, setBillForm] = useState<BillTemplateForm>(initBillTemplate);
   const [savedBillForm, setSavedBillForm] = useState<BillTemplateForm>(initBillTemplate);
+  const billFormRef = useRef(billForm);
   const [billTemplateCards, setBillTemplateCards] = useState<TemplateCard[]>(TEMPLATE_CARDS);
   const saveBillTemplate = async (silent: boolean = false) => {
     posSettings.setBillTemplate(billForm.billTemplate);
+    posSettings.setBillTemplateSource(billForm.billTemplateSource);
     posSettings.setBillFooterMessage(billForm.billFooterMessage);
-    // Persist the resolved selection identity captured at selection time
-    // (NOT re-derived by first-id match, which a colliding pack id would
-    // fail): bare id for core templates, structured { source, id } for
-    // pack and merchant.
+    // Persist bare ID for core templates, structured { source, id }
+    // for pack and merchant templates.
     const templateValue = billForm.billTemplateSource === 'core'
       ? billForm.billTemplate
       : JSON.stringify({ source: billForm.billTemplateSource, id: billForm.billTemplate });
@@ -1251,7 +1429,7 @@ export default function SettingsPage() {
 
   // Store / business fields — local form state (saved only on explicit Save)
   type BusinessForm = {
-    businessName: string; countryCode: string; timezone: string; currency: string;
+    businessName: string; countryCode: string; timezone: string; businessDayStartTime: string; currency: string;
     billingType: 'postpaid' | 'prepaid';
     tablesRequired: boolean;
     taxRegistered: boolean;
@@ -1261,7 +1439,7 @@ export default function SettingsPage() {
     calendar: CalendarMode;
   };
   const [savedBusiness, setSavedBusiness] = useState<BusinessForm>({
-    businessName: '', countryCode: '', timezone: '', currency: '', billingType: 'postpaid',
+    businessName: '', countryCode: '', timezone: '', businessDayStartTime: '00:00', currency: '', billingType: 'postpaid',
     tablesRequired: true,
     taxRegistered: false,
     taxRegistrationNumber: '', businessAddress: '', businessPhone: '', instagramHandle: '',
@@ -1270,25 +1448,18 @@ export default function SettingsPage() {
     calendar: 'locale',
   });
   const [form, setForm] = useState<BusinessForm>(savedBusiness);
+  const businessFormRef = useRef(form);
   const [savingBusiness, setSavingBusiness] = useState(false);
-  // Server-resolved: the active country tax pack's format if it declares
-  // one, else the static countries.ts fallback, else null. The backend is
-  // authoritative; this drives immediate warning feedback below the field.
+  // Server-resolved tax format from country tax pack or static fallback;
+  // drives immediate warning feedback below the field.
   const [taxIdFormat, setTaxIdFormat] = useState<{ pattern: string; description: string } | null>(null);
   const [taxIdFormatCountryCode, setTaxIdFormatCountryCode] = useState('');
-  // check 25 (main/routes/tax-packs.ts) rejects the textbook nested-
-  // quantifier ReDoS shape at pack-activation time, but that's a known-shape
-  // heuristic, not a formal safety proof. This runs on every keystroke, so
-  // cap the input actually tested as a backstop too: the longest real
-  // registration-number scheme is 15 chars (India GSTIN), so 24 leaves
-  // generous headroom while bounding a worst-case pattern's backtracking to
-  // low milliseconds instead of freezing the tab.
+  // Cap regex evaluation length to 24 chars to avoid ReDoS freezing the UI
+  // on worst-case backtracking patterns.
   const TAX_ID_WARNING_MAX_LENGTH = 24;
   const taxIdWarning = (() => {
     const value = form.taxRegistrationNumber.trim();
-    // Do not show a format against a country other than the one for which the
-    // server resolved it. This also keeps a rejected country-change response
-    // visible for the submitted country without mislabeling it after a revert.
+    // Only validate against pattern if country matches server-resolved country.
     if (!taxIdFormat || !value || form.countryCode !== taxIdFormatCountryCode) return null;
     if (value.length > TAX_ID_WARNING_MAX_LENGTH) return null;
     try {
@@ -1306,6 +1477,7 @@ export default function SettingsPage() {
     cloud_last_sync: null as string | null,
   });
   const [savedCloudSettings, setSavedCloudSettings] = useState(cloudSettings);
+  const cloudSettingsRef = useRef(cloudSettings);
   const [cloudStatus, setCloudStatus] = useState({
     cloud_registration_status: 'unregistered',
     cloud_services_disabled_by_user: false,
@@ -1315,13 +1487,14 @@ export default function SettingsPage() {
     cloud_last_error: null as string | null,
     cloud_deletion_status: '',
   });
+  const [cloudPrivacyHydrated, setCloudPrivacyHydrated] = useState(false);
    
   const [savingCloud, setSavingCloud] = useState(false);
   const [registeringCloud, setRegisteringCloud] = useState(false);
   const [showInitializeCloudConfirm, setShowInitializeCloudConfirm] = useState(false);
 
   const cloudServicesStopped = cloudStatus.cloud_services_disabled_by_user;
-  const cloudDeletionFinal = cloudStatus.cloud_registration_status === 'deleted' || ['approved', 'completed', 'deleted'].includes(cloudStatus.cloud_deletion_status);
+  const cloudDeletionFinal = !cloudPrivacyHydrated || cloudAccountLoadFailed || cloudStatus.cloud_registration_status === 'deleted' || ['approved', 'completed', 'deleted'].includes(cloudStatus.cloud_deletion_status);
   const cloudDeletionNeedsAction = !cloudDeletionFinal && (cloudDeletionNeedsResolution || ['processing', 'failed'].includes(cloudStatus.cloud_deletion_status));
 
   const refreshCloudStatus = async () => {
@@ -1402,8 +1575,7 @@ export default function SettingsPage() {
   const [backingUpGoogleDrive, setBackingUpGoogleDrive] = useState(false);
   const [savingGoogleDrivePrefs, setSavingGoogleDrivePrefs] = useState(false);
 
-  // Kitchen workflow toggles (issue #133) — independent on/off switches,
-  // default true to match pre-toggle always-on behavior.
+  // Kitchen workflow toggle states (defaults to enabled).
   const [kdsEnabledSetting, setKdsEnabledSetting] = useState(true);
   const [savingKdsEnabled, setSavingKdsEnabled] = useState(false);
   const [serverAppEnabledSetting, setServerAppEnabledSetting] = useState(true);
@@ -1432,7 +1604,44 @@ export default function SettingsPage() {
     invoiceFinancialYearStartDay: 1,
   });
   const [orderNumberForm, setOrderNumberForm] = useState<OrderNumberForm>(savedOrderNumberForm);
+  const orderNumberFormRef = useRef(orderNumberForm);
   const [savingOrderNumbering, setSavingOrderNumbering] = useState(false);
+
+  useEffect(() => {
+    loyaltyFormRef.current = { loyaltyEnabled, globalCashbackPercent };
+    discountFormRef.current = { discountMaxPct, discountMaxAmount, discountMode, discountRequiresApproval };
+    activeTabRef.current = activeTab;
+    printingFormRef.current = printingForm;
+    billFormRef.current = billForm;
+    businessFormRef.current = form;
+    cloudSettingsRef.current = cloudSettings;
+    orderNumberFormRef.current = orderNumberForm;
+  }, [
+    loyaltyEnabled,
+    globalCashbackPercent,
+    discountMaxPct,
+    discountMaxAmount,
+    discountMode,
+    discountRequiresApproval,
+    activeTab,
+    printingForm,
+    billForm,
+    form,
+    cloudSettings,
+    orderNumberForm,
+  ]);
+
+  const mergeHydratedValues = <T extends object>(previous: T, initial: T, loaded: T, touchedAtHydrationStart: Map<string, number>): T => {
+    const previousValues = previous as Record<string, unknown>;
+    const initialValues = initial as Record<string, unknown>;
+    return Object.fromEntries(Object.entries(loaded).map(([key, value]) => [
+      key,
+      (hydrationTouchVersions.current.get(key) || 0) > (touchedAtHydrationStart.get(key) || 0)
+        || !Object.is(previousValues[key], initialValues[key])
+        ? previousValues[key]
+        : value,
+    ])) as T;
+  };
 
   const resetBusiness = async () => {
     try {
@@ -1448,6 +1657,7 @@ export default function SettingsPage() {
         businessName: d.business_name || '',
         countryCode: d.country || '',
         timezone: d.timezone || '',
+        businessDayStartTime: d.business_day_start_time || '00:00',
         currency: d.currency || '',
         billingType: d.billing_type === 'prepaid' ? 'prepaid' : 'postpaid',
         tablesRequired: typeof d.tables_required === 'boolean' ? d.tables_required : true,
@@ -1504,10 +1714,10 @@ export default function SettingsPage() {
       if (discountRes.data.discount_requires_approval !== undefined) { setDiscountRequiresApproval(!!discountRes.data.discount_requires_approval); setSavedDiscountRequiresApproval(!!discountRes.data.discount_requires_approval); }
 
       const loadedOrderNumbering: OrderNumberForm = {
-        prefix: orderNumberingRes.data.order_number_prefix ?? 'ORD',
+        prefix: orderNumberingRes.data.order_number_prefix == null ? 'ORD' : sanitizeStoredNumberPrefix(orderNumberingRes.data.order_number_prefix),
         includeDate: orderNumberingRes.data.order_number_include_date !== false,
         resetDaily: orderNumberingRes.data.order_number_reset_daily !== false,
-        invoicePrefix: orderNumberingRes.data.invoice_number_prefix ?? 'INV',
+        invoicePrefix: orderNumberingRes.data.invoice_number_prefix == null ? 'INV' : sanitizeStoredNumberPrefix(orderNumberingRes.data.invoice_number_prefix),
         invoiceIncludePeriod: orderNumberingRes.data.invoice_number_include_period !== false,
         invoiceResetPeriod: (orderNumberingRes.data.invoice_number_reset_period || 'daily') as InvoiceResetPeriod,
         invoiceFinancialYearStartMonth: Number(orderNumberingRes.data.invoice_financial_year_start_month) || 4,
@@ -1522,8 +1732,10 @@ export default function SettingsPage() {
     }
   };
 
-  const fetchGoogleDriveStatus = () => {
-    api.get('/settings/google-drive').then((res) => {
+  const fetchGoogleDriveStatus = async (signal?: AbortSignal) => {
+    try {
+      const res = await api.get('/settings/google-drive', signal ? { signal } : undefined);
+      if (signal?.aborted) return;
       setGoogleDriveStatus({
         configured: !!res.data.configured,
         secure_storage_available: res.data.secure_storage_available !== false,
@@ -1536,131 +1748,321 @@ export default function SettingsPage() {
         last_backup_filename: res.data.last_backup_filename || null,
         last_error: res.data.last_error || null,
       });
-    }).catch(() => {
+    } catch (error) {
+      if (isRequestCancelled(error)) return;
       // Leave defaults (not configured / not connected) — this section is
       // optional and must never block the rest of Settings from loading.
-    });
-  };
-
-  const loadPairedDevices = async () => {
-    setDevicesLoading(true);
-    try {
-      const res = await api.get('/mobile/devices');
-      setPairedDevices(res.data.devices || []);
-    } catch {
-      setPairedDevices([]);
-    } finally {
-      setDevicesLoading(false);
     }
   };
 
-  useEffect(() => {
-    fetchPrinters();
-    // Inlined rather than calling fetchDetectedPrinters() (used by the manual "refresh"
-    // button too) — detectingPrinters already starts true for this initial detection.
-    api.get('/printers/detect')
-      .then((res) => setDetectedPrinters(res.data.printers || []))
-      .catch(() => setDetectedPrinters([]))
-      .finally(() => setDetectingPrinters(false));
-    // Inlined rather than calling fetchKdsInfo() (used by the manual "refresh" button too) —
-    // kdsInfoLoading already starts true for this initial fetch.
-    api.get('/kds-info')
-      .then((res) => setKdsInfo(res.data))
-      .catch(() => toast.error(t('kdsInfoFetchFailed')))
-      .finally(() => setKdsInfoLoading(false));
-    fetchStations();
-    fetchStationCategories();
-    fetchStationStaff();
+  const loadPairedDevices = async (signal?: AbortSignal) => {
+    setDevicesLoading(true);
+    try {
+      const res = await api.get('/mobile/devices', signal ? { signal } : undefined);
+      if (signal?.aborted) return;
+      setPairedDevices(res.data.devices || []);
+    } catch (error) {
+      if (isRequestCancelled(error)) return;
+      setPairedDevices([]);
+    } finally {
+      if (!signal?.aborted) setDevicesLoading(false);
+    }
+  };
 
-    api.get('/settings/loyalty').then((res) => {
-      setLoyaltyEnabled(!!res.data.loyalty_enabled);
-      setSavedLoyaltyEnabled(!!res.data.loyalty_enabled);
-      setGlobalCashbackPercent(String(res.data.global_cashback_percent ?? 0));
-      setSavedGlobalCashbackPercent(String(res.data.global_cashback_percent ?? 0));
-    }).catch(() => {});
-
-    api.get('/products/loyalty/global-rate-candidates')
-      .then((res) => setGlobalRateCandidates(Number(res.data.count) || 0))
-      .catch(() => {});
-
-    api.get('/settings/discount').then((res) => {
-      if (res.data.discount_max_percentage !== undefined) {
-        const value = normalizeDiscountPercentage(res.data.discount_max_percentage);
-        setDiscountMaxPct(value);
-        setSavedDiscountMaxPct(value);
+  const loadSettingsTab = async (tab: string, signal: AbortSignal, includeStatusOnly = true): Promise<void> => {
+    const get = (path: string) => api.get(path, { signal });
+    const active = () => !signal.aborted;
+    const hydrationTouchSnapshot = new Map(hydrationTouchVersions.current);
+    const readOptional = async (path: string) => {
+      try {
+        return await get(path);
+      } catch (error) {
+        if (axios.isAxiosError(error) && error.response?.status === 404) return null;
+        throw error;
       }
-      if (res.data.discount_max_amount !== undefined) {
-        const value = normalizeDiscountAmount(res.data.discount_max_amount);
-        setDiscountMaxAmount(value);
-        setSavedDiscountMaxAmount(value);
+    };
+
+    const loadBusiness = async () => {
+      const tenantId = currentTenant?.id ?? null;
+      if (businessHydrationTenant.current !== tenantId) {
+        businessHydrationTenant.current = tenantId;
+        businessHydrated.current = false;
+        businessHydrationPromise.current = null;
       }
-      if (res.data.discount_mode) { setDiscountMode(res.data.discount_mode); setSavedDiscountMode(res.data.discount_mode); }
-      if (res.data.discount_requires_approval !== undefined) { setDiscountRequiresApproval(!!res.data.discount_requires_approval); setSavedDiscountRequiresApproval(!!res.data.discount_requires_approval); }
-    }).catch(() => {});
+      if (businessHydrated.current) return;
+      if (businessHydrationPromise.current) {
+        try {
+          await businessHydrationPromise.current;
+        } catch (error) {
+          if (!active() || !isRequestCancelled(error)) throw error;
+        }
+        if (businessHydrated.current || !active()) return;
+      }
 
-    api.get('/settings/telemetry_enabled').then((res) => {
-      setTelemetryEnabled(res.data.setting?.value === 'true');
-    }).catch(() => {
-      // No row yet = consent never given (setup predates this feature, or
-      // declined) = stays off until explicitly turned on here.
-      setTelemetryEnabled(false);
-    });
+      const businessFormAtHydrationStart = { ...businessFormRef.current };
+      const printingAtHydrationStart = { ...printingFormRef.current };
+      const promise = (async () => {
+        const { data: d } = await get('/settings/business');
+        if (!active()) {
+          businessHydrationPromise.current = null;
+          return;
+        }
+        const loaded: BusinessForm = {
+          businessName: d.business_name || '',
+          countryCode: d.country || '',
+          timezone: d.timezone || '',
+          businessDayStartTime: d.business_day_start_time || '00:00',
+          currency: d.currency || '',
+          billingType: d.billing_type === 'prepaid' ? 'prepaid' : 'postpaid',
+          tablesRequired: typeof d.tables_required === 'boolean' ? d.tables_required : true,
+          taxRegistered: d.tax_registered === 'true' || d.tax_registered === true || d.tax_registered === 1,
+          taxRegistrationNumber: d.tax_registration_number || '',
+          businessAddress: d.business_address || '',
+          businessPhone: d.business_phone || '',
+          instagramHandle: d.instagram_handle || '',
+          currencyDisplay: d.currency_display === 'toman' ? 'toman' : d.currency_display === 'toman_short' ? 'toman_short' : 'rial',
+          numberDigits: d.number_digits === 'latin' ? 'latin' : 'locale',
+          calendar: d.calendar === 'persian' ? 'persian' : d.calendar === 'gregorian' ? 'gregorian' : 'locale',
+        };
+        const mergedBusiness = mergeHydratedValues(
+          businessFormRef.current,
+          businessFormAtHydrationStart,
+          loaded,
+          hydrationTouchSnapshot,
+        );
+        setSavedBusiness(loaded);
+        setForm(mergedBusiness);
+        setTaxIdFormat(d.tax_id_format || null);
+        setTaxIdFormatCountryCode(loaded.countryCode);
+        const billDisplay = {
+          billShowName: d.bill_show_name !== false,
+          billShowAddress: d.bill_show_address !== false,
+          billShowPhone: d.bill_show_phone !== false,
+          billShowTaxId: d.bill_show_tax_id === true,
+          billShowTaxBreakdown: d.bill_show_tax_breakdown !== false,
+          billShowCustomerName: d.bill_show_customer_name !== false,
+          billShowCustomerPhone: d.bill_show_customer_phone !== false,
+          billShowTableNumber: d.bill_show_table_number !== false,
+        };
+        mergeHydratedPrinting(billDisplay, printingAtHydrationStart, hydrationTouchSnapshot);
+        setSavedPrinting((previous) => ({ ...previous, ...billDisplay }));
+        posSettings.setBillShowName(billDisplay.billShowName);
+        posSettings.setBillShowAddress(billDisplay.billShowAddress);
+        posSettings.setBillShowPhone(billDisplay.billShowPhone);
+        posSettings.setBillShowTaxId(billDisplay.billShowTaxId);
+        posSettings.setBillShowTaxBreakdown(billDisplay.billShowTaxBreakdown);
+        posSettings.setBillShowCustomerName(billDisplay.billShowCustomerName);
+        posSettings.setBillShowCustomerPhone(billDisplay.billShowCustomerPhone);
+        posSettings.setBillShowTableNumber(billDisplay.billShowTableNumber);
+        if (d.tax_registration_number) posSettings.setBillTaxRegistrationNumber(d.tax_registration_number);
+        if (d.business_address) posSettings.setBillAddress(d.business_address);
+        if (d.business_phone) posSettings.setBillPhone(d.business_phone);
+        posSettings.setBillingType(d.billing_type === 'prepaid' ? 'prepaid' : 'postpaid');
+        posSettings.setTablesRequired(typeof d.tables_required === 'boolean' ? d.tables_required : true);
+        businessHydrated.current = true;
+      })();
+      businessHydrationPromise.current = promise;
+      try {
+        await promise;
+      } catch (error) {
+        if (businessHydrationPromise.current === promise) businessHydrationPromise.current = null;
+        throw error;
+      }
+    };
 
-    api.get('/settings/diagnostics_consent').then((res) => {
-      setDiagnosticsConsent(res.data.setting?.value !== 'false');
-    }).catch(() => {
-      setDiagnosticsConsent(true);
-    });
+    const loadCloud = async (required = false) => {
+      const cloudSettingsAtHydrationStart = { ...cloudSettingsRef.current };
+      let registrationStatus = cloudRegistrationStatus.current;
+      const tenantId = currentTenant?.id ?? null;
+      if (cloudHydrationTenant.current !== tenantId) {
+        cloudHydrationTenant.current = tenantId;
+        cloudHydrationGeneration.current += 1;
+        cloudHydrated.current = false;
+        cloudHydrationSucceeded.current = false;
+        cloudHydrationPromise.current = null;
+        cloudRegistrationStatus.current = 'unregistered';
+        setCloudPrivacyHydrated(false);
+      }
+      const loadGeneration = cloudHydrationGeneration.current;
+      try {
+        if (cloudHydrated.current) {
+          if (required && !cloudHydrationSucceeded.current && active()) throw new Error('Cloud hydration failed');
+          registrationStatus = cloudRegistrationStatus.current;
+        } else {
+          if (cloudHydrationPromise.current) {
+            try {
+              await cloudHydrationPromise.current;
+            } catch (error) {
+              if (cloudHydrationGeneration.current !== loadGeneration || !active()) return;
+              if (!isRequestCancelled(error)) throw error;
+            }
+          }
+          if (cloudHydrationGeneration.current !== loadGeneration || !active()) {
+            return;
+          }
+          if (cloudHydrated.current) {
+            if (required && !cloudHydrationSucceeded.current && active()) throw new Error('Cloud hydration failed');
+            registrationStatus = cloudRegistrationStatus.current;
+          } else {
+            const requestGeneration = cloudHydrationGeneration.current;
+            const promise = (async () => {
+              const { data } = await get('/settings/cloud');
+              if (!active()) {
+                if (cloudHydrationGeneration.current === requestGeneration) {
+                  cloudHydrationPromise.current = null;
+                }
+                return;
+              }
+              if (cloudHydrationGeneration.current !== requestGeneration) return;
+              const settings = {
+                cloud_api_key: data.cloud_api_key || '',
+                cloud_store_id: data.cloud_store_id || '',
+                cloud_sync_enabled: !!data.cloud_sync_enabled,
+                cloud_orders_enabled: !!data.cloud_orders_enabled,
+                cloud_last_sync: data.cloud_last_sync || null,
+              };
+              registrationStatus = data.cloud_registration_status || 'unregistered';
+              cloudRegistrationStatus.current = registrationStatus;
+              const mergedCloudSettings = mergeHydratedValues(cloudSettingsRef.current, cloudSettingsAtHydrationStart, settings, hydrationTouchSnapshot);
+              setCloudSettings(mergedCloudSettings);
+              setSavedCloudSettings(settings);
+              setCloudStatus({
+                cloud_registration_status: data.cloud_registration_status || 'unregistered',
+                cloud_services_disabled_by_user: !!data.cloud_services_disabled_by_user,
+                cloud_connected: !!data.cloud_connected,
+                cloud_relay_mode: data.cloud_relay_mode || 'disconnected',
+                cloud_last_heartbeat: data.cloud_last_heartbeat || null,
+                cloud_last_error: data.cloud_last_error || null,
+                cloud_deletion_status: data.cloud_deletion_status || '',
+              });
+              cloudHydrationSucceeded.current = true;
+              cloudHydrated.current = true;
+            })();
+            cloudHydrationPromise.current = promise;
+            try {
+              await promise;
+            } catch (error) {
+              if (cloudHydrationPromise.current === promise && isRequestCancelled(error)) {
+                cloudHydrationPromise.current = null;
+              }
+              throw error;
+            }
+          }
+        }
+      } catch (error) {
+        if (!active() || isRequestCancelled(error) || required) throw error;
+        cloudHydrationSucceeded.current = false;
+        cloudHydrated.current = true;
+        cloudRegistrationStatus.current = 'unregistered';
+        registrationStatus = 'unregistered';
+        setCloudStatus((previous) => ({
+          ...previous,
+          cloud_registration_status: 'unregistered',
+          cloud_connected: false,
+          cloud_relay_mode: 'disconnected',
+        }));
+      }
 
-    fetchGoogleDriveStatus();
+      if (tab !== 'mobile-access' || !includeStatusOnly || !active()) return;
+      if (registrationStatus !== 'registered') {
+        setPairingUnavailable(true);
+        return;
+      }
+      try {
+        const pairingResponse = await get('/mobile/pairing-code');
+        if (active()) {
+          setPairingCode(pairingResponse.data.pairing_code);
+          setPairingExpiresAt(pairingResponse.data.expires_at);
+          setPairingQrDataUrl(pairingResponse.data.qr_data_url || null);
+          setPairingUnavailable(false);
+        }
+      } catch (error) {
+        if (!isRequestCancelled(error) && active()) setPairingUnavailable(true);
+      }
+      await loadPairedDevices(signal);
+    };
 
-    api.get('/settings/kds_enabled').then((res) => {
-      const enabled = res.data.setting?.value !== 'false';
-      setKdsEnabledSetting(enabled);
-      posSettings.setKdsEnabled(enabled);
-    }).catch(() => {});
+    const loadPrinting = async (printingAtHydrationStart: PrintingForm, billFormAtHydrationStart: BillTemplateForm) => {
+      const [trimResponse, cashEnabledResponse, cashMethodsResponse, billLanguageResponse, kotLanguageResponse] = await Promise.all([
+        readOptional('/settings/printer_trim_decimals'),
+        readOptional('/settings/cash_drawer_pulse_enabled'),
+        readOptional('/settings/cash_drawer_pulse_methods'),
+        readOptional('/settings/bill_language_policy'),
+        readOptional('/settings/kot_language_policy'),
+      ]);
+      if (!active()) return;
 
-    api.get('/settings/server_app_enabled').then((res) => {
-      setServerAppEnabledSetting(res.data.setting?.value !== 'false');
-    }).catch(() => {});
+      if (trimResponse) {
+        const enabled = trimResponse.data.setting?.value === 'true';
+        posSettings.setPrinterTrimDecimals(enabled);
+        mergeHydratedPrinting({ printerTrimDecimals: enabled }, printingAtHydrationStart, hydrationTouchSnapshot);
+        setSavedPrinting((p) => ({ ...p, printerTrimDecimals: enabled }));
+      }
+      if (cashEnabledResponse) {
+        const raw = cashEnabledResponse.data.setting?.value;
+        if (raw === 'true' || raw === 'false') {
+          const enabled = raw === 'true';
+          setSavedPrinting((p) => ({ ...p, cashDrawerPulseEnabled: enabled }));
+          // Missing rows intentionally remain undefined so thermal printing keeps
+          // its legacy per-printer fallback.
+          mergeHydratedPrinting({ cashDrawerPulseEnabled: enabled }, printingAtHydrationStart, hydrationTouchSnapshot);
+        }
+      }
+      if (cashMethodsResponse) {
+        try {
+          const methods = JSON.parse(cashMethodsResponse.data.setting?.value || '[]');
+          if (Array.isArray(methods)) {
+            const valid = methods.filter((method: unknown): method is string => typeof method === 'string');
+            const normalized = methods.length > 0 && valid.length === 0 ? ['cash', 'card'] : valid;
+            mergeHydratedPrinting({ cashDrawerPulseMethods: normalized }, printingAtHydrationStart, hydrationTouchSnapshot);
+            setSavedPrinting((p) => ({ ...p, cashDrawerPulseMethods: normalized }));
+          }
+        } catch { /* Use the safe defaults. */ }
+      }
+      if (billLanguageResponse) {
+        const policy = parseStoredReceiptLanguagePolicy(billLanguageResponse.data?.setting?.value);
+        if (policy) {
+          posSettings.setBillLanguagePolicy(policy);
+          const formPatch = {
+            receiptPrimaryLanguage: policy.primary.mode === 'fixed' ? policy.primary.language : 'inherit',
+            receiptSecondLanguage: policy.additional[0] ?? 'none',
+          };
+          mergeHydratedPrinting(formPatch, printingAtHydrationStart, hydrationTouchSnapshot);
+          setSavedPrinting((p) => ({ ...p, ...formPatch }));
+        }
+      }
+      if (kotLanguageResponse) {
+        const policy = parseStoredKotLanguagePolicy(kotLanguageResponse.data?.setting?.value);
+        if (policy) {
+          posSettings.setKotLanguagePolicy(policy);
+          const formPatch = { kotLanguage: policy.primary.mode === 'fixed' ? policy.primary.language : 'inherit' };
+          mergeHydratedPrinting(formPatch, printingAtHydrationStart, hydrationTouchSnapshot);
+          setSavedPrinting((p) => ({ ...p, ...formPatch }));
+        }
+      }
+      const zReportResponse = await readOptional('/settings/z_report_language_policy');
+      if (!active()) return;
+      if (zReportResponse) {
+        const policy = parseStoredReceiptLanguagePolicy(zReportResponse.data?.setting?.value);
+        if (policy) {
+          const formPatch = {
+            zReportPrimaryLanguage: policy.primary.mode === 'fixed' ? policy.primary.language : 'inherit',
+            zReportSecondLanguage: policy.additional[0] ?? 'none',
+          };
+          mergeHydratedPrinting(formPatch, printingAtHydrationStart, hydrationTouchSnapshot);
+          setSavedPrinting((p) => ({ ...p, ...formPatch }));
+          setZReportLanguagePolicyLoaded(true);
+        }
+      } else {
+        setZReportLanguagePolicyLoaded(true);
+      }
 
-    api.get('/settings/kot_printing_enabled').then((res) => {
-      const enabled = res.data.setting?.value !== 'false';
-      setKotPrintingEnabledSetting(enabled);
-      posSettings.setKotPrintingEnabled(enabled);
-    }).catch(() => {});
-    api.get('/settings/printer_trim_decimals').then((res) => {
-      const enabled = res.data.setting?.value === 'true';
-      posSettings.setPrinterTrimDecimals(enabled);
-      setPrintingForm((p) => ({ ...p, printerTrimDecimals: enabled }));
-      setSavedPrinting((p) => ({ ...p, printerTrimDecimals: enabled }));
-    }).catch(() => {});
-    api.get('/settings/bill_language_policy').then((res) => {
-      const policy = parseStoredReceiptLanguagePolicy(res.data?.setting?.value);
-      if (!policy) return;
-      posSettings.setBillLanguagePolicy(policy);
-      const formPatch = {
-        receiptPrimaryLanguage: policy.primary.mode === 'fixed' ? policy.primary.language : 'inherit',
-        receiptSecondLanguage: policy.additional[0] ?? 'none',
-      };
-      setPrintingForm((p) => ({ ...p, ...formPatch }));
-      setSavedPrinting((p) => ({ ...p, ...formPatch }));
-    }).catch(() => {});
-    api.get('/settings/kot_language_policy').then((res) => {
-      const policy = parseStoredKotLanguagePolicy(res.data?.setting?.value);
-      if (!policy) return;
-      posSettings.setKotLanguagePolicy(policy);
-      const formPatch = {
-        kotLanguage: policy.primary.mode === 'fixed' ? policy.primary.language : 'inherit',
-      };
-      setPrintingForm((p) => ({ ...p, ...formPatch }));
-      setSavedPrinting((p) => ({ ...p, ...formPatch }));
-    }).catch(() => {});
-    Promise.all([
-      api.get('/settings/bill-templates').catch(() => null),
-      api.get('/settings/bill_template').catch(() => null),
-      api.get('/settings/bill_footer_message').catch(() => null),
-    ]).then(([templatesResponse, templateResponse, footerResponse]) => {
+      const [templatesResponse, templateResponse, footerResponse] = await Promise.all([
+        readOptional('/settings/bill-templates'),
+        readOptional('/settings/bill_template'),
+        readOptional('/settings/bill_footer_message'),
+      ]);
+      if (!active()) return;
       const pluginCards: TemplateCard[] = (templatesResponse?.data?.plugins || []).map((template: {
         id: string;
         displayName: string;
@@ -1674,9 +2076,6 @@ export default function SettingsPage() {
         selectionSource: 'pack' as const,
         description: `${template.country} tax template · ${template.paperColumns.join(', ')} columns`,
       }));
-      // Merchant templates (#447): provenance is informational only — a
-      // cloned origin references a compliance-pack template WITHOUT any
-      // trust claim; the copy is an ordinary editable document.
       const merchantCards: TemplateCard[] = (templatesResponse?.data?.merchant || [])
         .filter((template: { status: string }) => template.status === 'active')
         .map((template: {
@@ -1699,148 +2098,300 @@ export default function SettingsPage() {
         }));
       const cards = [...TEMPLATE_CARDS, ...pluginCards, ...merchantCards];
       setBillTemplateCards(cards);
-      // The persisted value may be a legacy bare id or a structured
-      // { source, id } JSON string (#447). Resolve it back to a picker card,
-      // preferring the card whose selection source matches the stored source
-      // so a pack template_id that collides with a core name keeps its
-      // qualifier on the next save.
       let storedId: unknown = templateResponse?.data.setting?.value;
       let storedSource: string | null = null;
       if (typeof storedId === 'string' && storedId.trim().startsWith('{')) {
         try {
           const parsed = JSON.parse(storedId) as { source?: unknown; id?: unknown };
-          if (
-            parsed && typeof parsed === 'object'
-            && typeof parsed.id === 'string'
-            && (parsed.source === 'core' || parsed.source === 'pack' || parsed.source === 'merchant')
-          ) {
+          if (parsed && typeof parsed === 'object' && typeof parsed.id === 'string'
+            && (parsed.source === 'core' || parsed.source === 'pack' || parsed.source === 'merchant')) {
             storedId = parsed.id;
             storedSource = parsed.source;
           }
         } catch { /* keep raw value */ }
       }
-      const candidateCard = typeof storedId === 'string'
-        ? cards.find((card) => card.id === storedId)
-        : undefined;
+      const candidateCard = typeof storedId === 'string' ? cards.find((card) => card.id === storedId) : undefined;
       const matchedCard = candidateCard && storedSource !== null && candidateCard.selectionSource !== storedSource
         ? cards.find((card) => card.id === candidateCard.id && card.selectionSource === storedSource)
         : candidateCard;
       const billTemplate: BillTemplate = matchedCard ? matchedCard.id : 'classic';
-      const billTemplateSource: 'core' | 'pack' | 'merchant' = matchedCard
-        ? matchedCard.selectionSource
-        : 'core';
+      const billTemplateSource: 'core' | 'pack' | 'merchant' = matchedCard ? matchedCard.selectionSource : 'core';
       const billFooterMessage = footerResponse?.data.setting?.value ?? posSettings.billFooterMessage;
       const loadedBillForm = { billTemplate, billTemplateSource, billFooterMessage };
       posSettings.setBillTemplate(billTemplate);
+      posSettings.setBillTemplateSource(billTemplateSource);
       posSettings.setBillFooterMessage(billFooterMessage);
-      setBillForm(loadedBillForm);
+      const mergedBillForm = mergeHydratedValues(billFormRef.current, billFormAtHydrationStart, loadedBillForm, hydrationTouchSnapshot);
+      setBillForm(mergedBillForm);
       setSavedBillForm(loadedBillForm);
-    });
+    };
 
-    api.get('/settings/order-numbering').then((res) => {
-      const loaded: OrderNumberForm = {
-        prefix: res.data.order_number_prefix ?? 'ORD',
-        includeDate: res.data.order_number_include_date !== false,
-        resetDaily: res.data.order_number_reset_daily !== false,
-        invoicePrefix: res.data.invoice_number_prefix ?? 'INV',
-        invoiceIncludePeriod: res.data.invoice_number_include_period !== false,
-        invoiceResetPeriod: (res.data.invoice_number_reset_period || 'daily') as InvoiceResetPeriod,
-        invoiceFinancialYearStartMonth: Number(res.data.invoice_financial_year_start_month) || 4,
-        invoiceFinancialYearStartDay: Number(res.data.invoice_financial_year_start_day) || 1,
-      };
-      setOrderNumberForm(loaded);
-      setSavedOrderNumberForm(loaded);
-    }).catch(() => {});
-
-
-    api.get('/settings/cloud').then((res) => {
-      const settings = {
-        cloud_api_key: res.data.cloud_api_key || '',
-        cloud_store_id: res.data.cloud_store_id || '',
-        cloud_sync_enabled: !!res.data.cloud_sync_enabled,
-        cloud_orders_enabled: !!res.data.cloud_orders_enabled,
-        cloud_last_sync: res.data.cloud_last_sync || null,
-      };
-      setCloudSettings(settings);
-      setSavedCloudSettings(settings);
-      setCloudStatus({
-        cloud_registration_status: res.data.cloud_registration_status || 'unregistered',
-        cloud_services_disabled_by_user: !!res.data.cloud_services_disabled_by_user,
-        cloud_connected: !!res.data.cloud_connected,
-        cloud_relay_mode: res.data.cloud_relay_mode || 'disconnected',
-        cloud_last_heartbeat: res.data.cloud_last_heartbeat || null,
-        cloud_last_error: res.data.cloud_last_error || null,
-        cloud_deletion_status: res.data.cloud_deletion_status || '',
-      });
-
-      // Mobile pairing requires cloud registration — skip the requests entirely
-      // for unregistered stores to avoid 502 noise in the console.
-      if (res.data.cloud_registration_status === 'registered') {
-        api.get('/mobile/pairing-code').then((pcRes) => {
-          setPairingCode(pcRes.data.pairing_code);
-          setPairingExpiresAt(pcRes.data.expires_at);
-          setPairingQrDataUrl(pcRes.data.qr_data_url || null);
-          setPairingUnavailable(false);
-        }).catch(() => {
-          setPairingUnavailable(true);
-        });
-        loadPairedDevices();
-      } else {
-        setPairingUnavailable(true);
+    try {
+      if (tab === 'appearance') {
+        const seqAtFetch = saveSeq.current;
+        const { data } = await get('/settings/theme_mode');
+        if (!active()) return;
+        const raw = data?.setting?.value;
+        if (raw === 'light' || raw === 'dark' || raw === 'system') {
+          if (!userTouched.current || needsServerTruth.current) setThemeMode(raw);
+          if (saveSeq.current === seqAtFetch) lastCommitted.current = raw;
+          if (needsServerTruth.current) needsServerTruth.current = false;
+        }
+        return;
       }
-    }).catch(() => {});
+      if (tab === 'store') {
+        const orderNumberAtHydrationStart = { ...orderNumberFormRef.current };
+        await loadBusiness();
+        const { data } = await get('/settings/order-numbering');
+        if (!active()) return;
+        const loaded: OrderNumberForm = {
+          prefix: data.order_number_prefix == null ? 'ORD' : sanitizeStoredNumberPrefix(data.order_number_prefix),
+          includeDate: data.order_number_include_date !== false,
+          resetDaily: data.order_number_reset_daily !== false,
+          invoicePrefix: data.invoice_number_prefix == null ? 'INV' : sanitizeStoredNumberPrefix(data.invoice_number_prefix),
+          invoiceIncludePeriod: data.invoice_number_include_period !== false,
+          invoiceResetPeriod: (data.invoice_number_reset_period || 'daily') as InvoiceResetPeriod,
+          invoiceFinancialYearStartMonth: Number(data.invoice_financial_year_start_month) || 4,
+          invoiceFinancialYearStartDay: Number(data.invoice_financial_year_start_day) || 1,
+        };
+        const mergedOrderNumbering = mergeHydratedValues(orderNumberFormRef.current, orderNumberAtHydrationStart, loaded, hydrationTouchSnapshot);
+        setOrderNumberForm(mergedOrderNumbering);
+        setSavedOrderNumberForm(loaded);
+        return;
+      }
+      if (tab === 'receipts-printers') {
+        const printingAtHydrationStart = { ...printingFormRef.current };
+        const billFormAtHydrationStart = { ...billFormRef.current };
+        await loadBusiness();
+        await Promise.all([
+          fetchPrinters(signal),
+          fetchDetectedPrinters(signal),
+          loadPrinting(printingAtHydrationStart, billFormAtHydrationStart),
+          readOptional('/settings/kot_printing_enabled').then((res) => {
+            if (!active()) return;
+            const enabled = res?.data.setting?.value !== 'false';
+            setKotPrintingEnabledSetting(enabled);
+            posSettings.setKotPrintingEnabled(enabled);
+          }),
+        ]);
+        return;
+      }
+      if (tab === 'kds') {
+        const [kdsInfoLoaded, stationsLoaded, categoriesLoaded, staffLoaded, settingLoaded] = await Promise.all([
+          fetchKdsInfo(signal),
+          fetchStations(signal),
+          fetchStationCategories(signal),
+          fetchStationStaff(signal),
+          get('/settings/kds_enabled').then((res) => {
+            if (!active()) return false;
+            const enabled = res.data.setting?.value !== 'false';
+            setKdsEnabledSetting(enabled);
+            posSettings.setKdsEnabled(enabled);
+            return true;
+          }).catch((error) => {
+            if (isRequestCancelled(error)) throw error;
+            return false;
+          }),
+        ]);
+        if (!kdsInfoLoaded || !stationsLoaded || !categoriesLoaded || !staffLoaded || !settingLoaded) {
+          throw new Error('KDS hydration failed');
+        }
+        return;
+      }
+      if (tab === 'server-app') {
+        const { data } = await get('/settings/server_app_enabled');
+        if (active()) setServerAppEnabledSetting(data.setting?.value !== 'false');
+        return;
+      }
+      if (tab === 'loyalty') {
+        const loyaltyAtHydrationStart = { ...loyaltyFormRef.current };
+        const [loyaltyResponse, candidatesResponse] = await Promise.all([
+          get('/settings/loyalty'),
+          get('/products/loyalty/global-rate-candidates'),
+        ]);
+        if (!active()) return;
+        const loadedLoyalty = {
+          loyaltyEnabled: !!loyaltyResponse.data.loyalty_enabled,
+          globalCashbackPercent: String(loyaltyResponse.data.global_cashback_percent ?? 0),
+        };
+        const mergedLoyalty = mergeHydratedValues(loyaltyFormRef.current, loyaltyAtHydrationStart, loadedLoyalty, hydrationTouchSnapshot);
+        setLoyaltyEnabled(mergedLoyalty.loyaltyEnabled);
+        setSavedLoyaltyEnabled(loadedLoyalty.loyaltyEnabled);
+        setGlobalCashbackPercent(mergedLoyalty.globalCashbackPercent);
+        setSavedGlobalCashbackPercent(loadedLoyalty.globalCashbackPercent);
+        setGlobalRateCandidates(Number(candidatesResponse.data.count) || 0);
+        return;
+      }
+      if (tab === 'discounts') {
+        const discountAtHydrationStart = { ...discountFormRef.current };
+        const { data } = await get('/settings/discount');
+        if (!active()) return;
+        const loadedDiscount = { ...discountAtHydrationStart };
+        if (data.discount_max_percentage !== undefined) loadedDiscount.discountMaxPct = normalizeDiscountPercentage(data.discount_max_percentage);
+        if (data.discount_max_amount !== undefined) loadedDiscount.discountMaxAmount = normalizeDiscountAmount(data.discount_max_amount);
+        if (data.discount_mode) loadedDiscount.discountMode = data.discount_mode;
+        if (data.discount_requires_approval !== undefined) loadedDiscount.discountRequiresApproval = !!data.discount_requires_approval;
+        const mergedDiscount = mergeHydratedValues(discountFormRef.current, discountAtHydrationStart, loadedDiscount, hydrationTouchSnapshot);
+        setDiscountMaxPct(mergedDiscount.discountMaxPct);
+        setSavedDiscountMaxPct(loadedDiscount.discountMaxPct);
+        setDiscountMaxAmount(mergedDiscount.discountMaxAmount);
+        setSavedDiscountMaxAmount(loadedDiscount.discountMaxAmount);
+        setDiscountMode(mergedDiscount.discountMode);
+        setSavedDiscountMode(loadedDiscount.discountMode);
+        setDiscountRequiresApproval(mergedDiscount.discountRequiresApproval);
+        setSavedDiscountRequiresApproval(loadedDiscount.discountRequiresApproval);
+        return;
+      }
+      if (tab === 'privacy') {
+        setCloudPrivacyHydrated(false);
+        const [telemetryResponse, diagnosticsResponse] = await Promise.all([
+          get('/settings/telemetry_enabled').catch(() => null),
+          get('/settings/diagnostics_consent').catch(() => null),
+        ]);
+        if (!active()) return;
+        setTelemetryEnabled(telemetryResponse ? telemetryResponse.data.setting?.value === 'true' : false);
+        setDiagnosticsConsent(diagnosticsResponse ? diagnosticsResponse.data.setting?.value !== 'false' : true);
+        const [cloudLoaded, accountLoaded] = await Promise.all([
+          loadCloud(true).then(() => true).catch((error) => {
+            if (isRequestCancelled(error)) throw error;
+            return false;
+          }),
+          isOwner ? fetchCloudAccount(signal) : Promise.resolve(true),
+        ]);
+        if (!cloudLoaded || !accountLoaded) throw new Error('Privacy hydration failed');
+        if (active()) setCloudPrivacyHydrated(true);
+        return;
+      }
+      if (tab === 'data') {
+        void fetchGoogleDriveStatus(signal);
+        const [masterPinLoaded, backupsLoaded] = await Promise.all([
+          fetchMasterPinStatus(signal),
+          fetchBackups(signal),
+        ]);
+        if (!masterPinLoaded || !backupsLoaded) throw new Error('Data hydration failed');
+        return;
+      }
+      if (tab === 'account') {
+        if (isOwner) await fetchCloudAccount(signal);
+        return;
+      }
+      if (tab === 'about') {
+        setMoreAppsLoading(true);
+        try {
+          const moreAppsResponse = await get('/more-apps');
+          if (active()) {
+            setMoreApps(moreAppsResponse.data.apps || []);
+          }
+        } catch (error) {
+          if (isRequestCancelled(error)) throw error;
+        } finally {
+          if (active()) setMoreAppsLoading(false);
+        }
+        return;
+      }
+      if (tab === 'mobile-access' || tab === 'orderflow') {
+        if (tab === 'mobile-access' && includeStatusOnly) {
+          try {
+            const revfloResponse = await get('/more-apps/revflo');
+            if (active()) setRevflo(revfloResponse.data.app || null);
+          } catch (error) {
+            if (isRequestCancelled(error)) throw error;
+          }
+        }
+        await loadCloud(!includeStatusOnly);
+      }
+    } catch (error) {
+      if (!isRequestCancelled(error) && active()) {
+        // Individual Settings sections are best-effort; the panel remains usable
+        // and its existing manual refresh actions remain available.
+      }
+      throw error;
+    }
+  };
 
-    api.get('/settings/business').then((res) => {
-      const d = res.data;
-      const loaded: BusinessForm = {
-        businessName: d.business_name || '',
-        countryCode: d.country || '',
-        timezone: d.timezone || '',
-        currency: d.currency || '',
-        billingType: d.billing_type === 'prepaid' ? 'prepaid' : 'postpaid',
-        tablesRequired: typeof d.tables_required === 'boolean' ? d.tables_required : true,
-        taxRegistered: d.tax_registered === 'true' || d.tax_registered === true || d.tax_registered === 1,
-        taxRegistrationNumber: d.tax_registration_number || '',
-        businessAddress: d.business_address || '',
-        businessPhone: d.business_phone || '',
-        instagramHandle: d.instagram_handle || '',
-        currencyDisplay: d.currency_display === 'toman' ? 'toman' : d.currency_display === 'toman_short' ? 'toman_short' : 'rial',
-        numberDigits: d.number_digits === 'latin' ? 'latin' : 'locale',
-        calendar: d.calendar === 'persian' ? 'persian' : d.calendar === 'gregorian' ? 'gregorian' : 'locale',
-      };
-      setSavedBusiness(loaded);
-      setForm(loaded);
-      setTaxIdFormat(d.tax_id_format || null);
-      setTaxIdFormatCountryCode(loaded.countryCode);
-      // Sync to pos-settings store for bill printing
-      const billDisplay = {
-        billShowName: d.bill_show_name !== false,
-        billShowAddress: d.bill_show_address !== false,
-        billShowPhone: d.bill_show_phone !== false,
-        billShowTaxId: d.bill_show_tax_id === true,
-        billShowTaxBreakdown: d.bill_show_tax_breakdown !== false,
-        billShowCustomerName: d.bill_show_customer_name !== false,
-        billShowCustomerPhone: d.bill_show_customer_phone !== false,
-        billShowTableNumber: d.bill_show_table_number !== false,
-      };
-      setPrintingForm((previous) => ({ ...previous, ...billDisplay }));
-      setSavedPrinting((previous) => ({ ...previous, ...billDisplay }));
-      posSettings.setBillShowName(billDisplay.billShowName);
-      posSettings.setBillShowAddress(billDisplay.billShowAddress);
-      posSettings.setBillShowPhone(billDisplay.billShowPhone);
-      posSettings.setBillShowTaxId(billDisplay.billShowTaxId);
-      posSettings.setBillShowTaxBreakdown(billDisplay.billShowTaxBreakdown);
-      posSettings.setBillShowCustomerName(billDisplay.billShowCustomerName);
-      posSettings.setBillShowCustomerPhone(billDisplay.billShowCustomerPhone);
-      posSettings.setBillShowTableNumber(billDisplay.billShowTableNumber);
-      if (d.tax_registration_number) posSettings.setBillTaxRegistrationNumber(d.tax_registration_number);
-      if (d.business_address) posSettings.setBillAddress(d.business_address);
-      if (d.business_phone) posSettings.setBillPhone(d.business_phone);
-      posSettings.setBillingType(d.billing_type === 'prepaid' ? 'prepaid' : 'postpaid');
-      posSettings.setTablesRequired(typeof d.tables_required === 'boolean' ? d.tables_required : true);
-    }).catch(() => {});
+  const startSettingsTabLoad = (tab: string, controller: AbortController, includeStatusOnly = true): Promise<void> => {
+    const tenantId = currentTenant?.id;
+    if (!tenantId) return Promise.resolve();
+    const { signal } = controller;
+    const key = `${tenantId}:${tab}${tab === 'mobile-access' && !includeStatusOnly ? ':status' : ''}`;
+    const requiresCloudHydration = tab === 'mobile-access' && !includeStatusOnly && !cloudHydrationSucceeded.current;
+    if (loadedSettingsTabs.current.has(key) && !requiresCloudHydration) return Promise.resolve();
+    const existing = settingsTabLoadPromises.current.get(key);
+    if (existing) return existing;
+    const promise = loadSettingsTab(tab, signal, includeStatusOnly).then(() => {
+      if (!signal.aborted) loadedSettingsTabs.current.add(key);
+    });
+    settingsTabLoadPromises.current.set(key, promise);
+    settingsTabLoadControllers.current.set(key, controller);
+    void promise.then(() => {
+      if (settingsTabLoadPromises.current.get(key) === promise) {
+        settingsTabLoadPromises.current.delete(key);
+        if (settingsTabLoadControllers.current.get(key) === controller) {
+          settingsTabLoadControllers.current.delete(key);
+        }
+      }
+    }, () => {
+      if (settingsTabLoadPromises.current.get(key) === promise) {
+        settingsTabLoadPromises.current.delete(key);
+        if (settingsTabLoadControllers.current.get(key) === controller) {
+          settingsTabLoadControllers.current.delete(key);
+        }
+      }
+    });
+    return promise;
+  };
+
+  useEffect(() => {
+    if (!currentTenant?.id) return;
+    const key = `${currentTenant.id}:${activeTab}`;
+    if (loadedSettingsTabs.current.has(key)) return;
+    const tabLoadPromises = settingsTabLoadPromises.current;
+    const tabLoadControllers = settingsTabLoadControllers.current;
+    const controller = new AbortController();
+    void startSettingsTabLoad(activeTab, controller)
+      .catch(() => {});
+    return () => {
+      controller.abort();
+      if (tabLoadPromises.has(key)) {
+        tabLoadPromises.delete(key);
+      }
+      if (tabLoadControllers.get(key) === controller) {
+        tabLoadControllers.delete(key);
+      }
+    };
+  // The tab and tenant identity are the intentional hydration boundaries.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [activeTab, currentTenant?.id, isOwner]);
+
+  useEffect(() => {
+    mobileAccessRequestGeneration.current += 1;
+    mobileAccessRequestController.current?.abort();
+    mobileAccessRequestController.current = null;
+    return () => {
+      mobileAccessRequestGeneration.current += 1;
+      mobileAccessRequestController.current?.abort();
+      mobileAccessRequestController.current = null;
+      setRotatingCode(false);
+    };
+  }, [activeTab, currentTenant?.id]);
+
+  useEffect(() => {
+    if (requestedAction !== 'health-check' || !currentTenant?.id) return;
+    const key = `${currentTenant.id}:health-check`;
+    if (healthCheckLoaded.current === key) return;
+    const controller = new AbortController();
+    api.get('/db-tools/health-check', { signal: controller.signal }).then(({ data }) => {
+      if (controller.signal.aborted) return;
+      healthCheckLoaded.current = key;
+      setHealthReport(data);
+    }).catch((error) => {
+      if (!isRequestCancelled(error) && !controller.signal.aborted) {
+        toast.error(t('healthCheckFailed'));
+        setHealthCheckOpen(false);
+      }
+    });
+    return () => controller.abort();
+  }, [activeTab, currentTenant?.id, requestedAction, t]);
 
   const saveCloud = async (silent = false) => {
     setSavingCloud(true);
@@ -1883,8 +2434,14 @@ export default function SettingsPage() {
     setRegisteringCloud(true);
     try {
       const res = await api.post('/settings/cloud/register', { email });
+      const registrationStatus = res.data.cloud_registration_status || 'unregistered';
+      cloudRegistrationStatus.current = registrationStatus;
+      cloudHydrationGeneration.current += 1;
+      cloudHydrated.current = false;
+      cloudHydrationSucceeded.current = false;
+      cloudHydrationPromise.current = null;
       setCloudStatus({
-        cloud_registration_status: res.data.cloud_registration_status || 'unregistered',
+        cloud_registration_status: registrationStatus,
         cloud_services_disabled_by_user: !!res.data.cloud_services_disabled_by_user,
         cloud_connected: !!res.data.cloud_connected,
         cloud_relay_mode: res.data.cloud_relay_mode || 'disconnected',
@@ -1899,10 +2456,32 @@ export default function SettingsPage() {
       }));
       await fetchCloudAccount();
       notifyCloudAccountStatusChanged();
-      if (res.data.cloud_registration_status === 'registered') {
+      if (registrationStatus === 'registered') {
+        const mobileAccessKeys = currentTenant?.id
+          ? [`${currentTenant.id}:mobile-access`, `${currentTenant.id}:mobile-access:status`]
+          : [];
+        mobileAccessKeys.forEach((key) => {
+          settingsTabLoadControllers.current.get(key)?.abort();
+          settingsTabLoadControllers.current.delete(key);
+          settingsTabLoadPromises.current.delete(key);
+          loadedSettingsTabs.current.delete(key);
+        });
+        if (activeTabRef.current === 'mobile-access') {
+          const controller = new AbortController();
+          mobileAccessRequestController.current = controller;
+          try {
+            await startSettingsTabLoad('mobile-access', controller);
+          } finally {
+            if (mobileAccessRequestController.current === controller) {
+              mobileAccessRequestController.current = null;
+            }
+            controller.abort();
+          }
+        }
         toast.success(t('cloudRegistrationSuccess'));
       }
-    } catch {
+    } catch (error) {
+      if (isRequestCancelled(error)) return;
       toast.error(t('cloudRegistrationFailed'));
     } finally {
       setRegisteringCloud(false);
@@ -1999,10 +2578,7 @@ export default function SettingsPage() {
     }
   };
 
-  // Kitchen workflow toggles (issue #133) — saved immediately on toggle
-  // (not batched with the rest of the form) since turning KDS off also
-  // invalidates outstanding pairing tokens server-side; a stale local
-  // "unsaved" toggle would be misleading about that security-relevant effect.
+  // Saved immediately because turning KDS off invalidates pairing tokens server-side.
   const saveKdsEnabled = async (enabled: boolean) => {
     const previous = kdsEnabledSetting;
     setKdsEnabledSetting(enabled);
@@ -2124,6 +2700,7 @@ export default function SettingsPage() {
       const putRes = await api.put('/settings/business', {
         business_name: form.businessName,
         timezone: form.timezone,
+        business_day_start_time: form.businessDayStartTime,
         currency: form.currency,
         country: form.countryCode,
         billing_type: form.billingType,
@@ -2178,7 +2755,7 @@ export default function SettingsPage() {
       posSettings.setBillPhone(normalizedBusinessPhone);
       posSettings.setBillingType(form.billingType);
       posSettings.setTablesRequired(form.tablesRequired);
-      updateCurrentTenant({ currency: form.currency, timezone: form.timezone, country: form.countryCode, currency_display: form.currencyDisplay, number_digits: form.numberDigits, calendar: form.calendar });
+      updateCurrentTenant({ currency: form.currency, timezone: form.timezone, business_day_start_time: form.businessDayStartTime, country: form.countryCode, currency_display: form.currencyDisplay, number_digits: form.numberDigits, calendar: form.calendar });
       if (!silent) toast.success(t('storeSaved'));
     } catch (err: unknown) {
       const responseData = (err as { response?: { data?: unknown } }).response?.data;
@@ -2201,12 +2778,12 @@ export default function SettingsPage() {
 
   const saveOrderNumbering = async (silent = false) => {
     const prefix = orderNumberForm.prefix.trim();
-    if (prefix && !/^[A-Za-z0-9_-]{0,12}$/.test(prefix)) {
+    if (prefix && !/^[A-Za-z0-9]{0,12}$/.test(prefix)) {
       toast.error(t('orderNumberPrefixInvalid'));
       return;
     }
     const invoicePrefix = orderNumberForm.invoicePrefix.trim();
-    if (invoicePrefix && !/^[A-Za-z0-9_-]{0,12}$/.test(invoicePrefix)) {
+    if (invoicePrefix && !/^[A-Za-z0-9]{0,12}$/.test(invoicePrefix)) {
       toast.error(t('invoiceNumberPrefixInvalid'));
       return;
     }
@@ -2242,31 +2819,68 @@ export default function SettingsPage() {
   };
 
   const saveAllSettings = async () => {
+    if (savingAllSettingsInFlight.current) return;
+    savingAllSettingsInFlight.current = true;
+    setSavingAllSettings(true);
     try {
-      await Promise.all([saveBusinessInfo(true), saveLoyalty(true), saveDiscount(true), saveCloud(true), saveOrderNumbering(true)]);
-      await savePrinting(true);
-      await saveBillTemplate(true);
-      toast.success(t('allSaved'));
+      await Promise.all(['store', 'receipts-printers', 'loyalty', 'discounts', 'mobile-access'].map((tab) => {
+        const key = `${currentTenant?.id}:${tab}${tab === 'mobile-access' ? ':status' : ''}`;
+        if (loadedSettingsTabs.current.has(key)) return Promise.resolve();
+        return startSettingsTabLoad(tab, new AbortController(), false);
+      }));
+      // Hydration updates state asynchronously. Let the next render run the
+      // saves against the hydrated values instead of stale initial defaults.
+      setSaveAllHydrationRun((run) => run + 1);
     } catch {
       toast.error(t('allSaveFailed'));
+      savingAllSettingsInFlight.current = false;
+      setSavingAllSettings(false);
     }
   };
 
+  useEffect(() => {
+    if (saveAllHydrationRun === 0 || !savingAllSettingsInFlight.current) return;
+    void (async () => {
+      try {
+        await Promise.all([saveBusinessInfo(true), saveLoyalty(true), saveDiscount(true), saveCloud(true), saveOrderNumbering(true)]);
+        await savePrinting(true);
+        await saveBillTemplate(true);
+        toast.success(t('allSaved'));
+      } catch {
+        toast.error(t('allSaveFailed'));
+      } finally {
+        savingAllSettingsInFlight.current = false;
+        setSavingAllSettings(false);
+      }
+    })();
+  // This effect intentionally runs once per hydration run, using the state
+  // values produced by the loaders before it starts the writes.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [saveAllHydrationRun]);
+
   const rotatePairingCode = async () => {
     setRotatingCode(true);
+    const generation = mobileAccessRequestGeneration.current;
+    const controller = new AbortController();
+    mobileAccessRequestController.current = controller;
     try {
-      const res = await api.post('/mobile/rotate-code');
+      const res = await api.post('/mobile/rotate-code', undefined, { signal: controller.signal });
+      if (controller.signal.aborted || generation !== mobileAccessRequestGeneration.current || activeTabRef.current !== 'mobile-access') return;
       setPairingCode(res.data.pairing_code);
       setPairingExpiresAt(res.data.expires_at);
       setPairingQrDataUrl(res.data.qr_data_url || null);
       setPairingUnavailable(false);
       toast.success(t('pairingCodeRotated'));
-      loadPairedDevices();
-    } catch {
+      await loadPairedDevices(controller.signal);
+    } catch (error) {
+      if (isRequestCancelled(error)) return;
       // Show a localized failure; the specific backend reason stays in logs.
       toast.error(t('pairingCodeFailed'));
     } finally {
-      setRotatingCode(false);
+      if (mobileAccessRequestController.current === controller) {
+        mobileAccessRequestController.current = null;
+        setRotatingCode(false);
+      }
     }
   };
 
@@ -2277,11 +2891,6 @@ export default function SettingsPage() {
       setTimeout(() => setCopiedCode(false), 2000);
     });
   };
-
-  const paperSizeOptions: { value: PaperSize; label: string }[] = [
-    { value: 'thermal58', label: t('paperSize58') },
-    { value: 'thermal80', label: t('paperSize80') },
-  ];
 
   const isDirty = 
     JSON.stringify(form) !== JSON.stringify(savedBusiness) ||
@@ -2331,26 +2940,29 @@ export default function SettingsPage() {
         <div className="w-full md:w-40 md:min-w-[10rem] shrink-0 md:h-full md:min-h-0 md:flex md:flex-col">
           <div className="flex items-center gap-3 mb-6 shrink-0">
             <Settings size={28} className="text-brand" />
-            <h1 className="text-2xl font-bold text-gray-900">{t('title')}</h1>
+            <h1 className="text-2xl font-bold text-foreground">{t('title')}</h1>
           </div>
 
-           <nav className="flex md:flex-col gap-0.5 overflow-x-auto md:flex-1 md:min-h-0 md:overflow-x-hidden md:overflow-y-auto md:overscroll-contain border-b md:border-b-0 md:border-e border-gray-200 pb-2 md:pb-0 md:pe-2">
+           <nav className="flex md:flex-col gap-0.5 overflow-x-auto md:flex-1 md:min-h-0 md:overflow-x-hidden md:overflow-y-auto md:overscroll-contain border-b md:border-b-0 md:border-e border-border pb-2 md:pb-0 md:pe-2">
 
             {/* General group */}
-            <div className="hidden md:block px-3 pt-3 pb-2 mt-2 mb-1 border-b border-gray-100">
-              <p className="text-[11px] font-bold uppercase tracking-widest text-gray-400">{t('navGroupGeneral')}</p>
+            <div className="hidden md:block px-3 pt-3 pb-2 mt-2 mb-1 border-b border-border">
+              <p className="text-[11px] font-bold uppercase tracking-widest text-muted-foreground">{t('navGroupGeneral')}</p>
             </div>
             <SettingsNavItem label={t('storeDetails')} value="store" active={activeTab} onClick={handleSettingsTabChange} />
             <SettingsNavItem label={t('tabPrinters')} value="receipts-printers" active={activeTab} onClick={handleSettingsTabChange} />
             <SettingsNavItem label={t('paymentMethods')} value="payments" active={activeTab} onClick={handleSettingsTabChange} />
             <SettingsNavItem label={t('currencies')} value="currencies" active={activeTab} onClick={handleSettingsTabChange} />
+            {isAdmin && (
+              <SettingsNavItem label={t('tabAppearance')} value="appearance" active={activeTab} onClick={handleSettingsTabChange} />
+            )}
             {canViewTaxConfiguration && (
               <SettingsNavItem label={t('taxConfiguration')} value="tax" active={activeTab} onClick={handleSettingsTabChange} />
             )}
 
             {/* Operations group */}
-            <div className="hidden md:block px-3 pt-4 pb-2 mt-3 mb-1 border-b border-gray-100">
-              <p className="text-[11px] font-bold uppercase tracking-widest text-gray-400">{t('navGroupOperations')}</p>
+            <div className="hidden md:block px-3 pt-4 pb-2 mt-3 mb-1 border-b border-border">
+              <p className="text-[11px] font-bold uppercase tracking-widest text-muted-foreground">{t('navGroupOperations')}</p>
             </div>
             <SettingsNavItem label={t('posWorkflow')} value="pos" active={activeTab} onClick={handleSettingsTabChange} />
             <SettingsNavItem label={t('tabKds')} value="kds" active={activeTab} onClick={handleSettingsTabChange} />
@@ -2360,23 +2972,23 @@ export default function SettingsPage() {
             <SettingsNavItem label={t('tabWhatsapp')} value="whatsapp" active={activeTab} onClick={handleSettingsTabChange} />
 
             {/* Customers group */}
-            <div className="hidden md:block px-3 pt-4 pb-2 mt-3 mb-1 border-b border-gray-100">
-              <p className="text-[11px] font-bold uppercase tracking-widest text-gray-400">{t('navGroupCustomers')}</p>
+            <div className="hidden md:block px-3 pt-4 pb-2 mt-3 mb-1 border-b border-border">
+              <p className="text-[11px] font-bold uppercase tracking-widest text-muted-foreground">{t('navGroupCustomers')}</p>
             </div>
             <SettingsNavItem label={t('loyalty')} value="loyalty" active={activeTab} onClick={handleSettingsTabChange} />
             <SettingsNavItem label={t('discounts')} value="discounts" active={activeTab} onClick={handleSettingsTabChange} />
 
             {/* Integrations group (formerly "Data") */}
-            <div className="hidden md:block px-3 pt-4 pb-2 mt-3 mb-1 border-b border-gray-100">
-              <p className="text-[11px] font-bold uppercase tracking-widest text-gray-400">{t('navGroupData')}</p>
+            <div className="hidden md:block px-3 pt-4 pb-2 mt-3 mb-1 border-b border-border">
+              <p className="text-[11px] font-bold uppercase tracking-widest text-muted-foreground">{t('navGroupData')}</p>
             </div>
             <SettingsNavItem label={t('tabMobileAccess')} value="mobile-access" active={activeTab} onClick={handleSettingsTabChange} />
             <SettingsNavItem label={t('tabBackupData')} value="data" active={activeTab} onClick={handleSettingsTabChange} />
             <SettingsNavItem label={t('tabOrderflow')} value="orderflow" active={activeTab} onClick={handleSettingsTabChange} />
 
             {/* Account group */}
-            <div className="hidden md:block px-3 pt-4 pb-2 mt-3 mb-1 border-b border-gray-100">
-              <p className="text-[11px] font-bold uppercase tracking-widest text-gray-400">{t('navGroupAccount')}</p>
+            <div className="hidden md:block px-3 pt-4 pb-2 mt-3 mb-1 border-b border-border">
+              <p className="text-[11px] font-bold uppercase tracking-widest text-muted-foreground">{t('navGroupAccount')}</p>
             </div>
             <SettingsNavItem label={t('account')} value="account" active={activeTab} onClick={handleSettingsTabChange} attention={cloudDeletionNeedsAction || (cloudAccountAvailable && Boolean(cloudAccount?.email && !cloudAccount?.verified))} />
             <SettingsNavItem label={t('privacy')} value="privacy" active={activeTab} onClick={handleSettingsTabChange} />
@@ -2391,12 +3003,12 @@ export default function SettingsPage() {
         <TabsContent value="store">
           <div className="pb-6 max-w-3xl space-y-6">
             {/* Store Details — editable for admin, readonly otherwise */}
-            <div className="lg:col-span-2 bg-white rounded-xl border border-gray-100 p-6">
+            <div className="lg:col-span-2 bg-card rounded-xl border border-border p-6">
               <div className="flex items-center gap-2 mb-4">
-                <Building2 size={20} className="text-gray-500" />
-                <h2 className="font-semibold text-gray-900">{t('storeDetails')}</h2>
+                <Building2 size={20} className="text-muted-foreground" />
+                <h2 className="font-semibold text-foreground">{t('storeDetails')}</h2>
                 {!isAdmin && (
-                  <span className="ms-auto flex items-center gap-1 text-xs text-gray-400">
+                  <span className="ms-auto flex items-center gap-1 text-xs text-muted-foreground">
                     <Lock size={12} /> {t('adminOnly')}
                   </span>
                 )}
@@ -2404,21 +3016,21 @@ export default function SettingsPage() {
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-sm text-gray-500 mb-1">{t('businessName')}</label>
+                  <label className="block text-sm text-muted-foreground mb-1">{t('businessName')}</label>
                   {isAdmin ? (
-                    <input type="text" value={form.businessName} onChange={(e) => setForm((p) => ({ ...p, businessName: e.target.value }))}
-                      className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand" />
+                    <input type="text" value={form.businessName} onChange={(e) => { markHydrationTouched('businessName'); setForm((p) => ({ ...p, businessName: e.target.value })); }}
+                      className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand" />
                   ) : (
-                    <p className="font-medium text-gray-900">{form.businessName || currentTenant?.business_name}</p>
+                    <p className="font-medium text-foreground">{form.businessName || currentTenant?.business_name}</p>
                   )}
                 </div>
                 {/* Country, Timezone, Currency in single line with individual headings */}
                 <div className="md:col-span-2 space-y-2">
                   {/* Headings */}
                   <div className="grid grid-cols-3 gap-2">
-                    <label className="text-sm text-gray-500">{t('country')}</label>
-                    <label className="text-sm text-gray-500">{t('timezone')}</label>
-                    <label className="text-sm text-gray-500">{t('currency')}</label>
+                    <label className="text-sm text-muted-foreground">{t('country')}</label>
+                    <label className="text-sm text-muted-foreground">{t('timezone')}</label>
+                    <label className="text-sm text-muted-foreground">{t('currency')}</label>
                   </div>
                   
                   {/* Input fields */}
@@ -2428,19 +3040,18 @@ export default function SettingsPage() {
                         items={sortedCountries.map((c) => ({ value: c.code, label: getLocalizedCountryName(c.code, locale) }))}
                         value={form.countryCode || undefined}
                         onValueChange={(code) => {
+                          markHydrationTouched('countryCode');
+                          markHydrationTouched('currency');
+                          markHydrationTouched('timezone');
+                          markHydrationTouched('currencyDisplay');
+                          markHydrationTouched('numberDigits');
+                          markHydrationTouched('calendar');
                           const country = COUNTRIES.find(c => c.code === code);
                           setForm((p) => {
                             const previousCountry = getCountryByCode(p.countryCode);
                             const timezoneWasDefault = !previousCountry || p.timezone === previousCountry.timezone;
-                            // Only prefill the currency from the newly chosen country when the
-                            // current value is empty or still the previous country's default. A
-                            // currency the owner picked on purpose is never overwritten — this is
-                            // what lets the base currency differ from the country default.
                             const currencyWasDefault = !p.currency || !previousCountry || p.currency === previousCountry.currency;
                             const options = country?.localeOptions;
-                            // Re-evaluate locale display preferences against the
-                            // newly selected country (#390): keep supported values
-                            // and reset unsupported ones to their neutral defaults.
                             const currencyDisplay = (options?.currencyDisplay?.includes(p.currencyDisplay) || p.currencyDisplay === 'rial')
                               ? p.currencyDisplay
                               : 'rial';
@@ -2465,13 +3076,12 @@ export default function SettingsPage() {
                         }}
                         placeholder={t('selectCountry')}
                         searchPlaceholder={tCommon('search')}
-                        className="bg-white"
                       />
                       <TimeZoneSelect
                         value={form.timezone}
-                        onChange={(timezone) => setForm((p) => ({ ...p, timezone }))}
+                        onChange={(timezone) => { markHydrationTouched('timezone'); setForm((p) => ({ ...p, timezone })); }}
                         placeholder={t('selectTimezone')}
-                        className="px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand bg-white"
+                        className="px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand bg-card"
                         ariaLabel={t('timezone')}
                       />
                       <Combobox
@@ -2482,90 +3092,131 @@ export default function SettingsPage() {
                           ...CURRENCY_CODES.map(currencyItem),
                         ]}
                         value={form.currency || undefined}
-                        onValueChange={(code) => setForm((p) => ({ ...p, currency: code }))}
+                        onValueChange={(code) => {
+                          markHydrationTouched('currency');
+                          setForm((p) => ({ ...p, currency: code }));
+                        }}
                         placeholder={t('currency')}
                         searchPlaceholder={tCommon('search')}
-                        className="bg-white"
                       />
                     </div>
                   ) : (
                     <div className="grid grid-cols-3 gap-2">
-                      <p className="font-medium text-gray-900">
+                      <p className="font-medium text-foreground">
                         {form.countryCode ? getLocalizedCountryName(form.countryCode, locale) : '—'}
                       </p>
-                      <p className="font-medium text-gray-900">
+                      <p className="font-medium text-foreground">
                         <Ltr>{form.timezone || '—'}</Ltr>
                       </p>
-                      <p className="font-medium text-gray-900">
+                      <p className="font-medium text-foreground">
                         <Ltr>{form.currency || '—'}</Ltr>
                       </p>
                     </div>
                   )}
                 </div>
+
+                {/* Business Day Start Time */}
+                <div className="md:col-span-2 space-y-1.5">
+                  <label htmlFor="business-day-start-time" className="text-sm text-muted-foreground">
+                    {t('businessDayStartTime')}
+                  </label>
+                  {isAdmin ? (
+                    <div className="max-w-xs">
+                      <select
+                        id="business-day-start-time"
+                        value={form.businessDayStartTime}
+                        onChange={(e) => {
+                          markHydrationTouched('businessDayStartTime');
+                          setForm((p) => ({ ...p, businessDayStartTime: e.target.value }));
+                        }}
+                        className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand bg-card"
+                      >
+                        {BUSINESS_DAY_START_OPTIONS.map((opt) => (
+                          <option key={opt.value} value={opt.value}>
+                            {opt.value === '00:00' ? `${opt.label} (${t('defaultMidnight')})` : opt.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ) : (
+                    <p className="font-medium text-foreground">
+                      <Ltr>{form.businessDayStartTime || '00:00'}</Ltr>
+                    </p>
+                  )}
+                  <p className="text-xs text-muted-foreground">
+                    {t('businessDayStartTimeDesc')}
+                  </p>
+                </div>
+
                 <LocalePreferencesPanel
                   options={getCountryByCode(form.countryCode)?.localeOptions}
                   currencyDisplay={form.currencyDisplay}
                   digits={form.numberDigits}
                   calendar={form.calendar}
                   isAdmin={isAdmin}
-                  onChange={(patch) => setForm((p) => ({
-                    ...p,
-                    ...(patch.currencyDisplay !== undefined ? { currencyDisplay: patch.currencyDisplay } : {}),
-                    ...(patch.digits !== undefined ? { numberDigits: patch.digits } : {}),
-                    ...(patch.calendar !== undefined ? { calendar: patch.calendar } : {}),
-                  }))}
+                  onChange={(patch) => {
+                    if (patch.currencyDisplay !== undefined) markHydrationTouched('currencyDisplay');
+                    if (patch.digits !== undefined) markHydrationTouched('numberDigits');
+                    if (patch.calendar !== undefined) markHydrationTouched('calendar');
+                    setForm((p) => ({
+                      ...p,
+                      ...(patch.currencyDisplay !== undefined ? { currencyDisplay: patch.currencyDisplay } : {}),
+                      ...(patch.digits !== undefined ? { numberDigits: patch.digits } : {}),
+                      ...(patch.calendar !== undefined ? { calendar: patch.calendar } : {}),
+                    }));
+                  }}
                 />
                 <div>
-                  <label className="block text-sm text-gray-500 mb-1">{t('billingType')}</label>
+                  <label className="block text-sm text-muted-foreground mb-1">{t('billingType')}</label>
                   {isAdmin ? (
                     <select value={form.billingType}
-                      onChange={(e) => setForm((p) => ({ ...p, billingType: e.target.value as 'postpaid' | 'prepaid' }))}
-                      className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand bg-white">
+                      onChange={(e) => { markHydrationTouched('billingType'); setForm((p) => ({ ...p, billingType: e.target.value as 'postpaid' | 'prepaid' })); }}
+                      className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand bg-card">
                       <option value="postpaid">{t('billingTypePostpaid')}</option>
                       <option value="prepaid">{t('billingTypePrepaid')}</option>
                     </select>
                   ) : (
-                    <p className="font-medium text-gray-900 capitalize">{form.billingType}</p>
+                    <p className="font-medium text-foreground capitalize">{form.billingType}</p>
                   )}
                 </div>
                 <div>
-                  <label className="block text-sm text-gray-500 mb-1">{t('tablesRequired')}</label>
+                  <label className="block text-sm text-muted-foreground mb-1">{t('tablesRequired')}</label>
                   {isAdmin ? (
                     <select
                       value={form.tablesRequired ? 'yes' : 'no'}
-                      onChange={(e) => setForm((p) => ({ ...p, tablesRequired: e.target.value === 'yes' }))}
-                      className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand bg-white"
+                      onChange={(e) => { markHydrationTouched('tablesRequired'); setForm((p) => ({ ...p, tablesRequired: e.target.value === 'yes' })); }}
+                      className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand bg-card"
                     >
                       <option value="yes">{t('tablesRequiredYes')}</option>
                       <option value="no">{t('tablesRequiredNo')}</option>
                     </select>
                   ) : (
-                    <p className="font-medium text-gray-900">{form.tablesRequired ? t('yes') : t('no')}</p>
+                    <p className="font-medium text-foreground">{form.tablesRequired ? t('yes') : t('no')}</p>
                   )}
                 </div>
                 <div>
-                  <label className="block text-sm text-gray-500 mb-1">{t('taxRegistered')}</label>
+                  <label className="block text-sm text-muted-foreground mb-1">{t('taxRegistered')}</label>
                   {isAdmin ? (
                     <select
                       value={form.taxRegistered ? 'yes' : 'no'}
-                      onChange={(e) => setForm((p) => ({ ...p, taxRegistered: e.target.value === 'yes' }))}
-                      className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand bg-white"
+                      onChange={(e) => { markHydrationTouched('taxRegistered'); setForm((p) => ({ ...p, taxRegistered: e.target.value === 'yes' })); }}
+                      className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand bg-card"
                     >
                       <option value="yes">{t('yes')}</option>
                       <option value="no">{t('no')}</option>
                     </select>
                   ) : (
-                    <p className="font-medium text-gray-900">{form.taxRegistered ? t('yes') : t('no')}</p>
+                    <p className="font-medium text-foreground">{form.taxRegistered ? t('yes') : t('no')}</p>
                   )}
                 </div>
                 {form.taxRegistered ? (
                   <div>
-                    <label className="block text-sm text-gray-500 mb-1">{t('taxIdLabel')}</label>
+                    <label className="block text-sm text-muted-foreground mb-1">{t('taxIdLabel')}</label>
                     {isAdmin ? (
                       <>
-                        <input type="text" value={form.taxRegistrationNumber} onChange={(e) => setForm((p) => ({ ...p, taxRegistrationNumber: e.target.value }))}
+                        <input type="text" value={form.taxRegistrationNumber} onChange={(e) => { markHydrationTouched('taxRegistrationNumber'); setForm((p) => ({ ...p, taxRegistrationNumber: e.target.value })); }}
                           placeholder={t('taxIdPlaceholder')}
-                          className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand" dir="ltr" />
+                          className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand" dir="ltr" />
                         {taxIdWarning ? (
                           <p className="mt-1 text-xs text-amber-600">
                             {t('taxIdFormatWarning', { country: form.countryCode, format: taxIdWarning })}
@@ -2574,40 +3225,40 @@ export default function SettingsPage() {
                       </>
 
                     ) : (
-                      <p className="font-medium text-gray-900"><Ltr>{form.taxRegistrationNumber || '—'}</Ltr></p>
+                      <p className="font-medium text-foreground"><Ltr>{form.taxRegistrationNumber || '—'}</Ltr></p>
                     )}
                   </div>
                 ) : <div className="hidden md:block" />}
                 <div>
-                  <label className="block text-sm text-gray-500 mb-1">{t('phone')}</label>
+                  <label className="block text-sm text-muted-foreground mb-1">{t('phone')}</label>
                   {isAdmin ? (
-                    <input type="text" value={form.businessPhone} onChange={(e) => setForm((p) => ({ ...p, businessPhone: e.target.value }))}
+                    <input type="text" value={form.businessPhone} onChange={(e) => { markHydrationTouched('businessPhone'); setForm((p) => ({ ...p, businessPhone: e.target.value })); }}
                       placeholder={t('phonePlaceholder', { dialCode: dialCodeFor(form.countryCode) || '+1' })}
-                      className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand" dir="ltr" />
+                      className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand" dir="ltr" />
                   ) : (
-                    <p className="font-medium text-gray-900"><Ltr>{form.businessPhone || '—'}</Ltr></p>
+                    <p className="font-medium text-foreground"><Ltr>{form.businessPhone || '—'}</Ltr></p>
                   )}
                 </div>
                 <div className="md:col-span-2">
-                  <label className="block text-sm text-gray-500 mb-1">{t('address')}</label>
+                  <label className="block text-sm text-muted-foreground mb-1">{t('address')}</label>
                   {isAdmin ? (
-                    <textarea value={form.businessAddress} onChange={(e) => setForm((p) => ({ ...p, businessAddress: e.target.value }))}
+                    <textarea value={form.businessAddress} onChange={(e) => { markHydrationTouched('businessAddress'); setForm((p) => ({ ...p, businessAddress: e.target.value })); }}
                       rows={2} placeholder={t('addressPlaceholder')}
-                      className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand resize-none" />
+                      className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand resize-none" />
                   ) : (
-                    <p className="font-medium text-gray-900">{form.businessAddress || '—'}</p>
+                    <p className="font-medium text-foreground">{form.businessAddress || '—'}</p>
                   )}
                 </div>
                 <div>
-                  <label className="block text-sm text-gray-500 mb-1">{t('instagramHandle')}</label>
+                  <label className="block text-sm text-muted-foreground mb-1">{t('instagramHandle')}</label>
                   {isAdmin ? (
-                    <input type="text" value={form.instagramHandle} onChange={(e) => setForm((p) => ({ ...p, instagramHandle: e.target.value }))}
+                    <input type="text" value={form.instagramHandle} onChange={(e) => { markHydrationTouched('instagramHandle'); setForm((p) => ({ ...p, instagramHandle: e.target.value })); }}
                       placeholder={t('instagramPlaceholder')}
-                      className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand" />
+                      className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand" />
                   ) : (
-                    <p className="font-medium text-gray-900">{form.instagramHandle || '—'}</p>
+                    <p className="font-medium text-foreground">{form.instagramHandle || '—'}</p>
                   )}
-                  <p className="text-xs text-gray-500 mt-1">{t('instagramHint')}</p>
+                  <p className="text-xs text-muted-foreground mt-1">{t('instagramHint')}</p>
                 </div>
               </div>
 
@@ -2618,37 +3269,40 @@ export default function SettingsPage() {
             </div>
 
             {/* Number Formats */}
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            <div className="bg-card rounded-xl border border-border p-6">
               <div className="flex items-center gap-2 mb-4">
-                <Hash size={20} className="text-gray-500" />
-                <h2 className="font-semibold text-gray-900">{t('orderNumberFormat')}</h2>
+                <Hash size={20} className="text-muted-foreground" />
+                <h2 className="font-semibold text-foreground">{t('orderNumberFormat')}</h2>
                 {!isAdmin && (
-                  <span className="ms-auto flex items-center gap-1 text-xs text-gray-400">
+                  <span className="ms-auto flex items-center gap-1 text-xs text-muted-foreground">
                     <Lock size={12} /> {t('adminOnly')}
                   </span>
                 )}
               </div>
 
-              <h3 className="text-sm font-semibold text-gray-800 mb-3">{t('orderNumbers')}</h3>
+              <h3 className="text-sm font-semibold text-foreground mb-3">{t('orderNumbers')}</h3>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-sm text-gray-500 mb-1">{t('orderNumberPrefix')}</label>
+                  <label className="block text-sm text-muted-foreground mb-1">{t('orderNumberPrefix')}</label>
                   {isAdmin ? (
                     <input
                       type="text"
                       value={orderNumberForm.prefix}
-                      onChange={(e) => setOrderNumberForm((p) => ({ ...p, prefix: e.target.value.toUpperCase() }))}
+                      onChange={(e) => {
+                        markHydrationTouched('prefix');
+                        setOrderNumberForm((p) => ({ ...p, prefix: e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '') }));
+                      }}
                       placeholder="ORD"
                       maxLength={12}
-                      className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand"
+                      className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand"
                     />
                   ) : (
-                    <p className="font-medium text-gray-900">{orderNumberForm.prefix || '—'}</p>
+                    <p className="font-medium text-foreground">{orderNumberForm.prefix || '—'}</p>
                   )}
                 </div>
                 <div>
-                  <label className="block text-sm text-gray-500 mb-1">{t('orderNumberPreview')}</label>
-                  <p className="font-mono font-medium text-gray-900 px-3 py-2 bg-gray-50 rounded-lg border border-gray-100">
+                  <label className="block text-sm text-muted-foreground mb-1">{t('orderNumberPreview')}</label>
+                  <p className="font-mono font-medium text-foreground px-3 py-2 bg-muted rounded-lg border border-border">
                     <Ltr>{[
                       orderNumberForm.prefix,
                       orderNumberForm.includeDate ? new Date().toISOString().slice(0, 10).replace(/-/g, '') : '',
@@ -2658,50 +3312,59 @@ export default function SettingsPage() {
                 </div>
               </div>
 
-              <div className="mt-5 pt-5 border-t border-gray-100 space-y-3">
+              <div className="mt-5 pt-5 border-t border-border space-y-3">
                 <div className="flex items-center justify-between py-2">
                   <div>
-                    <span className="text-sm text-gray-700">{t('orderNumberIncludeDate')}</span>
-                    <p className="text-xs text-gray-500">{t('orderNumberIncludeDateHint')}</p>
+                    <span className="text-sm text-foreground">{t('orderNumberIncludeDate')}</span>
+                    <p className="text-xs text-muted-foreground">{t('orderNumberIncludeDateHint')}</p>
                   </div>
                   <Toggle
                     value={orderNumberForm.includeDate}
-                    onChange={isAdmin ? (v) => setOrderNumberForm((p) => ({ ...p, includeDate: v })) : () => {}}
+                    onChange={isAdmin ? (v) => {
+                      markHydrationTouched('includeDate');
+                      setOrderNumberForm((p) => ({ ...p, includeDate: v }));
+                    } : () => {}}
                   />
                 </div>
                 <div className="flex items-center justify-between py-2">
                   <div>
-                    <span className="text-sm text-gray-700">{t('orderNumberResetDaily')}</span>
-                    <p className="text-xs text-gray-500">{t('orderNumberResetDailyHint')}</p>
+                    <span className="text-sm text-foreground">{t('orderNumberResetDaily')}</span>
+                    <p className="text-xs text-muted-foreground">{t('orderNumberResetDailyHint')}</p>
                   </div>
                   <Toggle
                     value={orderNumberForm.resetDaily}
-                    onChange={isAdmin ? (v) => setOrderNumberForm((p) => ({ ...p, resetDaily: v })) : () => {}}
+                    onChange={isAdmin ? (v) => {
+                      markHydrationTouched('resetDaily');
+                      setOrderNumberForm((p) => ({ ...p, resetDaily: v }));
+                    } : () => {}}
                   />
                 </div>
               </div>
 
-              <div className="mt-6 pt-5 border-t border-gray-100">
-                <h3 className="text-sm font-semibold text-gray-800 mb-3">{t('invoiceNumbers')}</h3>
+              <div className="mt-6 pt-5 border-t border-border">
+                <h3 className="text-sm font-semibold text-foreground mb-3">{t('invoiceNumbers')}</h3>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div>
-                    <label className="block text-sm text-gray-500 mb-1">{t('invoiceNumberPrefix')}</label>
+                    <label className="block text-sm text-muted-foreground mb-1">{t('invoiceNumberPrefix')}</label>
                     {isAdmin ? (
                       <input
                         type="text"
                         value={orderNumberForm.invoicePrefix}
-                        onChange={(e) => setOrderNumberForm((p) => ({ ...p, invoicePrefix: e.target.value.toUpperCase() }))}
+                        onChange={(e) => {
+                          markHydrationTouched('invoicePrefix');
+                          setOrderNumberForm((p) => ({ ...p, invoicePrefix: e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '') }));
+                        }}
                         placeholder="INV"
                         maxLength={12}
-                        className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand"
+                        className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand"
                       />
                     ) : (
-                      <p className="font-medium text-gray-900">{orderNumberForm.invoicePrefix || '—'}</p>
+                      <p className="font-medium text-foreground">{orderNumberForm.invoicePrefix || '—'}</p>
                     )}
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-500 mb-1">{t('invoiceNumberPreview')}</label>
-                    <p className="font-mono font-medium text-gray-900 px-3 py-2 bg-gray-50 rounded-lg border border-gray-100">
+                    <label className="block text-sm text-muted-foreground mb-1">{t('invoiceNumberPreview')}</label>
+                    <p className="font-mono font-medium text-foreground px-3 py-2 bg-muted rounded-lg border border-border">
                       <Ltr>{[
                         orderNumberForm.invoicePrefix,
                         orderNumberForm.invoiceIncludePeriod ? invoicePreviewSegment(
@@ -2714,12 +3377,15 @@ export default function SettingsPage() {
                     </p>
                   </div>
                   <div>
-                    <label className="block text-sm text-gray-500 mb-1">{t('invoiceResetPeriod')}</label>
+                    <label className="block text-sm text-muted-foreground mb-1">{t('invoiceResetPeriod')}</label>
                     {isAdmin ? (
                       <select
                         value={orderNumberForm.invoiceResetPeriod}
-                        onChange={(e) => setOrderNumberForm((p) => ({ ...p, invoiceResetPeriod: e.target.value as InvoiceResetPeriod }))}
-                        className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand bg-white"
+                        onChange={(e) => {
+                          markHydrationTouched('invoiceResetPeriod');
+                          setOrderNumberForm((p) => ({ ...p, invoiceResetPeriod: e.target.value as InvoiceResetPeriod }));
+                        }}
+                        className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand bg-card"
                       >
                         <option value="daily">{t('invoiceResetDaily')}</option>
                         <option value="monthly">{t('invoiceResetMonthly')}</option>
@@ -2727,48 +3393,57 @@ export default function SettingsPage() {
                         <option value="never">{t('invoiceResetNever')}</option>
                       </select>
                     ) : (
-                      <p className="font-medium text-gray-900">{orderNumberForm.invoiceResetPeriod.replace('_', ' ')}</p>
+                      <p className="font-medium text-foreground">{orderNumberForm.invoiceResetPeriod.replace('_', ' ')}</p>
                     )}
                   </div>
                   {orderNumberForm.invoiceResetPeriod === 'financial_year' && (
                     <div className="grid grid-cols-2 gap-3">
                       <div>
-                        <label className="block text-sm text-gray-500 mb-1">{t('financialYearStartMonth')}</label>
+                        <label className="block text-sm text-muted-foreground mb-1">{t('financialYearStartMonth')}</label>
                         <input
                           type="number"
                           min={1}
                           max={12}
                           value={orderNumberForm.invoiceFinancialYearStartMonth}
                           disabled={!isAdmin}
-                          onChange={(e) => setOrderNumberForm((p) => ({ ...p, invoiceFinancialYearStartMonth: Number(e.target.value) }))}
-                          className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand disabled:bg-gray-50"
+                          onChange={(e) => {
+                            markHydrationTouched('invoiceFinancialYearStartMonth');
+                            setOrderNumberForm((p) => ({ ...p, invoiceFinancialYearStartMonth: Number(e.target.value) }));
+                          }}
+                          className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand disabled:bg-muted"
                         />
                       </div>
                       <div>
-                        <label className="block text-sm text-gray-500 mb-1">{t('financialYearStartDay')}</label>
+                        <label className="block text-sm text-muted-foreground mb-1">{t('financialYearStartDay')}</label>
                         <input
                           type="number"
                           min={1}
                           max={31}
                           value={orderNumberForm.invoiceFinancialYearStartDay}
                           disabled={!isAdmin}
-                          onChange={(e) => setOrderNumberForm((p) => ({ ...p, invoiceFinancialYearStartDay: Number(e.target.value) }))}
-                          className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand disabled:bg-gray-50"
+                          onChange={(e) => {
+                            markHydrationTouched('invoiceFinancialYearStartDay');
+                            setOrderNumberForm((p) => ({ ...p, invoiceFinancialYearStartDay: Number(e.target.value) }));
+                          }}
+                          className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand disabled:bg-muted"
                         />
                       </div>
                     </div>
                   )}
                 </div>
 
-                <div className="mt-5 pt-5 border-t border-gray-100">
+                <div className="mt-5 pt-5 border-t border-border">
                   <div className="flex items-center justify-between py-2">
                     <div>
-                      <span className="text-sm text-gray-700">{t('invoiceNumberIncludePeriod')}</span>
-                      <p className="text-xs text-gray-500">{t('invoiceNumberIncludePeriodHint')}</p>
+                      <span className="text-sm text-foreground">{t('invoiceNumberIncludePeriod')}</span>
+                      <p className="text-xs text-muted-foreground">{t('invoiceNumberIncludePeriodHint')}</p>
                     </div>
                     <Toggle
                       value={orderNumberForm.invoiceIncludePeriod}
-                      onChange={isAdmin ? (v) => setOrderNumberForm((p) => ({ ...p, invoiceIncludePeriod: v })) : () => {}}
+                      onChange={isAdmin ? (v) => {
+                        markHydrationTouched('invoiceIncludePeriod');
+                        setOrderNumberForm((p) => ({ ...p, invoiceIncludePeriod: v }));
+                      } : () => {}}
                     />
                   </div>
                 </div>
@@ -2777,18 +3452,18 @@ export default function SettingsPage() {
 
 
             {/* Subscription */}
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            <div className="bg-card rounded-xl border border-border p-6">
               <div className="flex items-center gap-2 mb-4">
-                <CreditCard size={20} className="text-gray-500" />
-                <h2 className="font-semibold text-gray-900">{t('subscription')}</h2>
+                <CreditCard size={20} className="text-muted-foreground" />
+                <h2 className="font-semibold text-foreground">{t('subscription')}</h2>
               </div>
               <div className="space-y-3">
                 <div>
-                  <p className="text-sm text-gray-500">{t('plan')}</p>
-                  <p className="font-medium text-gray-900 capitalize">{currentTenant?.plan}</p>
+                  <p className="text-sm text-muted-foreground">{t('plan')}</p>
+                  <p className="font-medium text-foreground capitalize">{currentTenant?.plan}</p>
                 </div>
                 <div>
-                  <p className="text-sm text-gray-500">{t('status')}</p>
+                  <p className="text-sm text-muted-foreground">{t('status')}</p>
                   <span className={`px-2.5 py-1 rounded-full text-xs font-medium ${
                     currentTenant?.status === 'active' ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
                   }`}>
@@ -2796,7 +3471,7 @@ export default function SettingsPage() {
                   </span>
                 </div>
                 <div>
-                  <p className="text-sm text-gray-500 mb-1">{t('languages')}</p>
+                  <p className="text-sm text-muted-foreground mb-1">{t('languages')}</p>
                   <select
                     value={language}
                     onChange={(e) => {
@@ -2804,7 +3479,7 @@ export default function SettingsPage() {
                       setLanguage(lang);
                       api.put('/settings/business', { language: lang }).catch(() => toast.error(t('saveFailed')));
                     }}
-                    className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand bg-white"
+                    className="block w-full rounded-md border border-border bg-card shadow-sm focus:border-brand focus:ring-brand sm:text-sm px-3 py-2 text-foreground"
                   >
                     {SELECTABLE_LANGUAGES.map((lang) => (
                       <option key={lang} value={lang}>{LANGUAGES[lang].nativeName}</option>
@@ -2825,25 +3500,75 @@ export default function SettingsPage() {
         <TabsContent value="currencies">
           <CurrenciesPanel isAdmin={isAdmin} />
         </TabsContent>
+=======
+        {isAdmin && (
+        <TabsContent value="appearance">
+          <div className="pb-6 max-w-3xl space-y-6">
+            <div className="bg-card rounded-xl border border-border p-6">
+              <div className="flex items-center gap-2 mb-4">
+                <SunMoon size={20} className="text-muted-foreground" />
+                <h2 className="font-semibold text-foreground">{t('themeTitle')}</h2>
+              </div>
+              <div
+                className="flex gap-3"
+                role="radiogroup"
+                aria-label={t('themeTitle')}
+              >
+                {(['light', 'dark', 'system'] as const).map((m) => {
+                  const active = themeMode === m;
+                  const label = m === 'light' ? t('themeLight') : m === 'dark' ? t('themeDark') : t('themeSystem');
+                  return (
+                    <button
+                      key={m}
+                      type="button"
+                      role="radio"
+                      aria-checked={active}
+                      disabled={savingTheme}
+                      onClick={() => { if (!active) saveThemeMode(m); }}
+                      className={`text-start rounded-lg border-2 px-4 py-3 transition flex-1 ${
+                        active
+                          ? 'border-brand bg-brand/5'
+                          : 'border-border hover:border-gray-300 dark:border-border'
+                      } ${savingTheme ? 'opacity-60 cursor-not-allowed' : ''}`}
+                    >
+                      <div className="flex items-center gap-2">
+                        <span
+                          aria-hidden="true"
+                          className={`inline-block w-4 h-4 rounded-full border-2 flex items-center justify-center ${
+                            active ? 'border-brand' : 'border-gray-300 dark:border-border'
+                          }`}
+                        >
+                          {active && <span className="block w-2 h-2 rounded-full bg-brand" />}
+                        </span>
+                        <span className="font-medium text-foreground">{label}</span>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        </TabsContent>
+        )}
 
         {canViewTaxConfiguration && (
           <TabsContent value="tax">
-            <TaxConfigurationPanel isOwner={currentTenant?.role === 'owner'} />
+            <TaxConfigurationPanel isOwner={isOwner} />
           </TabsContent>
         )}
 
         <TabsContent value="pos">
           <div className="pb-6 max-w-3xl space-y-6">
             {/* POS Display */}
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            <div className="bg-card rounded-xl border border-border p-6">
               <div className="flex items-center gap-2 mb-4">
-                <Monitor size={20} className="text-gray-500" />
-                <h2 className="font-semibold text-gray-900">{t('posDisplay')}</h2>
+                <Monitor size={20} className="text-muted-foreground" />
+                <h2 className="font-semibold text-foreground">{t('posDisplay')}</h2>
               </div>
               <div className="flex items-center justify-between gap-4">
                 <div className="flex-1 min-w-0">
-                  <p className="font-medium text-gray-900">{t('showProductImages')}</p>
-                  <p className="text-sm text-gray-500">{t('showProductImagesHint')}</p>
+                  <p className="font-medium text-foreground">{t('showProductImages')}</p>
+                  <p className="text-sm text-muted-foreground">{t('showProductImagesHint')}</p>
                 </div>
                 <Toggle value={posSettings.showProductImages} onChange={(v) => {
                   posSettings.setShowProductImages(v);
@@ -2853,27 +3578,27 @@ export default function SettingsPage() {
             </div>
 
             {/* POS Workflow */}
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            <div className="bg-card rounded-xl border border-border p-6">
               <div className="flex items-center gap-2 mb-4">
-                <Users size={20} className="text-gray-500" />
-                <h2 className="font-semibold text-gray-900">{t('posWorkflow')}</h2>
+                <Users size={20} className="text-muted-foreground" />
+                <h2 className="font-semibold text-foreground">{t('posWorkflow')}</h2>
               </div>
               <div className="space-y-4">
                 <div className="flex items-center justify-between gap-4">
                   <div className="flex-1 min-w-0">
-                    <p className="font-medium text-gray-900">{t('customerMandatory')}</p>
-                    <p className="text-sm text-gray-500">{t('customerMandatoryHint')}</p>
+                    <p className="font-medium text-foreground">{t('customerMandatory')}</p>
+                    <p className="text-sm text-muted-foreground">{t('customerMandatoryHint')}</p>
                   </div>
                   <Toggle value={posSettings.customerMandatory} onChange={(v) => {
                     posSettings.setCustomerMandatory(v);
                     toast.success(v ? t('customerMandatoryEnabled') : t('customerMandatoryDisabled'), { id: 'pos-local' });
                   }} />
                 </div>
-                <p className="text-sm text-gray-500">{t('phoneDigitsDerived')}</p>
-                <div className="flex items-center justify-between gap-4 pt-2 border-t border-gray-100">
+                <p className="text-sm text-muted-foreground">{t('phoneDigitsDerived')}</p>
+                <div className="flex items-center justify-between gap-4 pt-2 border-t border-border">
                   <div className="flex-1 min-w-0">
-                    <p className="font-medium text-gray-900">{t('enforcePhoneLength')}</p>
-                    <p className="text-sm text-gray-500">{t('enforcePhoneLengthHint')}</p>
+                    <p className="font-medium text-foreground">{t('enforcePhoneLength')}</p>
+                    <p className="text-sm text-muted-foreground">{t('enforcePhoneLengthHint')}</p>
                   </div>
                   <Toggle value={posSettings.enforcePhoneLength} onChange={(v) => {
                     posSettings.setEnforcePhoneLength(v);
@@ -2884,12 +3609,12 @@ export default function SettingsPage() {
             </div>
 
             {/* Add a cashier — pair another device onto the same POS over the local network */}
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            <div className="bg-card rounded-xl border border-border p-6">
               <div className="flex items-center gap-2 mb-4">
-                <Smartphone size={20} className="text-gray-500" />
-                <h2 className="font-semibold text-gray-900">{t('posPairing')}</h2>
+                <Smartphone size={20} className="text-muted-foreground" />
+                <h2 className="font-semibold text-foreground">{t('posPairing')}</h2>
               </div>
-              <p className="text-sm text-gray-500 mb-5">
+              <p className="text-sm text-muted-foreground mb-5">
                 {t('posPairingHint')}
               </p>
 
@@ -2905,15 +3630,15 @@ export default function SettingsPage() {
                     <>
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 w-full">
                         {posInfo.ips_data.map((ipInfo: { ip: string; url: string; qr_data: string | null }, idx: number) => (
-                          <div key={idx} className="flex flex-col items-center p-4 bg-gray-50 border border-gray-200 rounded-lg">
-                            <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">
+                          <div key={idx} className="flex flex-col items-center p-4 bg-muted border border-border rounded-lg">
+                            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-3">
                               {ipInfo.ip.startsWith('100.') ? t('vpnMeshNetwork') : t('localNetwork')}
                             </p>
                             {ipInfo.qr_data ? (
-                              <img src={ipInfo.qr_data} alt={`QR Code for ${ipInfo.ip}`} className="w-40 h-40 rounded-lg mb-3 bg-white p-2 border border-gray-100" />
+                              <img src={ipInfo.qr_data} alt={`QR Code for ${ipInfo.ip}`} className="w-40 h-40 rounded-lg mb-3 bg-card p-2 border border-border" />
                             ) : (
-                              <div className="w-40 h-40 bg-gray-100 rounded-lg flex items-center justify-center mb-3">
-                                <QrCode size={40} className="text-gray-400" />
+                              <div className="w-40 h-40 bg-muted rounded-lg flex items-center justify-center mb-3">
+                                <QrCode size={40} className="text-muted-foreground" />
                               </div>
                             )}
                             <Ltr as="a" href={ipInfo.url} target="_blank" rel="noopener noreferrer" className="text-xs font-mono text-brand hover:underline break-all text-center">
@@ -2922,14 +3647,14 @@ export default function SettingsPage() {
                           </div>
                         ))}
                       </div>
-                      <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                      <div className="bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800/40 rounded-lg p-4">
                         <div className="flex items-start gap-3">
                           <div className="flex-1">
-                            <p className="text-xs font-semibold text-blue-700 uppercase tracking-wide mb-1">{t('appleDevices')}</p>
-                            <Ltr as="a" href={posInfo.mdns_url} target="_blank" rel="noopener noreferrer" className="block font-mono text-sm text-blue-600 break-all hover:underline">
+                            <p className="text-xs font-semibold text-blue-700 dark:text-blue-300 uppercase tracking-wide mb-1">{t('appleDevices')}</p>
+                            <Ltr as="a" href={posInfo.mdns_url} target="_blank" rel="noopener noreferrer" className="block font-mono text-sm text-blue-600 dark:text-blue-400 break-all hover:underline">
                               {posInfo.mdns_url}
                             </Ltr>
-                            <p className="text-xs text-blue-600 mt-2">
+                            <p className="text-xs text-blue-600 dark:text-blue-400 mt-2">
                               {t('appleDevicesHint')}
                             </p>
                           </div>
@@ -2940,23 +3665,23 @@ export default function SettingsPage() {
                     <div className="flex flex-col sm:flex-row gap-6 items-start">
                       <div className="shrink-0">
                         {posInfo.qr_data_url ? (
-                          <img src={posInfo.qr_data_url} alt={t('posQrAlt')} className="w-48 h-48 rounded-xl border border-gray-200" />
+                          <img src={posInfo.qr_data_url} alt={t('posQrAlt')} className="w-48 h-48 rounded-xl border border-border" />
                         ) : (
-                          <div className="w-48 h-48 rounded-xl border border-gray-200 flex items-center justify-center text-gray-400">
+                          <div className="w-48 h-48 rounded-xl border border-border flex items-center justify-center text-muted-foreground">
                             <QrCode size={48} />
                           </div>
                         )}
                       </div>
                       <div className="flex-1 space-y-4">
                         <div>
-                          <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">{t('directIp')}</p>
+                          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-1">{t('directIp')}</p>
                           <Ltr as="a" href={posInfo.ip_url} target="_blank" rel="noopener noreferrer" className="block font-mono text-sm text-brand break-all hover:underline">
                             {posInfo.ip_url}
                           </Ltr>
                         </div>
                         <div>
-                          <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">{t('mdnsAlwaysStable')}</p>
-                          <Ltr as="a" href={posInfo.mdns_url} target="_blank" rel="noopener noreferrer" className="block font-mono text-sm text-gray-700 break-all hover:underline">
+                          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-1">{t('mdnsAlwaysStable')}</p>
+                          <Ltr as="a" href={posInfo.mdns_url} target="_blank" rel="noopener noreferrer" className="block font-mono text-sm text-foreground break-all hover:underline">
                             {posInfo.mdns_url}
                           </Ltr>
                         </div>
@@ -2964,9 +3689,9 @@ export default function SettingsPage() {
                     </div>
                   )}
 
-                  <div className="flex justify-end border-t border-gray-200 pt-4">
+                  <div className="flex justify-end border-t border-border pt-4">
                     <button onClick={fetchPosInfo} disabled={posInfoLoading}
-                      className="flex items-center gap-2 text-sm text-gray-500 hover:text-gray-800">
+                      className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground">
                       <RefreshCw size={14} className={posInfoLoading ? 'animate-spin' : ''} />
                       {t('refreshUrls')}
                     </button>
@@ -2976,7 +3701,7 @@ export default function SettingsPage() {
 
               {!posInfo && !posInfoLoading && (
                 <>
-                  <p className="text-sm text-gray-500 mb-3">
+                  <p className="text-sm text-muted-foreground mb-3">
                     {t('posLoadHint')}
                   </p>
                   <button onClick={fetchPosInfo}
@@ -2992,19 +3717,19 @@ export default function SettingsPage() {
         {/* Kitchen Display — own tab under Operations */}
         <TabsContent value="kds">
           <div className="pb-6 max-w-3xl space-y-6">
-            {/* KDS on/off (issue #133) — not every business runs a Kitchen Display. */}
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            {/* Kitchen Display System enable toggle */}
+            <div className="bg-card rounded-xl border border-border p-6">
               <div className="flex items-center justify-between gap-4">
                 <div className="flex-1 min-w-0">
-                  <p className="font-medium text-gray-900">{t('kdsEnabledToggle')}</p>
-                  <p className="text-sm text-gray-500">{t('kdsEnabledToggleHint')}</p>
+                  <p className="font-medium text-foreground">{t('kdsEnabledToggle')}</p>
+                  <p className="text-sm text-muted-foreground">{t('kdsEnabledToggleHint')}</p>
                 </div>
                 <Toggle value={kdsEnabledSetting} onChange={(v) => { if (!savingKdsEnabled) saveKdsEnabled(v); }} />
               </div>
               {!kdsEnabledSetting && !kotPrintingEnabledSetting && (
-                <div className="mt-4 flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded-lg">
-                  <AlertTriangle size={16} className="text-amber-600 shrink-0 mt-0.5" />
-                  <p className="text-xs text-amber-800">
+                <div className="mt-4 flex items-start gap-2 p-3 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/40 rounded-lg">
+                  <AlertTriangle size={16} className="text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+                  <p className="text-xs text-amber-800 dark:text-amber-300">
                     {t('kitchenWorkflowBothOffNote')}
                   </p>
                 </div>
@@ -3012,18 +3737,18 @@ export default function SettingsPage() {
             </div>
 
             {!kdsEnabledSetting && (
-              <p className="text-sm text-gray-400 italic">
+              <p className="text-sm text-muted-foreground italic">
                 {t('kdsPairingHiddenHint')}
               </p>
             )}
 
             {kdsEnabledSetting && (
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            <div className="bg-card rounded-xl border border-border p-6">
               <div className="flex items-center gap-2 mb-4">
-                <ChefHat size={20} className="text-gray-500" />
-                <h2 className="font-semibold text-gray-900">{t('kds')}</h2>
+                <ChefHat size={20} className="text-muted-foreground" />
+                <h2 className="font-semibold text-foreground">{t('kds')}</h2>
               </div>
-              <p className="text-sm text-gray-500 mb-5">
+              <p className="text-sm text-muted-foreground mb-5">
                 {t('kdsPairingHint')}
               </p>
 
@@ -3039,15 +3764,15 @@ export default function SettingsPage() {
                     <>
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 w-full">
                         {kdsInfo.ips_data.map((ipInfo: { ip: string; url: string; qr_data: string | null }, idx: number) => (
-                          <div key={idx} className="flex flex-col items-center p-4 bg-gray-50 border border-gray-200 rounded-lg">
-                            <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">
+                          <div key={idx} className="flex flex-col items-center p-4 bg-muted border border-border rounded-lg">
+                            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-3">
                               {ipInfo.ip.startsWith('100.') ? t('vpnMeshNetwork') : t('localNetwork')}
                             </p>
                             {ipInfo.qr_data ? (
-                              <img src={ipInfo.qr_data} alt={`QR Code for ${ipInfo.ip}`} className="w-40 h-40 rounded-lg mb-3 bg-white p-2 border border-gray-100" />
+                              <img src={ipInfo.qr_data} alt={`QR Code for ${ipInfo.ip}`} className="w-40 h-40 rounded-lg mb-3 bg-card p-2 border border-border" />
                             ) : (
-                              <div className="w-40 h-40 bg-gray-100 rounded-lg flex items-center justify-center mb-3">
-                                <QrCode size={40} className="text-gray-400" />
+                              <div className="w-40 h-40 bg-muted rounded-lg flex items-center justify-center mb-3">
+                                <QrCode size={40} className="text-muted-foreground" />
                               </div>
                             )}
                             <Ltr as="a" href={ipInfo.url} target="_blank" rel="noopener noreferrer" className="text-xs font-mono text-brand hover:underline break-all text-center">
@@ -3056,14 +3781,14 @@ export default function SettingsPage() {
                           </div>
                         ))}
                       </div>
-                      <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                      <div className="bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800/40 rounded-lg p-4">
                         <div className="flex items-start gap-3">
                           <div className="flex-1">
-                            <p className="text-xs font-semibold text-blue-700 uppercase tracking-wide mb-1">{t('appleDevices')}</p>
-                            <Ltr as="a" href={kdsInfo.mdns_url} target="_blank" rel="noopener noreferrer" className="block font-mono text-sm text-blue-600 break-all hover:underline">
+                            <p className="text-xs font-semibold text-blue-700 dark:text-blue-300 uppercase tracking-wide mb-1">{t('appleDevices')}</p>
+                            <Ltr as="a" href={kdsInfo.mdns_url} target="_blank" rel="noopener noreferrer" className="block font-mono text-sm text-blue-600 dark:text-blue-400 break-all hover:underline">
                               {kdsInfo.mdns_url}
                             </Ltr>
-                            <p className="text-xs text-blue-600 mt-2">
+                            <p className="text-xs text-blue-600 dark:text-blue-400 mt-2">
                               {t('appleDevicesHint')}
                             </p>
                           </div>
@@ -3074,23 +3799,23 @@ export default function SettingsPage() {
                     <div className="flex flex-col sm:flex-row gap-6 items-start">
                       <div className="shrink-0">
                         {kdsInfo.qr_data_url ? (
-                          <img src={kdsInfo.qr_data_url} alt={t('kdsQrAlt')} className="w-48 h-48 rounded-xl border border-gray-200" />
+                          <img src={kdsInfo.qr_data_url} alt={t('kdsQrAlt')} className="w-48 h-48 rounded-xl border border-border" />
                         ) : (
-                          <div className="w-48 h-48 rounded-xl border border-gray-200 flex items-center justify-center text-gray-400">
+                          <div className="w-48 h-48 rounded-xl border border-border flex items-center justify-center text-muted-foreground">
                             <QrCode size={48} />
                           </div>
                         )}
                       </div>
                       <div className="flex-1 space-y-4">
                         <div>
-                          <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">{t('directIp')}</p>
+                          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-1">{t('directIp')}</p>
                           <Ltr as="a" href={kdsInfo.ip_url} target="_blank" rel="noopener noreferrer" className="block font-mono text-sm text-brand break-all hover:underline">
                             {kdsInfo.ip_url}
                           </Ltr>
                         </div>
                         <div>
-                          <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">{t('mdnsAlwaysStable')}</p>
-                          <Ltr as="a" href={kdsInfo.mdns_url} target="_blank" rel="noopener noreferrer" className="block font-mono text-sm text-gray-700 break-all hover:underline">
+                          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-1">{t('mdnsAlwaysStable')}</p>
+                          <Ltr as="a" href={kdsInfo.mdns_url} target="_blank" rel="noopener noreferrer" className="block font-mono text-sm text-foreground break-all hover:underline">
                             {kdsInfo.mdns_url}
                           </Ltr>
                         </div>
@@ -3098,9 +3823,9 @@ export default function SettingsPage() {
                     </div>
                   )}
 
-                  <div className="flex justify-end border-t border-gray-200 pt-4">
-                    <button onClick={fetchKdsInfo} disabled={kdsInfoLoading}
-                      className="flex items-center gap-2 text-sm text-gray-500 hover:text-gray-800">
+                  <div className="flex justify-end border-t border-border pt-4">
+                    <button onClick={() => { void fetchKdsInfo(); }} disabled={kdsInfoLoading}
+                      className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground">
                       <RefreshCw size={14} className={kdsInfoLoading ? 'animate-spin' : ''} />
                       {t('refreshUrls')}
                     </button>
@@ -3110,10 +3835,10 @@ export default function SettingsPage() {
 
               {!kdsInfo && !kdsInfoLoading && (
                 <>
-                  <p className="text-sm text-gray-500 mb-3">
+                  <p className="text-sm text-muted-foreground mb-3">
                     {t('kdsLoadHint')}
                   </p>
-                  <button onClick={fetchKdsInfo}
+                  <button onClick={() => { void fetchKdsInfo(); }}
                     className="px-4 py-2 text-sm bg-brand text-white rounded-lg hover:opacity-90 font-medium">
                     {t('loadKdsInfo')}
                   </button>
@@ -3122,11 +3847,11 @@ export default function SettingsPage() {
             </div>
             )}
 
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            <div className="bg-card rounded-xl border border-border p-6">
               <div className="flex items-center justify-between mb-4">
                 <div className="flex items-center gap-2">
-                  <ChefHat size={20} className="text-gray-500" />
-                  <h2 className="font-semibold text-gray-900">{t('kitchenStations')}</h2>
+                  <ChefHat size={20} className="text-muted-foreground" />
+                  <h2 className="font-semibold text-foreground">{t('kitchenStations')}</h2>
                 </div>
                 <button onClick={openAddStation}
                   className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-brand text-white rounded-lg hover:opacity-90 font-medium">
@@ -3134,10 +3859,10 @@ export default function SettingsPage() {
                   {t('addStation')}
                 </button>
               </div>
-              <p className="text-sm text-gray-500 mb-5">{t('kitchenStationsHint')}</p>
+              <p className="text-sm text-muted-foreground mb-5">{t('kitchenStationsHint')}</p>
 
               {stations.length === 0 ? (
-                <p className="text-sm text-gray-400 py-4 text-center">{t('noStationsYet')}</p>
+                <p className="text-sm text-muted-foreground py-4 text-center">{t('noStationsYet')}</p>
               ) : (
                 <div className="space-y-2">
                   {stations.map((station) => {
@@ -3149,10 +3874,10 @@ export default function SettingsPage() {
                     const printer = hwPrinters.find((p) => p.id === station.printer_id);
                     const users = stationUsersByStation[station.id] || [];
                     return (
-                      <div key={station.id} className="flex items-center justify-between p-3 border border-gray-100 rounded-lg">
+                      <div key={station.id} className="flex items-center justify-between p-3 border border-border rounded-lg">
                         <div className="min-w-0">
-                          <p className="font-medium text-gray-900">{station.name}</p>
-                          <p className="text-xs text-gray-500 mt-0.5">
+                          <p className="font-medium text-foreground">{station.name}</p>
+                          <p className="text-xs text-muted-foreground mt-0.5">
                             {categoryNames.length > 0 ? categoryNames.join(', ') : t('stationNoCategories')}
                             {' · '}
                             {printer ? printer.name : t('stationNoPrinter')}
@@ -3161,11 +3886,11 @@ export default function SettingsPage() {
                         </div>
                         <div className="flex items-center gap-1 shrink-0">
                           <button onClick={() => openEditStation(station)}
-                            className="px-2 py-1 text-xs text-gray-600 hover:text-gray-900 hover:bg-gray-50 rounded">
+                            className="px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-muted rounded">
                             {tCommon('edit')}
                           </button>
                           <button onClick={() => deleteStation(station.id)}
-                            className="p-1.5 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded">
+                            className="p-1.5 text-muted-foreground hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 rounded">
                             <Trash2 size={14} />
                           </button>
                         </div>
@@ -3184,24 +3909,24 @@ export default function SettingsPage() {
                     </DialogHeader>
                     <div className="space-y-4 py-2">
                       <div>
-                        <label className="block text-sm font-medium text-gray-700 mb-1">{t('stationName')}</label>
+                        <label className="block text-sm font-medium text-foreground mb-1">{t('stationName')}</label>
                         <input type="text" value={stationForm.name}
                           onChange={(e) => setStationForm((f) => ({ ...f, name: e.target.value }))}
                           placeholder={t('stationNamePlaceholder')}
-                          className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm" />
+                          className="w-full px-3 py-2 border border-border rounded-lg text-sm" />
                       </div>
 
                       <div>
-                        <label className="block text-sm font-medium text-gray-700 mb-1">{t('stationCategories')}</label>
+                        <label className="block text-sm font-medium text-foreground mb-1">{t('stationCategories')}</label>
                         {stationCategories.length === 0 ? (
-                          <p className="text-xs text-gray-400">{t('noCategoriesYet')}</p>
+                          <p className="text-xs text-muted-foreground">{t('noCategoriesYet')}</p>
                         ) : (
                           <div className="flex flex-wrap gap-2 max-h-32 overflow-y-auto">
                             {stationCategories.map((cat) => (
-                              <label key={cat.id} className="flex items-center gap-1.5 px-2.5 py-1 border border-gray-200 rounded-full text-xs cursor-pointer hover:bg-gray-50">
+                              <label key={cat.id} className="flex items-center gap-1.5 px-2.5 py-1 border border-border rounded-full text-xs cursor-pointer hover:bg-muted">
                                 <input type="checkbox" checked={stationForm.category_ids.includes(cat.id)}
                                   onChange={() => toggleStationFormValue('category_ids', cat.id)}
-                                  className="rounded border-gray-300 text-brand focus:ring-brand" />
+                                  className="rounded border-gray-300 dark:border-border text-brand focus:ring-brand" />
                                 {cat.name}
                               </label>
                             ))}
@@ -3210,10 +3935,10 @@ export default function SettingsPage() {
                       </div>
 
                       <div>
-                        <label className="block text-sm font-medium text-gray-700 mb-1">{t('stationPrinter')}</label>
+                        <label className="block text-sm font-medium text-foreground mb-1">{t('stationPrinter')}</label>
                         <select value={stationForm.printer_id}
                           onChange={(e) => setStationForm((f) => ({ ...f, printer_id: e.target.value }))}
-                          className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm bg-white">
+                          className="w-full px-3 py-2 border border-border rounded-lg text-sm bg-card">
                           <option value="">{t('stationUseDefaultPrinter')}</option>
                           {hwPrinters.map((p) => (
                             <option key={p.id} value={p.id}>{p.name}</option>
@@ -3222,16 +3947,16 @@ export default function SettingsPage() {
                       </div>
 
                       <div>
-                        <label className="block text-sm font-medium text-gray-700 mb-1">{t('stationStaff')}</label>
+                        <label className="block text-sm font-medium text-foreground mb-1">{t('stationStaff')}</label>
                         {stationStaff.length === 0 ? (
-                          <p className="text-xs text-gray-400">{t('noStaffYet')}</p>
+                          <p className="text-xs text-muted-foreground">{t('noStaffYet')}</p>
                         ) : (
                           <div className="flex flex-wrap gap-2 max-h-32 overflow-y-auto">
                             {stationStaff.map((u) => (
-                              <label key={u.id} className="flex items-center gap-1.5 px-2.5 py-1 border border-gray-200 rounded-full text-xs cursor-pointer hover:bg-gray-50">
+                              <label key={u.id} className="flex items-center gap-1.5 px-2.5 py-1 border border-border rounded-full text-xs cursor-pointer hover:bg-muted">
                                 <input type="checkbox" checked={stationForm.user_ids.includes(u.id)}
                                   onChange={() => toggleStationFormValue('user_ids', u.id)}
-                                  className="rounded border-gray-300 text-brand focus:ring-brand" />
+                                  className="rounded border-gray-300 dark:border-border text-brand focus:ring-brand" />
                                 {u.name}
                               </label>
                             ))}
@@ -3252,7 +3977,7 @@ export default function SettingsPage() {
 
             <KdsDefaultViewCard />
 
-            <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 text-sm text-blue-800">
+            <div className="bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800/40 rounded-xl p-4 text-sm text-blue-800 dark:text-blue-300">
               <strong>{t('howItWorks')}</strong> {t('howItWorksBody')}
             </div>
           </div>
@@ -3260,11 +3985,11 @@ export default function SettingsPage() {
 
         <TabsContent value="server-app">
           <div className="pb-6 max-w-3xl space-y-6">
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            <div className="bg-card rounded-xl border border-border p-6">
               <div className="flex items-center justify-between gap-4">
                 <div className="flex-1 min-w-0">
-                  <p className="font-medium text-gray-900">{t('serverApp')}</p>
-                  <p className="text-sm text-gray-500">
+                  <p className="font-medium text-foreground">{t('serverApp')}</p>
+                  <p className="text-sm text-muted-foreground">
                     {t('serverAppEnabledHint')}
                   </p>
                 </div>
@@ -3273,18 +3998,18 @@ export default function SettingsPage() {
             </div>
 
             {!serverAppEnabledSetting && (
-              <p className="text-sm text-gray-400 italic">
+              <p className="text-sm text-muted-foreground italic">
                 {t('serverAppPairingHiddenHint')}
               </p>
             )}
 
             {serverAppEnabledSetting && (
-              <div className="bg-white rounded-xl border border-gray-100 p-6">
+              <div className="bg-card rounded-xl border border-border p-6">
                 <div className="flex items-center gap-2 mb-4">
-                  <Smartphone size={20} className="text-gray-500" />
-                  <h2 className="font-semibold text-gray-900">{t('tablesideOrdering')}</h2>
+                  <Smartphone size={20} className="text-muted-foreground" />
+                  <h2 className="font-semibold text-foreground">{t('tablesideOrdering')}</h2>
                 </div>
-                <p className="text-sm text-gray-500 mb-5">
+                <p className="text-sm text-muted-foreground mb-5">
                   {t('serverAppPairingHint')}
                 </p>
 
@@ -3300,15 +4025,15 @@ export default function SettingsPage() {
                       <>
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 w-full">
                           {serverAppInfo.ips_data.map((ipInfo: { ip: string; url: string; qr_data: string | null }, idx: number) => (
-                            <div key={idx} className="flex flex-col items-center p-4 bg-gray-50 border border-gray-200 rounded-lg">
-                              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">
+                            <div key={idx} className="flex flex-col items-center p-4 bg-muted border border-border rounded-lg">
+                              <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-3">
                                 {ipInfo.ip.startsWith('100.') ? t('vpnMeshNetwork') : t('localNetwork')}
                               </p>
                               {ipInfo.qr_data ? (
-                                <img src={ipInfo.qr_data} alt={`QR Code for ${ipInfo.ip}`} className="w-40 h-40 rounded-lg mb-3 bg-white p-2 border border-gray-100" />
+                                <img src={ipInfo.qr_data} alt={`QR Code for ${ipInfo.ip}`} className="w-40 h-40 rounded-lg mb-3 bg-card p-2 border border-border" />
                               ) : (
-                                <div className="w-40 h-40 bg-gray-100 rounded-lg flex items-center justify-center mb-3">
-                                  <QrCode size={40} className="text-gray-400" />
+                                <div className="w-40 h-40 bg-muted rounded-lg flex items-center justify-center mb-3">
+                                  <QrCode size={40} className="text-muted-foreground" />
                                 </div>
                               )}
                               <Ltr as="a" href={ipInfo.url} target="_blank" rel="noopener noreferrer" className="text-xs font-mono text-brand hover:underline break-all text-center">
@@ -3317,35 +4042,35 @@ export default function SettingsPage() {
                             </div>
                           ))}
                         </div>
-                        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
-                          <p className="text-xs font-semibold text-blue-700 uppercase tracking-wide mb-1">{t('appleDevices')}</p>
-                          <Ltr as="a" href={serverAppInfo.mdns_url} target="_blank" rel="noopener noreferrer" className="block font-mono text-sm text-blue-600 break-all hover:underline">
+                        <div className="bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800/40 rounded-lg p-4">
+                          <p className="text-xs font-semibold text-blue-700 dark:text-blue-300 uppercase tracking-wide mb-1">{t('appleDevices')}</p>
+                          <Ltr as="a" href={serverAppInfo.mdns_url} target="_blank" rel="noopener noreferrer" className="block font-mono text-sm text-blue-600 dark:text-blue-400 break-all hover:underline">
                             {serverAppInfo.mdns_url}
                           </Ltr>
-                          <p className="text-xs text-blue-600 mt-2">{t('appleDevicesHint')}</p>
+                          <p className="text-xs text-blue-600 dark:text-blue-400 mt-2">{t('appleDevicesHint')}</p>
                         </div>
                       </>
                     ) : (
                       <div className="flex flex-col sm:flex-row gap-6 items-start">
                         <div className="shrink-0">
                           {serverAppInfo.qr_data_url ? (
-                            <img src={serverAppInfo.qr_data_url} alt={t('serverAppQrAlt')} className="w-48 h-48 rounded-xl border border-gray-200" />
+                            <img src={serverAppInfo.qr_data_url} alt={t('serverAppQrAlt')} className="w-48 h-48 rounded-xl border border-border" />
                           ) : (
-                            <div className="w-48 h-48 rounded-xl border border-gray-200 flex items-center justify-center text-gray-400">
+                            <div className="w-48 h-48 rounded-xl border border-border flex items-center justify-center text-muted-foreground">
                               <QrCode size={48} />
                             </div>
                           )}
                         </div>
                         <div className="flex-1 space-y-4">
                           <div>
-                            <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">{t('directIp')}</p>
+                            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-1">{t('directIp')}</p>
                             <Ltr as="a" href={serverAppInfo.ip_url} target="_blank" rel="noopener noreferrer" className="block font-mono text-sm text-brand break-all hover:underline">
                               {serverAppInfo.ip_url}
                             </Ltr>
                           </div>
                           <div>
-                            <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-1">{t('mdnsAlwaysStable')}</p>
-                            <Ltr as="a" href={serverAppInfo.mdns_url} target="_blank" rel="noopener noreferrer" className="block font-mono text-sm text-gray-700 break-all hover:underline">
+                            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-1">{t('mdnsAlwaysStable')}</p>
+                            <Ltr as="a" href={serverAppInfo.mdns_url} target="_blank" rel="noopener noreferrer" className="block font-mono text-sm text-foreground break-all hover:underline">
                               {serverAppInfo.mdns_url}
                             </Ltr>
                           </div>
@@ -3353,9 +4078,9 @@ export default function SettingsPage() {
                       </div>
                     )}
 
-                    <div className="flex justify-end border-t border-gray-200 pt-4">
+                    <div className="flex justify-end border-t border-border pt-4">
                       <button onClick={fetchServerAppInfo} disabled={serverAppInfoLoading}
-                        className="flex items-center gap-2 text-sm text-gray-500 hover:text-gray-800">
+                        className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground">
                         <RefreshCw size={14} className={serverAppInfoLoading ? 'animate-spin' : ''} />
                         {t('refreshUrls')}
                       </button>
@@ -3365,7 +4090,7 @@ export default function SettingsPage() {
 
                 {!serverAppInfo && !serverAppInfoLoading && (
                   <>
-                    <p className="text-sm text-gray-500 mb-3">
+                    <p className="text-sm text-muted-foreground mb-3">
                       {t('serverAppLoadHint')}
                     </p>
                     <button onClick={fetchServerAppInfo}
@@ -3382,35 +4107,38 @@ export default function SettingsPage() {
         <TabsContent value="loyalty">
           <div className="pb-6 max-w-3xl space-y-6">
             {/* Loyalty */}
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            <div className="bg-card rounded-xl border border-border p-6">
               <div className="flex items-center gap-2 mb-4">
-                <Gift size={20} className="text-gray-500" />
-                <h2 className="font-semibold text-gray-900">{t('loyaltyProgram')}</h2>
+                <Gift size={20} className="text-muted-foreground" />
+                <h2 className="font-semibold text-foreground">{t('loyaltyProgram')}</h2>
               </div>
               <div className="space-y-5">
                 {/* Enable toggle */}
                 <div className="flex items-center justify-between">
                   <div>
-                    <p className="font-medium text-gray-900">{t('enableLoyalty')}</p>
-                    <p className="text-sm text-gray-500">{t('loyaltyHint')}</p>
+                    <p className="font-medium text-foreground">{t('enableLoyalty')}</p>
+                    <p className="text-sm text-muted-foreground">{t('loyaltyHint')}</p>
                   </div>
                   <button
-                    onClick={() => setLoyaltyEnabled(!loyaltyEnabled)}
+                    onClick={() => {
+                      markHydrationTouched('loyaltyEnabled');
+                      setLoyaltyEnabled(!loyaltyEnabled);
+                    }}
                     className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                      loyaltyEnabled ? 'bg-brand' : 'bg-gray-200'
+                      loyaltyEnabled ? 'bg-brand' : 'bg-gray-200 dark:bg-input'
                     }`}
                   >
-                    <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                    <span className={`inline-block h-4 w-4 transform rounded-full bg-card transition-transform ${
                       loyaltyEnabled ? 'translate-x-6 rtl:-translate-x-6' : 'translate-x-1 rtl:-translate-x-1'
                     }`} />
                   </button>
                 </div>
                 {/* Global Cashback Input */}
                 {loyaltyEnabled && (
-                  <div className="pt-4 border-t border-gray-100 flex items-center justify-between">
+                  <div className="pt-4 border-t border-border flex items-center justify-between">
                     <div>
-                      <p className="font-medium text-gray-900">{t('globalLoyaltyRate')}</p>
-                      <p className="text-sm text-gray-500">{t('globalLoyaltyRateHint')}</p>
+                      <p className="font-medium text-foreground">{t('globalLoyaltyRate')}</p>
+                      <p className="text-sm text-muted-foreground">{t('globalLoyaltyRateHint')}</p>
                     </div>
                     <div className="flex items-center gap-2">
                       <input
@@ -3419,11 +4147,14 @@ export default function SettingsPage() {
                         max="100"
                         step="0.1"
                         value={globalCashbackPercent}
-                        onChange={(e) => setGlobalCashbackPercent(e.target.value)}
+                        onChange={(e) => {
+                          markHydrationTouched('globalCashbackPercent');
+                          setGlobalCashbackPercent(e.target.value);
+                        }}
                         placeholder="0"
-                        className="w-20 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-brand focus:border-brand transition-shadow text-end"
+                        className="w-20 px-3 py-2 border border-gray-300 dark:border-border rounded-lg focus:ring-2 focus:ring-brand focus:border-brand transition-shadow text-end"
                       />
-                      <span className="text-gray-500 font-medium">%</span>
+                      <span className="text-muted-foreground font-medium">%</span>
                     </div>
                   </div>
                 )}
@@ -3431,16 +4162,16 @@ export default function SettingsPage() {
                     ("earns nothing"), so the global rate does nothing for them
                     until the owner explicitly opts them in. */}
                 {loyaltyEnabled && globalRateCandidates > 0 && (
-                  <div className="pt-4 border-t border-gray-100">
-                    <p className="font-medium text-gray-900">{t('applyGlobalRateTitle')}</p>
-                    <p className="text-sm text-gray-500 mt-1">
+                  <div className="pt-4 border-t border-border">
+                    <p className="font-medium text-foreground">{t('applyGlobalRateTitle')}</p>
+                    <p className="text-sm text-muted-foreground mt-1">
                       {t('applyGlobalRateHint', { count: globalRateCandidates })}
                     </p>
                     <button
                       type="button"
                       onClick={applyGlobalRateToProducts}
                       disabled={applyingGlobalRate}
-                      className="mt-3 px-4 py-2 text-sm font-medium rounded-lg border border-gray-300 hover:bg-gray-50 disabled:opacity-50"
+                      className="mt-3 px-4 py-2 text-sm font-medium rounded-lg border border-gray-300 dark:border-border hover:bg-muted disabled:opacity-50"
                     >
                       {applyingGlobalRate
                         ? t('applyGlobalRateWorking')
@@ -3456,67 +4187,82 @@ export default function SettingsPage() {
         <TabsContent value="discounts">
           <div className="pb-6 max-w-3xl space-y-6">
             {/* Discount Limits */}
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            <div className="bg-card rounded-xl border border-border p-6">
               <div className="flex items-center gap-2 mb-4">
-                <Percent size={20} className="text-gray-500" />
-                <h2 className="font-semibold text-gray-900">{t('discountLimits')}</h2>
+                <Percent size={20} className="text-muted-foreground" />
+                <h2 className="font-semibold text-foreground">{t('discountLimits')}</h2>
               </div>
               <div className="space-y-5">
                 {/* Discount mode */}
                 <div>
-                  <p className="font-medium text-gray-900">{t('discountMode')}</p>
-                  <p className="text-sm text-gray-500 mb-2">{t('discountModeHint')}</p>
+                  <p className="font-medium text-foreground">{t('discountMode')}</p>
+                  <p className="text-sm text-muted-foreground mb-2">{t('discountModeHint')}</p>
                   <select value={discountMode}
-                    onChange={(e) => setDiscountMode(e.target.value)}
-                    className="w-48 px-3 py-1.5 text-sm border border-gray-200 rounded-lg outline-none focus:ring-1 focus:ring-brand bg-white">
+                    onChange={(e) => {
+                      markHydrationTouched('discountMode');
+                      setDiscountMode(e.target.value);
+                    }}
+                    className="w-48 px-3 py-1.5 text-sm border border-border rounded-lg outline-none focus:ring-1 focus:ring-brand bg-card">
                     <option value="both">{t('discountBoth')}</option>
                     <option value="percentage">{t('discountPercentageOnly')}</option>
                     <option value="flat">{t('discountFlatOnly')}</option>
+                    <option value="none">{t('discountNone')}</option>
                   </select>
                 </div>
 
                 {(discountMode === 'percentage' || discountMode === 'both') && (
                   <div>
-                    <p className="font-medium text-gray-900">{t('maxDiscountPercentage')}</p>
-                    <p className="text-sm text-gray-500 mb-2">{t('maxDiscountPercentageHint')}</p>
+                    <p className="font-medium text-foreground">{t('maxDiscountPercentage')}</p>
+                    <p className="text-sm text-muted-foreground mb-2">{t('maxDiscountPercentageHint')}</p>
                     <div className="flex items-center gap-3">
                       <input type="number" min={1} max={100} value={discountMaxPct}
-                        onChange={(e) => setDiscountMaxPct(normalizeDiscountPercentage(e.target.value))}
-                        className="w-24 px-3 py-1.5 text-sm border border-gray-200 rounded-lg outline-none focus:ring-1 focus:ring-brand" />
-                      <span className="text-sm text-gray-500">{t('percentMaximum')}</span>
+                        onChange={(e) => {
+                          markHydrationTouched('discountMaxPct');
+                          setDiscountMaxPct(normalizeDiscountPercentage(e.target.value));
+                        }}
+                        className="w-24 px-3 py-1.5 text-sm border border-border rounded-lg outline-none focus:ring-1 focus:ring-brand" />
+                      <span className="text-sm text-muted-foreground">{t('percentMaximum')}</span>
                     </div>
                   </div>
                 )}
 
                 {(discountMode === 'flat' || discountMode === 'both') && (
                   <div>
-                    <p className="font-medium text-gray-900">{t('maxDiscountAmount')}</p>
-                    <p className="text-sm text-gray-500 mb-2">{t('maxDiscountAmountHint')}</p>
+                    <p className="font-medium text-foreground">{t('maxDiscountAmount')}</p>
+                    <p className="text-sm text-muted-foreground mb-2">{t('maxDiscountAmountHint')}</p>
                     <div className="flex items-center gap-3">
                       <input type="number" min={0} max={999999} value={discountMaxAmount}
-                        onChange={(e) => setDiscountMaxAmount(normalizeDiscountAmount(e.target.value))}
-                        className="w-24 px-3 py-1.5 text-sm border border-gray-200 rounded-lg outline-none focus:ring-1 focus:ring-brand" />
-                      <span className="text-sm text-gray-500">{t('zeroNoLimit')}</span>
+                        onChange={(e) => {
+                          markHydrationTouched('discountMaxAmount');
+                          setDiscountMaxAmount(normalizeDiscountAmount(e.target.value));
+                        }}
+                        className="w-24 px-3 py-1.5 text-sm border border-border rounded-lg outline-none focus:ring-1 focus:ring-brand" />
+                      <span className="text-sm text-muted-foreground">{t('zeroNoLimit')}</span>
                     </div>
                   </div>
                 )}
 
-                <div className="flex items-center justify-between">
-                  <div>
-                    <p className="font-medium text-gray-900">{t('requireApproval')}</p>
-                    <p className="text-sm text-gray-500">{t('requireApprovalHint')}</p>
+                {discountMode !== 'none' && (
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="font-medium text-foreground">{t('requireApproval')}</p>
+                      <p className="text-sm text-muted-foreground">{t('requireApprovalHint')}</p>
+                    </div>
+                    <button
+                      onClick={() => {
+                        markHydrationTouched('discountRequiresApproval');
+                        setDiscountRequiresApproval(!discountRequiresApproval);
+                      }}
+                      className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                        discountRequiresApproval ? 'bg-brand' : 'bg-gray-200 dark:bg-input'
+                      }`}
+                    >
+                      <span className={`inline-block h-4 w-4 transform rounded-full bg-card transition-transform ${
+                        discountRequiresApproval ? 'translate-x-6 rtl:-translate-x-6' : 'translate-x-1 rtl:-translate-x-1'
+                      }`} />
+                    </button>
                   </div>
-                  <button
-                    onClick={() => setDiscountRequiresApproval(!discountRequiresApproval)}
-                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                      discountRequiresApproval ? 'bg-brand' : 'bg-gray-200'
-                    }`}
-                  >
-                    <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                      discountRequiresApproval ? 'translate-x-6 rtl:-translate-x-6' : 'translate-x-1 rtl:-translate-x-1'
-                    }`} />
-                  </button>
-                </div>
+                )}
 
               </div>
             </div>
@@ -3526,35 +4272,35 @@ export default function SettingsPage() {
         <TabsContent value="account">
           <div className="pb-6 max-w-3xl space-y-6">
             {/* Account */}
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
-              <h2 className="font-semibold text-gray-900 mb-4">{t('account')}</h2>
+            <div className="bg-card rounded-xl border border-border p-6">
+              <h2 className="font-semibold text-foreground mb-4">{t('account')}</h2>
               <div className="space-y-3">
                 <div>
-                  <p className="text-sm text-gray-500">{t('name')}</p>
-                  <p className="font-medium text-gray-900">{user?.name}</p>
+                  <p className="text-sm text-muted-foreground">{t('name')}</p>
+                  <p className="font-medium text-foreground">{user?.name}</p>
                 </div>
                 <div>
-                  <p className="text-sm text-gray-500">{t('email')}</p>
-                  <p className="font-medium text-gray-900"><Ltr>{user?.email}</Ltr></p>
+                  <p className="text-sm text-muted-foreground">{t('email')}</p>
+                  <p className="font-medium text-foreground"><Ltr>{user?.email}</Ltr></p>
                 </div>
                 <div>
-                  <p className="text-sm text-gray-500">{t('role')}</p>
-                  <p className="font-medium text-gray-900 capitalize">{currentTenant?.role || '—'}</p>
+                  <p className="text-sm text-muted-foreground">{t('role')}</p>
+                  <p className="font-medium text-foreground capitalize">{currentTenant?.role || '—'}</p>
                 </div>
               </div>
             </div>
-            {currentTenant?.role === 'owner' && (
-              <div className={`rounded-xl border p-6 ${cloudAccountAvailable && cloudAccount?.email && !cloudAccount.verified ? 'border-red-200 bg-red-50/40' : 'border-gray-100 bg-white'}`}>
+            {isOwner && (
+              <div className={`rounded-xl border p-6 ${cloudAccountAvailable && cloudAccount?.email && !cloudAccount.verified ? 'border-red-200 dark:border-red-800/40 bg-red-50/40 dark:bg-red-950/20' : 'border-border bg-card'}`}>
                 <div className="flex items-start justify-between gap-4">
                   <div>
-                    <h2 className="font-semibold text-gray-900">{t('contactEmailTitle')}</h2>
-                    <p className="mt-1 text-sm text-gray-600">{cloudAccountLoadFailed ? t('cloudAccountLoadFailed') : cloudAccountAvailable ? <Ltr>{cloudAccount?.email || user?.email || t('noCloudContactEmail')}</Ltr> : t('cloudAccountUnavailable')}</p>
+                    <h2 className="font-semibold text-foreground">{t('contactEmailTitle')}</h2>
+                    <p className="mt-1 text-sm text-muted-foreground">{cloudAccountLoadFailed ? t('cloudAccountLoadFailed') : cloudAccountAvailable ? <Ltr>{cloudAccount?.email || user?.email || t('noCloudContactEmail')}</Ltr> : t('cloudAccountUnavailable')}</p>
                   </div>
-                  <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${!cloudAccountAvailable ? 'bg-gray-100 text-gray-600' : cloudAccount?.verified ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                  <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${!cloudAccountAvailable ? 'bg-muted text-muted-foreground' : cloudAccount?.verified ? 'bg-green-100 dark:bg-green-950/40 text-green-700 dark:text-green-300' : 'bg-red-100 dark:bg-red-950/40 text-red-700 dark:text-red-300'}`}>
                     {cloudAccountLoadFailed ? t('cloudStatusUnavailable') : !cloudAccountAvailable ? t('cloudUnavailableBadge') : cloudAccount?.verified ? t('cloudVerified') : t('cloudPendingVerification')}
                   </span>
                 </div>
-                <p className="mt-3 text-sm text-gray-600">{cloudAccountLoadFailed ? t('cloudAccountLoadError') : cloudAccountAvailable ? t('cloudVerificationHint') : cloudDeletionPending ? t('cloudDeletionPendingHint') : cloudDeletionStatus === 'processing' ? t('cloudDeletionProcessingHint') : cloudDeletionStatus === 'failed' || cloudStatus.cloud_deletion_status === 'failed' ? t('cloudDeletionFailedHint') : t('cloudEnableHintAccount')}</p>
+                <p className="mt-3 text-sm text-muted-foreground">{cloudAccountLoadFailed ? t('cloudAccountLoadError') : cloudAccountAvailable ? t('cloudVerificationHint') : cloudDeletionPending ? t('cloudDeletionPendingHint') : cloudDeletionStatus === 'processing' ? t('cloudDeletionProcessingHint') : cloudDeletionStatus === 'failed' || cloudStatus.cloud_deletion_status === 'failed' ? t('cloudDeletionFailedHint') : t('cloudEnableHintAccount')}</p>
                 {cloudAccountLoadFailed && (
                   <Button variant="outline" className="mt-4" onClick={() => void fetchCloudAccount()}>{t('retry')}</Button>
                 )}
@@ -3569,10 +4315,10 @@ export default function SettingsPage() {
                   }}>{cloudAccountBusy ? t('cloudSendingVerification') : t('cloudSendVerificationEmail')}</Button>
                 )}
                 {cloudAccountAvailable && (
-                  <div className="mt-5 space-y-3 border-t border-gray-200 pt-4">
+                  <div className="mt-5 space-y-3 border-t border-border pt-4">
                     <label className="flex items-center justify-between gap-4 text-sm"><span>{t('cloudPrefProductUpdates')}</span><Toggle value={Boolean(cloudAccount?.product_updates)} onChange={async (value) => { setCloudAccountBusy(true); try { const { data } = await api.put('/settings/cloud/account/preferences', { product_updates: value }); setCloudAccount(data); } catch { toast.error(t('couldNotSavePreference')); } finally { setCloudAccountBusy(false); } }} /></label>
                     <label className="flex items-center justify-between gap-4 text-sm"><span>{t('cloudPrefMarketing')}</span><Toggle value={Boolean(cloudAccount?.marketing)} onChange={async (value) => { setCloudAccountBusy(true); try { const { data } = await api.put('/settings/cloud/account/preferences', { marketing: value }); setCloudAccount(data); } catch { toast.error(t('couldNotSavePreference')); } finally { setCloudAccountBusy(false); } }} /></label>
-                    <p className="text-xs text-gray-500">{t('cloudPrefNote')}</p>
+                    <p className="text-xs text-muted-foreground">{t('cloudPrefNote')}</p>
                   </div>
                 )}
               </div>
@@ -3583,11 +4329,11 @@ export default function SettingsPage() {
         {/* Privacy — anonymous telemetry (from the old Integrations tab) + cloud privacy controls (from Account) */}
         <TabsContent value="privacy">
           <div className="pb-6 max-w-3xl space-y-6">
-            <div className="bg-white rounded-xl border border-gray-100 p-6 space-y-4">
+            <div className="bg-card rounded-xl border border-border p-6 space-y-4">
               <div className="flex items-center gap-2">
-                <Lock size={20} className="text-gray-500" />
+                <Lock size={20} className="text-muted-foreground" />
                 <div>
-                  <h2 className="font-semibold text-gray-900">{t('privacy')}</h2>
+                  <h2 className="font-semibold text-foreground">{t('privacy')}</h2>
                 </div>
               </div>
 
@@ -3597,33 +4343,33 @@ export default function SettingsPage() {
                   checked={telemetryEnabled}
                   disabled={savingTelemetry}
                   onChange={(e) => saveTelemetry(e.target.checked)}
-                  className="rounded border-gray-300 text-brand focus:ring-brand"
+                  className="rounded border-gray-300 dark:border-border text-brand focus:ring-brand"
                 />
-                <span className="text-sm text-gray-700">{t('anonymousTelemetry')}</span>
+                <span className="text-sm text-foreground">{t('anonymousTelemetry')}</span>
               </label>
-              <p className="text-xs text-gray-500">{t('anonymousTelemetryHint')}</p>
+              <p className="text-xs text-muted-foreground">{t('anonymousTelemetryHint')}</p>
 
-              <div className="border-t border-gray-100 pt-4">
+              <div className="border-t border-border pt-4">
                 <label className="flex items-center gap-3 cursor-pointer">
                   <input
                     type="checkbox"
                     checked={diagnosticsConsent}
                     disabled={savingDiagnosticsConsent}
                     onChange={(e) => saveDiagnosticsConsent(e.target.checked)}
-                    className="rounded border-gray-300 text-brand focus:ring-brand"
+                    className="rounded border-gray-300 dark:border-border text-brand focus:ring-brand"
                   />
-                  <span className="text-sm text-gray-700">{t('storeDiagnostics')}</span>
+                  <span className="text-sm text-foreground">{t('storeDiagnostics')}</span>
                 </label>
-                <p className="text-xs text-gray-500 mt-1">{t('storeDiagnosticsHint')}</p>
+                <p className="text-xs text-muted-foreground mt-1">{t('storeDiagnosticsHint')}</p>
               </div>
             </div>
 
-            {currentTenant?.role === 'owner' && (
-              <div className="rounded-xl border border-gray-100 bg-white p-6">
-                <h2 className="font-semibold text-gray-900">{t('cloudPrivacyControls')}</h2>
-                <p className="mt-2 text-sm text-gray-600">{t('cloudStopReversible')}</p>
+            {isOwner && (
+              <div className="rounded-xl border border-border bg-card p-6">
+                <h2 className="font-semibold text-foreground">{t('cloudPrivacyControls')}</h2>
+                <p className="mt-2 text-sm text-muted-foreground">{t('cloudStopReversible')}</p>
                 {cloudAccount?.deletion_request && (
-                  <div className={`mt-4 rounded-lg border p-3 text-sm ${cloudAccount.deletion_request.status === 'pending' || cloudAccount.deletion_request.status === 'processing' ? 'border-amber-200 bg-amber-50 text-amber-900' : cloudAccount.deletion_request.status === 'approved' || cloudAccount.deletion_request.status === 'completed' || cloudAccount.deletion_request.status === 'deleted' ? 'border-green-200 bg-green-50 text-green-800' : cloudAccount.deletion_request.status === 'failed' ? 'border-red-200 bg-red-50 text-red-800' : 'border-gray-200 bg-gray-50 text-gray-700'}`}>
+                  <div className={`mt-4 rounded-lg border p-3 text-sm ${cloudAccount.deletion_request.status === 'pending' || cloudAccount.deletion_request.status === 'processing' ? 'border-amber-200 dark:border-amber-800/40 bg-amber-50 dark:bg-amber-950/40 text-amber-900 dark:text-amber-300' : cloudAccount.deletion_request.status === 'approved' || cloudAccount.deletion_request.status === 'completed' || cloudAccount.deletion_request.status === 'deleted' ? 'border-green-200 dark:border-green-800/40 bg-green-50 dark:bg-green-950/40 text-green-800 dark:text-green-300' : cloudAccount.deletion_request.status === 'failed' ? 'border-red-200 dark:border-red-800/40 bg-red-50 dark:bg-red-950/40 text-red-800 dark:text-red-300' : 'border-border bg-muted text-foreground'}`}>
                     <p className="font-semibold">{t('cloudDeletionRequest', { status: cloudAccount.deletion_request.status || '' })}</p>
                     {cloudAccount.deletion_request.id && <p className="mt-1 font-mono text-xs"><Ltr>{cloudAccount.deletion_request.id}</Ltr></p>}
                     {cloudAccount.deletion_request.decision_note && <p className="mt-2">{cloudAccount.deletion_request.decision_note}</p>}
@@ -3667,7 +4413,7 @@ export default function SettingsPage() {
                     </>
                   )}
                 </div>
-                <p className="mt-3 text-xs text-gray-500">{t('cloudTelemetryNote')}</p>
+                <p className="mt-3 text-xs text-muted-foreground">{t('cloudTelemetryNote')}</p>
               </div>
             )}
           </div>
@@ -3677,21 +4423,21 @@ export default function SettingsPage() {
         <TabsContent value="receipts-printers">
           <div className="pb-6 max-w-6xl space-y-6">
             <div className="space-y-6">
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            <div className="bg-card rounded-xl border border-border p-6">
               <div className="flex items-center justify-between mb-4">
                 <div className="flex items-center gap-2">
-                  <Printer size={20} className="text-gray-500" />
-                  <h2 className="font-semibold text-gray-900">{t('printers')}</h2>
+                  <Printer size={20} className="text-muted-foreground" />
+                  <h2 className="font-semibold text-foreground">{t('printers')}</h2>
                 </div>
                 {!showPrinterForm && (
                   <div className="flex items-center gap-2">
-                    <button onClick={fetchDetectedPrinters} disabled={detectingPrinters}
+                    <button onClick={() => { void fetchDetectedPrinters(); }} disabled={detectingPrinters}
                       title={t('refreshList')}
-                      className="flex items-center gap-2 px-3 py-2 text-sm border border-gray-200 text-gray-600 rounded-lg hover:bg-gray-50 font-medium disabled:opacity-50">
+                      className="flex items-center gap-2 px-3 py-2 text-sm border border-border text-muted-foreground rounded-lg hover:bg-muted font-medium disabled:opacity-50">
                       <RefreshCw size={14} className={detectingPrinters ? 'animate-spin' : ''} /> {t('refresh')}
                     </button>
                     <button onClick={openAddPrinter}
-                      className="flex items-center gap-2 px-4 py-2 text-sm border border-gray-200 text-gray-600 rounded-lg hover:bg-gray-50 font-medium">
+                      className="flex items-center gap-2 px-4 py-2 text-sm border border-border text-muted-foreground rounded-lg hover:bg-muted font-medium">
                       <Plus size={14} /> {t('addPrinterManually')}
                     </button>
                   </div>
@@ -3704,18 +4450,18 @@ export default function SettingsPage() {
                   <button
                     type="button"
                     onClick={() => setInstalledPrintersOpen((open) => !open)}
-                    className="flex w-full items-center justify-between gap-3 border-y border-gray-100 py-3 text-start"
+                    className="flex w-full items-center justify-between gap-3 border-y border-border py-3 text-start"
                     aria-expanded={installedPrintersOpen}
                   >
-                    <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+                    <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
                       {t('installedOnThisComputer')} ({detectedPrinters.length})
                     </span>
-                    <ChevronDown size={16} className={`text-gray-400 transition-transform ${installedPrintersOpen ? 'rotate-180' : ''}`} />
+                    <ChevronDown size={16} className={`text-muted-foreground transition-transform ${installedPrintersOpen ? 'rotate-180' : ''}`} />
                   </button>
                   {installedPrintersOpen && (detectingPrinters && detectedPrinters.length === 0 ? (
-                    <div className="py-6 text-center text-gray-400 text-sm">{t('scanningForPrinters')}</div>
+                    <div className="py-6 text-center text-muted-foreground text-sm">{t('scanningForPrinters')}</div>
                   ) : detectedPrinters.length === 0 ? (
-                    <div className="mt-2 py-6 text-center text-gray-400 text-sm border border-dashed border-gray-200 rounded-lg">
+                    <div className="mt-2 py-6 text-center text-muted-foreground text-sm border border-dashed border-border rounded-lg">
                       {t('noInstalledPrinters')}
                     </div>
                   ) : (
@@ -3723,22 +4469,22 @@ export default function SettingsPage() {
                       {detectedPrinters.map((p) => {
                         const alreadyAdded = hwPrinters.some((h) => h.name.toLowerCase() === p.name.toLowerCase());
                         const isAdding = addingDetectedName === p.name;
-                        const dotColor = p.status === 'idle' ? 'bg-green-500' : p.status === 'printing' ? 'bg-yellow-500' : 'bg-gray-300';
+                        const dotColor = p.status === 'idle' ? 'bg-green-500' : p.status === 'printing' ? 'bg-yellow-500' : 'bg-gray-300 dark:bg-muted';
                         const statusLabel = p.status === 'idle' ? t('printerOnline') : p.status === 'printing' ? t('printerPrinting') : t('printerOffline');
                         return (
-                          <div key={p.name} className="flex items-center gap-3 rounded-xl border border-gray-200 p-3">
-                            <div className="w-9 h-9 rounded-lg flex items-center justify-center bg-gray-100 shrink-0">
-                              {p.connectionType === 'network' ? <Wifi size={18} className="text-gray-500" /> : <Usb size={18} className="text-gray-500" />}
+                          <div key={p.name} className="flex items-center gap-3 rounded-xl border border-border p-3">
+                            <div className="w-9 h-9 rounded-lg flex items-center justify-center bg-muted shrink-0">
+                              {p.connectionType === 'network' ? <Wifi size={18} className="text-muted-foreground" /> : <Usb size={18} className="text-muted-foreground" />}
                             </div>
                             <div className="flex-1 min-w-0">
                               <div className="flex items-center gap-2">
-                                <span className="font-medium text-gray-900 text-sm truncate">{p.name}</span>
-                                <span className="flex items-center gap-1 text-[11px] text-gray-500">
+                                <span className="font-medium text-foreground text-sm truncate">{p.name}</span>
+                                <span className="flex items-center gap-1 text-[11px] text-muted-foreground">
                                   <span className={`w-1.5 h-1.5 rounded-full ${dotColor}`} />
                                   {statusLabel}
                                 </span>
                               </div>
-                              <p className="text-xs text-gray-500 mt-0.5 truncate">
+                              <p className="text-xs text-muted-foreground mt-0.5 truncate">
                                 {p.make !== 'Unknown' ? `${p.make} ${p.model}` : p.model}
                                 {p.connectionType === 'network' && p.ipAddress ? <> · <Ltr>{p.ipAddress}{p.port ? ':' + p.port : ''}</Ltr></> : ''}
                                 {p.paperWidth ? ` · ${printWidthLabel(p.paperWidth)}` : ''}
@@ -3746,7 +4492,7 @@ export default function SettingsPage() {
                               </p>
                             </div>
                             {alreadyAdded ? (
-                              <span className="text-xs text-gray-400 px-3 py-1.5 flex items-center gap-1">
+                              <span className="text-xs text-muted-foreground px-3 py-1.5 flex items-center gap-1">
                                 <CheckCircle2 size={14} className="text-green-500" /> {t('printerAdded')}
                               </span>
                             ) : (
@@ -3765,31 +4511,31 @@ export default function SettingsPage() {
 
               {/* Configured printer list */}
               {hwPrinters.length === 0 && !showPrinterForm && (
-                <div className="py-6 text-center text-gray-400">
+                <div className="py-6 text-center text-muted-foreground">
                   <p className="text-sm">{t('noPrintersConfigured')}</p>
                   <p className="text-xs mt-1">{t('printerHint')}</p>
                 </div>
               )}
 
               {hwPrinters.length > 0 && !showPrinterForm && (
-                <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-500 mb-2">{t('configuredPrinters')}</h3>
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-2">{t('configuredPrinters')}</h3>
               )}
               <div className="space-y-3">
                 {hwPrinters.map((p) => (
-                  <div key={p.id} className={`flex items-center gap-3 rounded-xl border p-4 ${p.is_default ? 'border-brand bg-brand/5' : 'border-gray-200'}`}>
-                    <div className="w-9 h-9 rounded-lg flex items-center justify-center bg-gray-100 shrink-0">
-                      {p.connection_type === 'network' ? <Wifi size={18} className="text-gray-500" /> :
+                  <div key={p.id} className={`flex items-center gap-3 rounded-xl border p-4 ${p.is_default ? 'border-brand bg-brand/5' : 'border-border'}`}>
+                    <div className="w-9 h-9 rounded-lg flex items-center justify-center bg-muted shrink-0">
+                      {p.connection_type === 'network' ? <Wifi size={18} className="text-muted-foreground" /> :
                        p.connection_type === 'webusb' ? <Usb size={18} className="text-blue-500" /> :
-                       <Usb size={18} className="text-gray-500" />}
+                       <Usb size={18} className="text-muted-foreground" />}
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
-                        <span className="font-semibold text-gray-900 text-sm">{p.name}</span>
+                        <span className="font-semibold text-foreground text-sm">{p.name}</span>
                         {p.is_default === 1 && (
                           <span className="text-[10px] bg-brand/10 text-brand px-2 py-0.5 rounded-full font-medium">{t('defaultPrinter')}</span>
                         )}
                       </div>
-                      <p className="text-xs text-gray-500 mt-0.5">
+                      <p className="text-xs text-muted-foreground mt-0.5">
                         {p.connection_type === 'network' ? <Ltr>{p.ip_address}:{p.port}</Ltr> :
                          p.connection_type === 'usb' ? t('connectionUsb') :
                          t('browserWebusb')}
@@ -3800,21 +4546,21 @@ export default function SettingsPage() {
                     <div className="flex items-center gap-1 shrink-0">
                       <button onClick={() => testPrinterHw(p)} disabled={testingPrinterId === p.id}
                         title={t('testPrint')}
-                        className="p-2 rounded-lg hover:bg-gray-100 text-gray-400 hover:text-gray-700 disabled:opacity-40">
+                        className="p-2 rounded-lg hover:bg-muted text-muted-foreground hover:text-foreground disabled:opacity-40">
                         <TestTube2 size={15} />
                       </button>
                       {p.is_default !== 1 && (
                         <button onClick={() => setDefaultPrinter(p.id)} title={t('setAsDefault')}
-                          className="p-2 rounded-lg hover:bg-yellow-50 text-gray-400 hover:text-yellow-600">
+                          className="p-2 rounded-lg hover:bg-yellow-50 dark:hover:bg-yellow-950/40 text-muted-foreground hover:text-yellow-600 dark:hover:text-yellow-400">
                           <Star size={15} />
                         </button>
                       )}
                       <button onClick={() => openEditPrinter(p)} title={t('edit')}
-                        className="p-2 rounded-lg hover:bg-gray-100 text-gray-400 hover:text-gray-700">
+                        className="p-2 rounded-lg hover:bg-muted text-muted-foreground hover:text-foreground">
                         <Settings size={15} />
                       </button>
                       <button onClick={() => deletePrinterHw(p.id)} title={t('delete')}
-                        className="p-2 rounded-lg hover:bg-red-50 text-gray-400 hover:text-red-600">
+                        className="p-2 rounded-lg hover:bg-red-50 text-red-600 hover:text-red-700">
                         <Trash2 size={15} />
                       </button>
                     </div>
@@ -3824,23 +4570,31 @@ export default function SettingsPage() {
 
               {/* Add / Edit form */}
               {showPrinterForm && (
-                <div className="mt-5 pt-5 border-t border-gray-100">
-                  <h3 className="font-semibold text-gray-900 text-sm mb-4">
+                <div className="mt-5 pt-5 border-t border-border">
+                  <h3 className="font-semibold text-foreground text-sm mb-4">
                     {editingPrinterId ? t('editPrinter') : t('addPrinter')}
                   </h3>
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div>
-                      <label className="block text-xs text-gray-500 mb-1">{t('printerName')}</label>
+                      <label className="block text-xs text-muted-foreground mb-1">{t('printerName')}</label>
                       <input type="text" value={printerForm.name}
                         onChange={(e) => setPrinterForm((p) => ({ ...p, name: e.target.value }))}
                         placeholder={t('printerNamePlaceholder')}
-                        className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand" />
+                        list="detected-printer-names"
+                        className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand" />
+                      <datalist id="detected-printer-names">
+                        {detectedPrinters.map((dp) => <option key={dp.name} value={dp.name} />)}
+                      </datalist>
+                      {printerForm.connection_type !== 'webusb' && printerForm.name.trim() && detectedPrinters.length > 0
+                        && !detectedPrinters.some((dp) => dp.name === printerForm.name) && (
+                        <p className="mt-1 text-xs text-amber-600">{t('printerNameMismatchWarning')}</p>
+                      )}
                     </div>
                     <div>
-                      <label className="block text-xs text-gray-500 mb-1">{t('connectionType')}</label>
+                      <label className="block text-xs text-muted-foreground mb-1">{t('connectionType')}</label>
                       <select value={printerForm.connection_type}
                         onChange={(e) => setPrinterForm((p) => ({ ...p, connection_type: e.target.value as HwPrinter['connection_type'] }))}
-                        className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand">
+                        className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand">
                         <option value="network">{t('connectionNetwork')}</option>
                         <option value="usb">{t('connectionUsb')}</option>
                         <option value="webusb">{t('connectionWebusb')}</option>
@@ -3849,32 +4603,32 @@ export default function SettingsPage() {
 
                     {printerForm.connection_type === 'network' && (<>
                       <div>
-                        <label className="block text-xs text-gray-500 mb-1">{t('ipAddress')}</label>
+                        <label className="block text-xs text-muted-foreground mb-1">{t('ipAddress')}</label>
                         <input type="text" value={printerForm.ip_address}
                           onChange={(e) => setPrinterForm((p) => ({ ...p, ip_address: e.target.value }))}
                           placeholder={t('ipAddressPlaceholder')}
-                          className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand" dir="ltr" />
+                          className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand" dir="ltr" />
                       </div>
                       <div>
-                        <label className="block text-xs text-gray-500 mb-1">{t('port')}</label>
+                        <label className="block text-xs text-muted-foreground mb-1">{t('port')}</label>
                         <input type="number" value={printerForm.port}
                           onChange={(e) => setPrinterForm((p) => ({ ...p, port: e.target.value }))}
                           placeholder={t('portPlaceholder')}
-                          className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand" />
+                          className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand" />
                       </div>
                     </>)}
 
                     {printerForm.connection_type === 'webusb' && (
-                      <div className="md:col-span-2 bg-blue-50 rounded-lg p-3 text-sm text-blue-700">
+                      <div className="md:col-span-2 bg-blue-50 dark:bg-blue-950/40 rounded-lg p-3 text-sm text-blue-700 dark:text-blue-300">
                         {t('webusbHint')}
                       </div>
                     )}
 
                     <div>
-                      <label className="block text-xs text-gray-500 mb-1">{t('paperWidth')}</label>
+                      <label className="block text-xs text-muted-foreground mb-1">{t('paperWidth')}</label>
                       <select value={printerForm.paper_width}
                         onChange={(e) => setPrinterForm((p) => ({ ...p, paper_width: e.target.value }))}
-                        className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand">
+                        className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand">
                         <option value="cols-32">{t('printColumns32')}</option>
                         <option value="cols-36">{t('printColumns36')}</option>
                         <option value="cols-40">{t('printColumns40')}</option>
@@ -3891,7 +4645,7 @@ export default function SettingsPage() {
                       {savingPrinter ? t('saving') : editingPrinterId ? tCommon('update') : t('addPrinter')}
                     </button>
                     <button onClick={() => setShowPrinterForm(false)}
-                      className="px-5 py-2 text-sm border border-gray-200 text-gray-600 rounded-lg hover:bg-gray-50 font-medium">
+                      className="px-5 py-2 text-sm border border-border text-muted-foreground rounded-lg hover:bg-muted font-medium">
                       {t('cancel')}
                     </button>
                   </div>
@@ -3899,63 +4653,98 @@ export default function SettingsPage() {
               )}
             </div>
 
-            <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 text-sm text-amber-800">
+            <div className="bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/40 rounded-xl p-4 text-sm text-amber-800 dark:text-amber-300">
               <strong>{t('defaultPrinterTipTitle')}</strong> {t('defaultPrinterTipBody')}
             </div>
 
             {/* Print Options — merged into the same Printers page rather than a separate tab */}
-            <div className="pt-4 border-t border-gray-100">
-              <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-400">{t('tabPrinting')}</h2>
+            <div className="pt-4 border-t border-border">
+              <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">{t('tabPrinting')}</h2>
             </div>
 
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            <div className="bg-card rounded-xl border border-border p-6">
               <div className="flex items-center gap-2 mb-4">
-                <Printer size={20} className="text-gray-500" />
-                <h2 className="font-semibold text-gray-900">{t('printing')}</h2>
+                <Printer size={20} className="text-muted-foreground" />
+                <h2 className="font-semibold text-foreground">{t('printing')}</h2>
               </div>
               <div className="space-y-4">
                 <div className="flex items-center justify-between gap-4">
                   <div className="flex-1 min-w-0">
-                    <p className="font-medium text-gray-900">{t('enablePrinter')}</p>
-                    <p className="text-sm text-gray-500">{t('enablePrinterHint')}</p>
+                    <p className="font-medium text-foreground">{t('enablePrinter')}</p>
+                    <p className="text-sm text-muted-foreground">{t('enablePrinterHint')}</p>
                   </div>
-                  <Toggle value={printingForm.printerEnabled} onChange={(v) => setPrintingForm((p) => ({ ...p, printerEnabled: v }))} />
+                  <Toggle value={printingForm.printerEnabled} onChange={(v) => { markHydrationTouched('printerEnabled'); setPrintingForm((p) => ({ ...p, printerEnabled: v })); }} />
+                </div>
+                <div className="border-t border-border pt-4">
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="flex-1 min-w-0">
+                      <p className="font-medium text-foreground">{t('sendPulseToCashDrawer')}</p>
+                      <p className="text-sm text-muted-foreground">{t('sendPulseToCashDrawerHint')}</p>
+                    </div>
+                    <Toggle value={!!printingForm.cashDrawerPulseEnabled} onChange={(v) => { markHydrationTouched('cashDrawerPulseEnabled'); setPrintingForm((p) => ({ ...p, cashDrawerPulseEnabled: v })); }} />
+                  </div>
+                  {printingForm.cashDrawerPulseEnabled && (
+                    <div className="mt-3 rounded-lg border border-border overflow-hidden">
+                      <button type="button" onClick={() => setCashDrawerMethodsOpen((open) => !open)} className="flex w-full items-center justify-between gap-3 px-3 py-2.5 text-start text-sm font-medium text-foreground hover:bg-muted">
+                        <span>{t('cashDrawerPulsePaymentOptions')}</span>
+                        <ChevronDown size={16} className={`text-muted-foreground transition-transform ${cashDrawerMethodsOpen ? 'rotate-180' : ''}`} />
+                      </button>
+                      {cashDrawerMethodsOpen && (
+                        <div className="border-t border-border bg-muted/30 px-3 py-2 space-y-2">
+                          {([
+                            ['cash', t('paymentMethodCash')],
+                            ['card', t('paymentMethodCard')],
+                            ...pulseCustomMethods.map((name): [string, string] => [name, name]),
+                          ]).map(([value, label]) => (
+                            <label key={value} className="flex items-center gap-2 text-sm text-foreground">
+                              <input
+                                type="checkbox"
+                                checked={printingForm.cashDrawerPulseMethods.includes(value)}
+                                onChange={(e) => {
+                                  markHydrationTouched('cashDrawerPulseMethods');
+                                  setPrintingForm((p) => ({
+                                    ...p,
+                                    cashDrawerPulseMethods: e.target.checked
+                                      ? [...p.cashDrawerPulseMethods, value]
+                                      : p.cashDrawerPulseMethods.filter((method) => method !== value),
+                                  }));
+                                }}
+                                className="h-4 w-4 rounded border-border text-brand focus:ring-brand"
+                              />
+                              {label}
+                            </label>
+                          ))}
+                          <p className="pt-1 text-xs text-muted-foreground">{t('cashDrawerPulsePaymentOptionsHint')}</p>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
                 <div>
-                  <p className="font-medium text-gray-900 mb-2">{t('paperSize')}</p>
-                  <select value={printingForm.printerPaperSize}
-                    onChange={(e) => setPrintingForm((p) => ({ ...p, printerPaperSize: e.target.value as PaperSize }))}
-                    className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand">
-                    {paperSizeOptions.map((opt) => (
-                      <option key={opt.value} value={opt.value}>{opt.label}</option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <p className="font-medium text-gray-900 mb-2">{t('printMethod')}</p>
+                  <p className="font-medium text-foreground mb-2">{t('printMethod')}</p>
                   <select value={printingForm.printMethod}
-                    onChange={(e) => setPrintingForm((p) => ({ ...p, printMethod: e.target.value as 'escpos' | 'browser' }))}
-                    className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand">
+                    onChange={(e) => { markHydrationTouched('printMethod'); setPrintingForm((p) => ({ ...p, printMethod: e.target.value as 'escpos' | 'browser' })); }}
+                    className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand">
                     <option value="escpos">{t('printMethodEscpos')}</option>
                     <option value="browser">{t('printMethodBrowser')}</option>
                   </select>
-                  <p className="text-xs text-gray-500 mt-1">
+                  <p className="text-xs text-muted-foreground mt-1">
                     {printingForm.printMethod === 'escpos'
                       ? t('printMethodEscposHint')
                       : t('printMethodBrowserHint')}
                   </p>
                 </div>
-                <div className="flex items-center justify-between gap-4 border-t border-gray-100 pt-4">
+                <div className="flex items-center justify-between gap-4 border-t border-border pt-4">
                   <div className="flex-1 min-w-0">
-                    <p className="font-medium text-gray-900">{t('kotPrintingEnabledToggle')}</p>
-                    <p className="text-sm text-gray-500">{t('kotPrintingEnabledToggleHint')}</p>
+                    <p className="font-medium text-foreground">{t('kotPrintingEnabledToggle')}</p>
+                    <p className="text-sm text-muted-foreground">{t('kotPrintingEnabledToggleHint')}</p>
                   </div>
                   <Toggle value={kotPrintingEnabledSetting} onChange={(v) => { if (!savingKotPrintingEnabled) saveKotPrintingEnabled(v); }} />
                 </div>
                 <div className={`flex items-center justify-between gap-4 ${!kotPrintingEnabledSetting ? 'opacity-50' : ''}`}>
                   <div className="flex-1 min-w-0">
-                    <p className="font-medium text-gray-900">{t('autoPrintKot')}</p>
-                    <p className="text-sm text-gray-500">
+                    <p className="font-medium text-foreground">{t('autoPrintKot')}</p>
+                    <p className="text-sm text-muted-foreground">
                       {kotPrintingEnabledSetting
                         ? t('autoPrintKotHint')
                         : t('autoPrintKotDisabledHint')}
@@ -3963,58 +4752,58 @@ export default function SettingsPage() {
                   </div>
                   <Toggle
                     value={printingForm.autoPrintKot && kotPrintingEnabledSetting}
-                    onChange={(v) => { if (kotPrintingEnabledSetting) setPrintingForm((p) => ({ ...p, autoPrintKot: v })); }}
+                    onChange={(v) => { if (kotPrintingEnabledSetting) { markHydrationTouched('autoPrintKot'); setPrintingForm((p) => ({ ...p, autoPrintKot: v })); } }}
                   />
                 </div>
                 {!kdsEnabledSetting && !kotPrintingEnabledSetting && (
-                  <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded-lg">
-                    <AlertTriangle size={16} className="text-amber-600 shrink-0 mt-0.5" />
-                    <p className="text-xs text-amber-800">
+                  <div className="flex items-start gap-2 p-3 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/40 rounded-lg">
+                    <AlertTriangle size={16} className="text-amber-600 dark:text-amber-300 shrink-0 mt-0.5" />
+                    <p className="text-xs text-amber-800 dark:text-amber-300">
                       {t('kitchenWorkflowBothOffNote')}
                     </p>
                   </div>
                 )}
                 <div className="flex items-center justify-between gap-4">
                   <div className="flex-1 min-w-0">
-                    <p className="font-medium text-gray-900">{t('autoPrintBill')}</p>
-                    <p className="text-sm text-gray-500">{t('autoPrintBillHint')}</p>
+                    <p className="font-medium text-foreground">{t('autoPrintBill')}</p>
+                    <p className="text-sm text-muted-foreground">{t('autoPrintBillHint')}</p>
                   </div>
-                  <Toggle value={printingForm.autoPrintBill} onChange={(v) => setPrintingForm((p) => ({ ...p, autoPrintBill: v }))} />
+                  <Toggle value={printingForm.autoPrintBill} onChange={(v) => { markHydrationTouched('autoPrintBill'); setPrintingForm((p) => ({ ...p, autoPrintBill: v })); }} />
                 </div>
                 <div className="flex items-center justify-between gap-4">
                   <div className="flex-1 min-w-0">
-                    <p className="font-medium text-gray-900">{t('printerUnicode')}</p>
-                    <p className="text-sm text-gray-500">
+                    <p className="font-medium text-foreground">{t('printerUnicode')}</p>
+                    <p className="text-sm text-muted-foreground">
                       {t('printerUnicodeHint')}
                     </p>
                   </div>
-                  <Toggle value={printingForm.printerUseUnicode} onChange={(v) => setPrintingForm((p) => ({ ...p, printerUseUnicode: v }))} />
+                  <Toggle value={printingForm.printerUseUnicode} onChange={(v) => { markHydrationTouched('printerUseUnicode'); setPrintingForm((p) => ({ ...p, printerUseUnicode: v })); }} />
                 </div>
                 <div className="flex items-center justify-between gap-4">
                   <div className="flex-1 min-w-0">
-                    <p className="font-medium text-gray-900">{t('printerArabicShaping')}</p>
-                    <p className="text-sm text-gray-500">{t('printerArabicShapingHint')}</p>
+                    <p className="font-medium text-foreground">{t('printerArabicShaping')}</p>
+                    <p className="text-sm text-muted-foreground">{t('printerArabicShapingHint')}</p>
                   </div>
-                  <Toggle value={printingForm.printerArabicShaping} onChange={(v) => setPrintingForm((p) => ({ ...p, printerArabicShaping: v }))} />
+                  <Toggle value={printingForm.printerArabicShaping} onChange={(v) => { markHydrationTouched('printerArabicShaping'); setPrintingForm((p) => ({ ...p, printerArabicShaping: v })); }} />
                 </div>
                 <div className="flex items-center justify-between gap-4">
                   <div className="flex-1 min-w-0">
-                    <p className="font-medium text-gray-900">{t('trimDecimals')}</p>
-                    <p className="text-sm text-gray-500">{t('trimDecimalsHint')}</p>
+                    <p className="font-medium text-foreground">{t('trimDecimals')}</p>
+                    <p className="text-sm text-muted-foreground">{t('trimDecimalsHint')}</p>
                   </div>
-                  <Toggle value={printingForm.printerTrimDecimals} onChange={(v) => setPrintingForm((p) => ({ ...p, printerTrimDecimals: v }))} />
+                  <Toggle value={printingForm.printerTrimDecimals} onChange={(v) => { markHydrationTouched('printerTrimDecimals'); setPrintingForm((p) => ({ ...p, printerTrimDecimals: v })); }} />
                 </div>
-                <div className="pt-4 border-t border-gray-100">
-                  <p className="font-medium text-gray-900 mb-1">{t('receiptLanguage')}</p>
-                  <p className="text-sm text-gray-500 mb-3">{t('receiptLanguageHint')}</p>
+                <div className="pt-4 border-t border-border">
+                  <p className="font-medium text-foreground mb-1">{t('receiptLanguage')}</p>
+                  <p className="text-sm text-muted-foreground mb-3">{t('receiptLanguageHint')}</p>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-3">
                     <div>
-                      <label htmlFor="receipt-primary-language" className="block text-sm font-medium text-gray-700 mb-1">{t('receiptLanguage')}</label>
+                      <label htmlFor="receipt-primary-language" className="block text-sm font-medium text-foreground mb-1">{t('receiptLanguage')}</label>
                       <select
                         id="receipt-primary-language"
                         value={printingForm.receiptPrimaryLanguage}
-                        onChange={(e) => setPrintingForm((p) => ({ ...p, receiptPrimaryLanguage: e.target.value }))}
-                        className="block w-full rounded-md border-gray-200 shadow-sm focus:border-brand focus:ring-brand sm:text-sm px-3 py-2 border"
+                        onChange={(e) => { markHydrationTouched('receiptPrimaryLanguage'); setPrintingForm((p) => ({ ...p, receiptPrimaryLanguage: e.target.value })); }}
+                        className="block w-full rounded-md border-border shadow-sm focus:border-brand focus:ring-brand sm:text-sm px-3 py-2 border"
                       >
                         <option value="inherit">{t('sameAsStore')}</option>
                         {SELECTABLE_LANGUAGES.map((lang) => (
@@ -4023,12 +4812,12 @@ export default function SettingsPage() {
                       </select>
                     </div>
                     <div>
-                      <label htmlFor="receipt-second-language" className="block text-sm font-medium text-gray-700 mb-1">{t('secondReceiptLanguage')}</label>
+                      <label htmlFor="receipt-second-language" className="block text-sm font-medium text-foreground mb-1">{t('secondReceiptLanguage')}</label>
                       <select
                         id="receipt-second-language"
                         value={printingForm.receiptSecondLanguage}
-                        onChange={(e) => setPrintingForm((p) => ({ ...p, receiptSecondLanguage: e.target.value }))}
-                        className="block w-full rounded-md border-gray-200 shadow-sm focus:border-brand focus:ring-brand sm:text-sm px-3 py-2 border"
+                        onChange={(e) => { markHydrationTouched('receiptSecondLanguage'); setPrintingForm((p) => ({ ...p, receiptSecondLanguage: e.target.value })); }}
+                        className="block w-full rounded-md border-border shadow-sm focus:border-brand focus:ring-brand sm:text-sm px-3 py-2 border"
                       >
                         <option value="none">{t('secondLanguageNone')}</option>
                         {SELECTABLE_LANGUAGES.map((lang) => (
@@ -4037,12 +4826,12 @@ export default function SettingsPage() {
                       </select>
                     </div>
                     <div>
-                      <label htmlFor="kot-language" className="block text-sm font-medium text-gray-700 mb-1">{t('kotPrintLanguage')}</label>
+                      <label htmlFor="kot-language" className="block text-sm font-medium text-foreground mb-1">{t('kotPrintLanguage')}</label>
                       <select
                         id="kot-language"
                         value={printingForm.kotLanguage}
-                        onChange={(e) => setPrintingForm((p) => ({ ...p, kotLanguage: e.target.value }))}
-                        className="block w-full rounded-md border-gray-200 shadow-sm focus:border-brand focus:ring-brand sm:text-sm px-3 py-2 border"
+                        onChange={(e) => { markHydrationTouched('kotLanguage'); setPrintingForm((p) => ({ ...p, kotLanguage: e.target.value })); }}
+                        className="block w-full rounded-md border-border shadow-sm focus:border-brand focus:ring-brand sm:text-sm px-3 py-2 border"
                       >
                         <option value="inherit">{t('sameAsStore')}</option>
                         {SELECTABLE_LANGUAGES.map((lang) => (
@@ -4050,12 +4839,41 @@ export default function SettingsPage() {
                         ))}
                       </select>
                     </div>
+                    <div>
+                      <label htmlFor="z-report-primary-language" className="block text-sm font-medium text-foreground mb-1">{t('zReportLanguage')}</label>
+                      <select
+                        id="z-report-primary-language"
+                        value={printingForm.zReportPrimaryLanguage}
+                        onChange={(e) => { markHydrationTouched('zReportPrimaryLanguage'); setPrintingForm((p) => ({ ...p, zReportPrimaryLanguage: e.target.value })); }}
+                        className="block w-full rounded-md border-border shadow-sm focus:border-brand focus:ring-brand sm:text-sm px-3 py-2 border"
+                      >
+                        <option value="inherit">{t('sameAsStore')}</option>
+                        {SELECTABLE_LANGUAGES.map((lang) => (
+                          <option key={lang} value={lang}>{LANGUAGES[lang].nativeName}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label htmlFor="z-report-second-language" className="block text-sm font-medium text-foreground mb-1">{t('secondZReportLanguage')}</label>
+                      <select
+                        id="z-report-second-language"
+                        value={printingForm.zReportSecondLanguage}
+                        onChange={(e) => { markHydrationTouched('zReportSecondLanguage'); setPrintingForm((p) => ({ ...p, zReportSecondLanguage: e.target.value })); }}
+                        className="block w-full rounded-md border-border shadow-sm focus:border-brand focus:ring-brand sm:text-sm px-3 py-2 border"
+                      >
+                        <option value="none">{t('secondLanguageNone')}</option>
+                        {SELECTABLE_LANGUAGES.map((lang) => (
+                          <option key={lang} value={lang}>{LANGUAGES[lang].nativeName}</option>
+                        ))}
+                      </select>
+                    </div>
                   </div>
-                  <p className="text-xs text-gray-400 mt-2">{t('kotPrintLanguageHint')}</p>
+                  <p className="text-xs text-muted-foreground mt-2">{t('kotPrintLanguageHint')}</p>
+                  <p className="text-xs text-muted-foreground mt-1">{t('zReportLanguageHint')}</p>
                 </div>
-                <div className="pt-4 border-t border-gray-100">
-                  <p className="font-medium text-gray-900 mb-1">{t('billContent')}</p>
-                  <p className="text-sm text-gray-500 mb-3">{t('billContentHint')}</p>
+                <div className="pt-4 border-t border-border">
+                  <p className="font-medium text-foreground mb-1">{t('billContent')}</p>
+                  <p className="text-sm text-muted-foreground mb-3">{t('billContentHint')}</p>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1">
                     {([
                       { label: t('showRestaurantName'), key: 'billShowName' as const },
@@ -4068,57 +4886,64 @@ export default function SettingsPage() {
                       { label: t('showTableNumber'), key: 'billShowTableNumber' as const },
                     ] as const).map((item) => (
                       <div key={item.key} className="flex min-h-11 items-center justify-between gap-3 py-1">
-                        <span className="text-sm text-gray-700">{item.label}</span>
+                        <span className="text-sm text-foreground">{item.label}</span>
                         <Toggle
                           value={printingForm[item.key]}
-                          onChange={(value) => setPrintingForm((previous) => ({ ...previous, [item.key]: value }))}
+                          onChange={(value) => { markHydrationTouched(item.key); setPrintingForm((previous) => ({ ...previous, [item.key]: value })); }}
                         />
                       </div>
                     ))}
                   </div>
-                  <div className="mt-4 border-t border-gray-100 pt-4">
-                    <label htmlFor="footer-message" className="block text-sm font-medium text-gray-700 mb-1">{t('footerMessage')}</label>
+                  <div className="mt-4 border-t border-border pt-4">
+                    <label htmlFor="footer-message" className="block text-sm font-medium text-foreground mb-1">{t('footerMessage')}</label>
                     <textarea id="footer-message" rows={2}
                       placeholder={t('footerMessagePlaceholder')}
                       value={billForm.billFooterMessage}
-                      onChange={(e) => setBillForm((p) => ({ ...p, billFooterMessage: e.target.value }))}
-                      className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand resize-none" />
-                    <p className="text-xs text-gray-400 mt-1">{t('footerMessageHint')}</p>
+                      onChange={(e) => {
+                        markHydrationTouched('billFooterMessage');
+                        setBillForm((p) => ({ ...p, billFooterMessage: e.target.value }));
+                      }}
+                      className="w-full px-3 py-2 text-sm border border-border rounded-lg outline-none focus:ring-2 focus:ring-brand resize-none" />
+                    <p className="text-xs text-muted-foreground mt-1">{t('footerMessageHint')}</p>
                   </div>
                 </div>
               </div>
             </div>
 
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            <div className="bg-card rounded-xl border border-border p-6">
               <div className="flex items-center gap-2 mb-4">
-                <Share2 size={20} className="text-gray-500" />
-                <h2 className="font-semibold text-gray-900">{t('whatsappSharing')}</h2>
+                <Share2 size={20} className="text-muted-foreground" />
+                <h2 className="font-semibold text-foreground">{t('whatsappSharing')}</h2>
               </div>
               <div className="flex items-center justify-between">
                 <div>
-                  <p className="font-medium text-gray-900">{t('enableWhatsappShare')}</p>
-                  <p className="text-sm text-gray-500">{t('enableWhatsappShareHint')}</p>
+                  <p className="font-medium text-foreground">{t('enableWhatsappShare')}</p>
+                  <p className="text-sm text-muted-foreground">{t('enableWhatsappShareHint')}</p>
                 </div>
-                <Toggle value={printingForm.whatsappShareEnabled} onChange={(v) => setPrintingForm((p) => ({ ...p, whatsappShareEnabled: v }))} />
+                <Toggle value={printingForm.whatsappShareEnabled} onChange={(v) => { markHydrationTouched('whatsappShareEnabled'); setPrintingForm((p) => ({ ...p, whatsappShareEnabled: v })); }} />
               </div>
             </div>
           </div>
 
             <div className="space-y-6">
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            <div className="bg-card rounded-xl border border-border p-6">
               <div className="flex items-center gap-2 mb-4">
-                <FileText size={20} className="text-gray-500" />
-                <h2 className="font-semibold text-gray-900">{t('billTemplate')}</h2>
+                <FileText size={20} className="text-muted-foreground" />
+                <h2 className="font-semibold text-foreground">{t('billTemplate')}</h2>
               </div>
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
                 {billTemplateCards.map((card) => {
                   const isSelected = isTemplateCardSelected(billForm, card);
                   return (
-                    <button key={card.id} onClick={() => setBillForm((p) => ({ ...p, billTemplate: card.id, billTemplateSource: card.selectionSource }))}
+                    <button key={card.id} onClick={() => {
+                      markHydrationTouched('billTemplate');
+                      markHydrationTouched('billTemplateSource');
+                      setBillForm((p) => ({ ...p, billTemplate: card.id, billTemplateSource: card.selectionSource }));
+                    }}
                       className={`text-start rounded-xl border-2 p-4 transition-all ${
-                        isSelected ? 'border-brand bg-brand/5' : 'border-gray-200 hover:border-gray-300 bg-white'
+                        isSelected ? 'border-brand bg-brand/5' : 'border-border hover:border-gray-300 dark:border-border bg-card'
                       }`}>
-                      <p className="font-semibold text-gray-900 mb-2 flex items-center gap-2">
+                      <p className="font-semibold text-foreground mb-2 flex items-center gap-2">
                         <span className="flex-1">{card.nameKey ? t(card.nameKey) : card.displayName}</span>
                         {card.source === 'merchant' && card.originBadgeKey && (
                           <span className="shrink-0 rounded-full bg-brand/10 px-2 py-0.5 text-[10px] font-medium text-brand">
@@ -4126,10 +4951,10 @@ export default function SettingsPage() {
                           </span>
                         )}
                       </p>
-                      <pre className="font-mono text-[9px] leading-tight text-gray-600 bg-gray-50 p-2 rounded overflow-hidden mb-3 whitespace-pre">
+                      <pre className="font-mono text-[9px] leading-tight text-muted-foreground bg-muted p-2 rounded overflow-hidden mb-3 whitespace-pre">
                         {card.preview}
                       </pre>
-                      <p className="text-xs text-gray-500">
+                      <p className="text-xs text-muted-foreground">
                         {card.source === 'plugin' || card.source === 'merchant'
                           ? card.description
                           : card.id === 'classic'
@@ -4151,14 +4976,14 @@ export default function SettingsPage() {
         <TabsContent value="data">
           <div className="pb-6 max-w-3xl space-y-6">
             <div className="space-y-6">
-            <h2 className="text-lg font-semibold text-gray-900">{t('tabBackupData')}</h2>
+            <h2 className="text-lg font-semibold text-foreground">{t('tabBackupData')}</h2>
             {/* Database Export */}
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            <div className="bg-card rounded-xl border border-border p-6">
               <div className="flex items-center gap-2 mb-4">
-                <FileText size={20} className="text-gray-500" />
-                <h2 className="font-semibold text-gray-900">{t('exportDatabase')}</h2>
+                <FileText size={20} className="text-muted-foreground" />
+                <h2 className="font-semibold text-foreground">{t('exportDatabase')}</h2>
               </div>
-              <p className="text-sm text-gray-500 mb-4">
+              <p className="text-sm text-muted-foreground mb-4">
                 {t('exportDatabaseHint')}
               </p>
               <button
@@ -4186,12 +5011,12 @@ export default function SettingsPage() {
             </div>
 
             {/* Database Backup */}
-            <div className="bg-white rounded-xl border border-blue-100 bg-blue-50/30 p-6">
+            <div className="bg-card rounded-xl border border-blue-100 bg-blue-50/30 p-6">
               <div className="flex items-center gap-2 mb-4">
                 <Database size={20} className="text-blue-600" />
-                <h2 className="font-semibold text-gray-900">{t('createBackup')}</h2>
+                <h2 className="font-semibold text-foreground">{t('createBackup')}</h2>
               </div>
-              <p className="text-sm text-gray-500 mb-4">
+              <p className="text-sm text-muted-foreground mb-4">
                 {t('createBackupHint')}
               </p>
               <div className="flex flex-wrap gap-2">
@@ -4203,7 +5028,7 @@ export default function SettingsPage() {
                 </button>
                 <button
                   onClick={handleChooseBackupLocation}
-                  className="px-5 py-2 text-sm bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 font-medium"
+                  className="px-5 py-2 text-sm bg-muted text-foreground rounded-lg hover:bg-muted font-medium"
                 >
                   {t('chooseBackupLocation')}
                 </button>
@@ -4211,35 +5036,35 @@ export default function SettingsPage() {
             </div>
 
             {/* Backup History */}
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            <div className="bg-card rounded-xl border border-border p-6">
               <div className="flex items-center justify-between mb-4">
                 <div className="flex items-center gap-2">
-                  <Database size={20} className="text-gray-500" />
-                  <h2 className="font-semibold text-gray-900">{t('backupHistory')}</h2>
+                  <Database size={20} className="text-muted-foreground" />
+                  <h2 className="font-semibold text-foreground">{t('backupHistory')}</h2>
                 </div>
                 <button
-                  onClick={fetchBackups}
+                  onClick={() => { void fetchBackups(); }}
                   disabled={backupsLoading}
-                  className="p-1.5 text-gray-400 hover:text-gray-600 rounded-lg hover:bg-gray-50 disabled:opacity-50"
+                  className="p-1.5 text-muted-foreground hover:text-foreground rounded-lg hover:bg-muted disabled:opacity-50"
                   title={t('refresh')}
                 >
                   <RefreshCw size={16} className={backupsLoading ? 'animate-spin' : ''} />
                 </button>
               </div>
-              <p className="text-sm text-gray-500 mb-4">
+              <p className="text-sm text-muted-foreground mb-4">
                 {t('backupHistoryHint')}
               </p>
               {backups.length === 0 ? (
-                <p className="text-sm text-gray-400 py-4 text-center">
+                <p className="text-sm text-muted-foreground py-4 text-center">
                   {backupsLoading ? tCommon('loading') : t('backupHistoryEmpty')}
                 </p>
               ) : (
-                <div className="divide-y divide-gray-100">
+                <div className="divide-y divide-border">
                   {backups.map((backup) => (
                     <div key={backup.path} className="flex items-center justify-between py-3 gap-3">
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
-                          <span className="text-sm font-medium text-gray-900">{formatDateTime(backup.createdAt)}</span>
+                          <span className="text-sm font-medium text-foreground">{formatDateTime(backup.createdAt)}</span>
                           {backup.kind === 'auto' && (
                             <span className="text-xs px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-100">
                               {t('backupKindAuto')}
@@ -4252,7 +5077,7 @@ export default function SettingsPage() {
                             </span>
                           )}
                         </div>
-                        <p className="text-xs text-gray-400 truncate">
+                        <p className="text-xs text-muted-foreground truncate">
                           {formatBackupSize(backup.sizeBytes)}
                           {backup.schemaVersion != null && ` · ${t('backupSchemaVersion', { version: backup.schemaVersion })}`}
                         </p>
@@ -4260,13 +5085,13 @@ export default function SettingsPage() {
                       <div className="shrink-0 flex items-center gap-2">
                         <button
                           onClick={() => handleRestoreFromHistory(backup)}
-                          className="px-3 py-1.5 text-xs bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 font-medium"
+                          className="px-3 py-1.5 text-xs bg-muted text-foreground rounded-lg hover:bg-muted font-medium"
                         >
                           {t('restoreBackup')}
                         </button>
                         <button
                           onClick={() => handleDeleteBackup(backup)}
-                          className="p-1.5 text-gray-400 hover:text-red-600 rounded-lg hover:bg-red-50"
+                          className="p-1.5 text-muted-foreground hover:text-red-600 rounded-lg hover:bg-red-50 dark:hover:bg-red-950/40"
                           title={t('deleteBackup')}
                         >
                           <Trash2 size={14} />
@@ -4279,52 +5104,52 @@ export default function SettingsPage() {
             </div>
 
             {/* Google Drive — automated off-device backups (#129) */}
-            <div className="bg-white rounded-xl border border-gray-100 p-6 space-y-4">
+            <div className="bg-card rounded-xl border border-border p-6 space-y-4">
               <div className="flex items-center gap-2">
-                <HardDrive size={20} className="text-gray-500" />
+                <HardDrive size={20} className="text-muted-foreground" />
                 <div>
-                  <h2 className="font-semibold text-gray-900">{t('googleDrive')}</h2>
-                  <p className="text-xs text-gray-500 mt-0.5">{t('googleDriveHint')}</p>
+                  <h2 className="font-semibold text-foreground">{t('googleDrive')}</h2>
+                  <p className="text-xs text-muted-foreground mt-0.5">{t('googleDriveHint')}</p>
                 </div>
               </div>
 
               {!googleDriveStatus.configured ? (
-                <div className="bg-gray-50 rounded-xl p-6 flex flex-col items-center justify-center text-center space-y-2">
-                  <div className="p-3 bg-white rounded-full shadow-sm">
-                    <HardDrive className="w-6 h-6 text-gray-400" />
+                <div className="bg-muted rounded-xl p-6 flex flex-col items-center justify-center text-center space-y-2">
+                  <div className="p-3 bg-card rounded-full shadow-sm">
+                    <HardDrive className="w-6 h-6 text-muted-foreground" />
                   </div>
-                  <p className="text-sm font-medium text-gray-900">{t('googleDriveNotConfigured')}</p>
-                  <p className="text-xs text-gray-500 max-w-sm">{t('googleDriveNotConfiguredHint')}</p>
+                  <p className="text-sm font-medium text-foreground">{t('googleDriveNotConfigured')}</p>
+                  <p className="text-xs text-muted-foreground max-w-sm">{t('googleDriveNotConfiguredHint')}</p>
                 </div>
               ) : !googleDriveStatus.secure_storage_available ? (
-                <div className="flex items-center gap-2 bg-amber-50 border border-amber-100 rounded-lg px-4 py-3">
-                  <AlertTriangle size={16} className="text-amber-600 shrink-0" />
-                  <p className="text-sm text-amber-800">{t('googleDriveSecureStorageUnavailable')}</p>
+                <div className="flex items-center gap-2 bg-amber-50 dark:bg-amber-950/40 border border-amber-100 dark:border-amber-800/40 rounded-lg px-4 py-3">
+                  <AlertTriangle size={16} className="text-amber-600 dark:text-amber-400 shrink-0" />
+                  <p className="text-sm text-amber-800 dark:text-amber-300">{t('googleDriveSecureStorageUnavailable')}</p>
                 </div>
               ) : (
                 <>
-                  <div className="rounded-lg border border-gray-100 px-4 py-3 flex items-center justify-between gap-3 flex-wrap">
+                  <div className="rounded-lg border border-border px-4 py-3 flex items-center justify-between gap-3 flex-wrap">
                     <div className="flex items-center gap-2">
                       {googleDriveStatus.connected ? (
                         <CheckCircle2 size={16} className="text-green-600 shrink-0" />
                       ) : (
-                        <CloudOff size={16} className="text-gray-400 shrink-0" />
+                        <CloudOff size={16} className="text-muted-foreground shrink-0" />
                       )}
                       <div>
-                        <p className="text-sm font-medium text-gray-900">
+                        <p className="text-sm font-medium text-foreground">
                           {googleDriveStatus.connected ? t('googleDriveConnected') : t('googleDriveNotConnected')}
                         </p>
                         {googleDriveStatus.connected && googleDriveStatus.account_email && (
-                          <p className="text-xs text-gray-500">{t('googleDriveAccount')}: <Ltr>{googleDriveStatus.account_email}</Ltr></p>
+                          <p className="text-xs text-muted-foreground">{t('googleDriveAccount')}: <Ltr>{googleDriveStatus.account_email}</Ltr></p>
                         )}
                       </div>
                     </div>
-                    {(currentTenant?.role === 'owner') && (
+                    {isOwner && (
                       googleDriveStatus.connected ? (
                         <button
                           onClick={disconnectGoogleDrive}
                           disabled={disconnectingGoogleDrive}
-                          className="px-4 py-2 text-sm border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-50 font-medium shrink-0"
+                          className="px-4 py-2 text-sm border border-border rounded-lg hover:bg-muted disabled:opacity-50 font-medium shrink-0"
                         >
                           {disconnectingGoogleDrive ? t('googleDriveDisconnecting') : t('googleDriveDisconnect')}
                         </button>
@@ -4344,19 +5169,19 @@ export default function SettingsPage() {
                     <>
                       <div className="grid sm:grid-cols-2 gap-4">
                         <div>
-                          <label className="block text-sm font-medium text-gray-700 mb-1">{t('googleDriveFrequency')}</label>
+                          <label className="block text-sm font-medium text-foreground mb-1">{t('googleDriveFrequency')}</label>
                           <select
                             value={googleDriveStatus.frequency}
                             disabled={savingGoogleDrivePrefs}
                             onChange={(e) => updateGoogleDrivePrefs({ frequency: e.target.value as 'daily' | 'weekly' })}
-                            className="w-full px-3 py-2 text-sm border border-gray-200 rounded-lg outline-none focus:ring-2 focus:ring-brand bg-white"
+                            className="w-full px-3 py-2 border border-border rounded-lg text-sm focus:ring-2 focus:ring-brand outline-none bg-card text-foreground disabled:opacity-50"
                           >
                             <option value="daily">{t('googleDriveFrequencyDaily')}</option>
                             <option value="weekly">{t('googleDriveFrequencyWeekly')}</option>
                           </select>
                         </div>
                         <div>
-                          <label className="block text-sm font-medium text-gray-700 mb-1">{t('googleDriveRetention')}</label>
+                          <label className="block text-sm font-medium text-foreground mb-1">{t('googleDriveRetention')}</label>
                           <input
                             type="number"
                             min={1}
@@ -4368,14 +5193,14 @@ export default function SettingsPage() {
                               const n = Number(e.target.value);
                               if (Number.isInteger(n) && n >= 1 && n <= 100) updateGoogleDrivePrefs({ retention_count: n });
                             }}
-                            className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-brand outline-none disabled:opacity-50"
+                            className="w-full px-3 py-2 border border-gray-300 dark:border-border rounded-lg text-sm focus:ring-2 focus:ring-brand outline-none disabled:opacity-50"
                           />
                         </div>
                       </div>
-                      <p className="text-xs text-gray-500">{t('googleDriveRetentionHint')}</p>
+                      <p className="text-xs text-muted-foreground">{t('googleDriveRetentionHint')}</p>
 
                       <div className="flex items-center justify-between gap-3 flex-wrap pt-1">
-                        <div className="text-xs text-gray-500">
+                        <div className="text-xs text-muted-foreground">
                           {googleDriveStatus.last_backup_at ? (
                             googleDriveStatus.last_backup_status === 'error' ? (
                               <span className="flex items-center gap-1 text-red-600">
@@ -4383,7 +5208,7 @@ export default function SettingsPage() {
                                 {t('googleDriveLastBackupErrorAt', { time: formatDateTime(googleDriveStatus.last_backup_at) })}
                               </span>
                             ) : (
-                              <span className="flex items-center gap-1 text-gray-500">
+                              <span className="flex items-center gap-1 text-muted-foreground">
                                 <CheckCircle2 size={13} className="text-green-600" />
                                 {t('googleDriveLastBackupSuccessAt', { time: formatDateTime(googleDriveStatus.last_backup_at) })}
                               </span>
@@ -4392,7 +5217,7 @@ export default function SettingsPage() {
                             <span>{t('googleDriveLastBackup')}: {t('googleDriveLastBackupNever')}</span>
                           )}
                         </div>
-                        {(currentTenant?.role === 'owner') && (
+                        {isOwner && (
                           <button
                             onClick={backupToGoogleDriveNow}
                             disabled={backingUpGoogleDrive}
@@ -4410,12 +5235,12 @@ export default function SettingsPage() {
             </div>
 
             {/* Database Import */}
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            <div className="bg-card rounded-xl border border-border p-6">
               <div className="flex items-center gap-2 mb-4">
-                <FileText size={20} className="text-gray-500" />
-                <h2 className="font-semibold text-gray-900">{t('importDatabase')}</h2>
+                <FileText size={20} className="text-muted-foreground" />
+                <h2 className="font-semibold text-foreground">{t('importDatabase')}</h2>
               </div>
-              <p className="text-sm text-gray-500 mb-4">
+              <p className="text-sm text-muted-foreground mb-4">
                 {t('importDatabaseHint')}
               </p>
               <input
@@ -4438,9 +5263,8 @@ export default function SettingsPage() {
 
                       const overwrite = await confirm(t('importOverwriteConfirm'), { confirmLabel: t('replaceAll') });
 
-                      // A schema-mismatch import takes the same destructive
-                      // delete-and-replace path as an overwrite, so it needs the
-                      // same Master PIN confirmation (GHSA-xxv4-gm82-4639).
+                      // Schema-mismatch import deletes and replaces data like an overwrite,
+                      // requiring Master PIN confirmation.
                       const rawImportVersion = String(data.schema_version ?? '');
                       const importVersion = /^(?:0|[1-9]\d*)$/.test(rawImportVersion) ? Number(rawImportVersion) : null;
                       const schemaMismatch = masterPinStatus.schemaVersion != null
@@ -4468,7 +5292,7 @@ export default function SettingsPage() {
               <div className="flex gap-2">
                 <label
                   htmlFor="import-file"
-                  className="px-5 py-2 text-sm bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 cursor-pointer font-medium"
+                  className="px-5 py-2 text-sm bg-muted text-foreground rounded-lg hover:bg-muted cursor-pointer font-medium"
                 >
                   {t('selectFileAndImport')}
                 </label>
@@ -4476,10 +5300,10 @@ export default function SettingsPage() {
             </div>
 
             {/* Database Info */}
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            <div className="bg-card rounded-xl border border-border p-6">
               <div className="flex items-center gap-2 mb-4">
-                <Database size={20} className="text-gray-500" />
-                <h2 className="font-semibold text-gray-900">{t('databaseInformation')}</h2>
+                <Database size={20} className="text-muted-foreground" />
+                <h2 className="font-semibold text-foreground">{t('databaseInformation')}</h2>
               </div>
               <button
                 onClick={async () => {
@@ -4492,36 +5316,36 @@ export default function SettingsPage() {
                     toast.error(t('tableInfoFailed'));
                   }
                 }}
-                className="px-5 py-2 text-sm border border-gray-200 text-gray-600 rounded-lg hover:bg-gray-50 font-medium"
+                className="px-5 py-2 text-sm border border-border text-muted-foreground rounded-lg hover:bg-muted font-medium"
               >
                 {t('viewTableInfo')}
               </button>
             </div>
 
             {/* Database Health Check */}
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            <div className="bg-card rounded-xl border border-border p-6">
               <div className="flex items-center gap-2 mb-4">
-                <Wrench size={20} className="text-gray-500" />
-                <h2 className="font-semibold text-gray-900">{t('databaseHealthCheck')}</h2>
+                <Wrench size={20} className="text-muted-foreground" />
+                <h2 className="font-semibold text-foreground">{t('databaseHealthCheck')}</h2>
               </div>
-              <p className="text-sm text-gray-500 mb-4">
+              <p className="text-sm text-muted-foreground mb-4">
                 {t('databaseHealthCheckDescription')}
               </p>
               <button
                 onClick={runHealthCheck}
-                className="px-5 py-2 text-sm border border-gray-200 text-gray-600 rounded-lg hover:bg-gray-50 font-medium"
+                className="px-5 py-2 text-sm border border-border text-muted-foreground rounded-lg hover:bg-muted font-medium"
               >
                 {t('databaseHealthCheck')}
               </button>
             </div>
 
             {/* Master PIN */}
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            <div className="bg-card rounded-xl border border-border p-6">
               <div className="flex items-center gap-2 mb-4">
-                <KeyRound size={20} className="text-gray-500" />
-                <h2 className="font-semibold text-gray-900">{t('masterPin')}</h2>
+                <KeyRound size={20} className="text-muted-foreground" />
+                <h2 className="font-semibold text-foreground">{t('masterPin')}</h2>
               </div>
-              <p className="text-sm text-gray-500 mb-4">
+              <p className="text-sm text-muted-foreground mb-4">
                 {t('masterPinDataDescription')}
               </p>
               {!masterPinStatus.available ? (
@@ -4533,7 +5357,7 @@ export default function SettingsPage() {
                   </span>
                   <button
                     onClick={() => setPinGate({ mode: 'set' })}
-                    className="px-5 py-2 text-sm border border-gray-200 text-gray-600 rounded-lg hover:bg-gray-50 font-medium"
+                    className="px-5 py-2 text-sm border border-border text-muted-foreground rounded-lg hover:bg-muted font-medium"
                   >
                     {masterPinStatus.isSet ? t('masterPinChangeButton') : t('masterPinSetButton')}
                   </button>
@@ -4542,12 +5366,12 @@ export default function SettingsPage() {
             </div>
 
             {/* Danger Zone: Initialize Database */}
-            <div className="bg-white rounded-xl border border-red-200 p-6">
+            <div className="bg-card rounded-xl border border-red-200 p-6">
               <div className="flex items-center gap-2 mb-4">
                 <AlertTriangle size={20} className="text-red-600" />
                 <h2 className="font-semibold text-red-600">{t('initializeDatabase')}</h2>
               </div>
-              <p className="text-sm text-gray-500 mb-4">
+              <p className="text-sm text-muted-foreground mb-4">
                 {t('initializeDatabaseDescription')}
               </p>
               <button
@@ -4567,10 +5391,10 @@ export default function SettingsPage() {
             {!whatsappEnabled ? (
               <WhatsAppEnableCard />
             ) : (
-              <div className="bg-white rounded-xl border border-gray-100 p-6 flex items-center justify-between gap-4">
+              <div className="bg-card rounded-xl border border-border p-6 flex items-center justify-between gap-4">
                 <div>
-                  <p className="font-semibold text-gray-900">{tWhatsappSettings('enabled')}</p>
-                  <p className="text-xs text-gray-500 mt-0.5">{tWhatsappSettings('enabledHint')}</p>
+                  <p className="font-semibold text-foreground">{tWhatsappSettings('enabled')}</p>
+                  <p className="text-xs text-muted-foreground mt-0.5">{tWhatsappSettings('enabledHint')}</p>
                 </div>
                 <Button asChild variant="outline" size="sm">
                   <Link href="/whatsapp">{tWhatsappSettings('openConnection')}</Link>
@@ -4583,26 +5407,26 @@ export default function SettingsPage() {
         <TabsContent value="mobile-access">
           <div className="pb-6 max-w-3xl space-y-6">
             <div className="space-y-6">
-            <h2 className="text-lg font-semibold text-gray-900">{t('tabMobileAccess')}</h2>
+            <h2 className="text-lg font-semibold text-foreground">{t('tabMobileAccess')}</h2>
 
             {/* FloAdmin — reporting sync */}
-            <div className="bg-white rounded-xl border border-gray-100 p-6 space-y-5">
+            <div className="bg-card rounded-xl border border-border p-6 space-y-5">
               <div className="flex items-center gap-2">
                 <Cloud size={20} className="text-brand" />
                 <div>
-                  <h2 className="font-semibold text-gray-900">{t('floadminSalesReporting')}</h2>
-                  <p className="text-xs text-gray-500 mt-0.5">{t('floadminSalesReportingHint')}</p>
+                  <h2 className="font-semibold text-foreground">{t('floadminSalesReporting')}</h2>
+                  <p className="text-xs text-muted-foreground mt-0.5">{t('floadminSalesReportingHint')}</p>
                 </div>
               </div>
 
               {cloudStatus.cloud_registration_status === 'unregistered' ? (
-                <div className="bg-gray-50 rounded-xl p-6 flex flex-col items-center justify-center text-center space-y-4">
-                  <div className="p-3 bg-white rounded-full shadow-sm">
+                <div className="bg-muted rounded-xl p-6 flex flex-col items-center justify-center text-center space-y-4">
+                  <div className="p-3 bg-card rounded-full shadow-sm">
                     <Cloud className="w-6 h-6 text-brand" />
                   </div>
                   <div>
-                    <h3 className="font-medium text-gray-900">{t('cloudServicesDisabled')}</h3>
-                    <p className="text-sm text-gray-500 mt-1 max-w-sm">{t('cloudServicesDisabledHint')}</p>
+                    <h3 className="font-medium text-foreground">{t('cloudServicesDisabled')}</h3>
+                    <p className="text-sm text-muted-foreground mt-1 max-w-sm">{t('cloudServicesDisabledHint')}</p>
                   </div>
                   <button
                     onClick={() => setShowInitializeCloudConfirm(true)}
@@ -4613,15 +5437,15 @@ export default function SettingsPage() {
                 </div>
               ) : (
                 <>
-                  <div className="rounded-lg border border-gray-100 px-4 py-3 flex items-center justify-between gap-3 flex-wrap">
+                  <div className="rounded-lg border border-border px-4 py-3 flex items-center justify-between gap-3 flex-wrap">
                     <div className="flex items-center gap-2">
                   {cloudStatus.cloud_registration_status === 'registered' && !cloudServicesStopped ? (
                     <CheckCircle2 size={16} className="text-green-600 shrink-0" />
                   ) : (
-                    <CloudOff size={16} className="text-gray-400 shrink-0" />
+                    <CloudOff size={16} className="text-muted-foreground shrink-0" />
                   )}
                   <div>
-                    <p className="text-sm font-medium text-gray-900">
+                    <p className="text-sm font-medium text-foreground">
                       {cloudStatus.cloud_registration_status === 'registered' && cloudServicesStopped && t('cloudServicesStopped')}
                       {cloudStatus.cloud_registration_status === 'registered' && !cloudServicesStopped && (cloudStatus.cloud_connected ? t('connectedToFloadmin') : t('registeredReconnecting'))}
                       {cloudStatus.cloud_registration_status === 'rejected' && t('registrationRejected')}
@@ -4631,7 +5455,7 @@ export default function SettingsPage() {
                       {cloudStatus.cloud_registration_status === 'deleted' && t('cloudDataDeleted')}
                       {(cloudStatus.cloud_registration_status === 'unregistered' || cloudStatus.cloud_registration_status === 'registration_failed') && t('notRegistered')}
                     </p>
-                    <p className="text-xs text-gray-500">
+                    <p className="text-xs text-muted-foreground">
                       {cloudStatus.cloud_registration_status === 'registered' && cloudServicesStopped && t('cloudResumeHint')}
                       {cloudStatus.cloud_registration_status === 'registered' && !cloudServicesStopped && (cloudStatus.cloud_last_heartbeat ? t('liveChannelHeartbeat', { mode: cloudStatus.cloud_relay_mode.replace('_', ' '), time: formatTime(cloudStatus.cloud_last_heartbeat) }) : t('liveChannel', { mode: cloudStatus.cloud_relay_mode.replace('_', ' ') }))}
                       {cloudStatus.cloud_registration_status === 'rejected' && t('registrationContactSupport')}
@@ -4657,23 +5481,26 @@ export default function SettingsPage() {
 
               {cloudStatus.cloud_registration_status !== 'deleted' && (
               <div className="space-y-3">
-                <p className="text-sm text-gray-600">{t('cloudManagedAutomatically')}</p>
+                <p className="text-sm text-muted-foreground">{t('cloudManagedAutomatically')}</p>
 
                 <label className="flex items-start gap-3 cursor-pointer">
                   <input
                     type="checkbox"
                     checked={cloudSettings.cloud_sync_enabled}
-                    onChange={(e) => setCloudSettings({ ...cloudSettings, cloud_sync_enabled: e.target.checked })}
-                    className="mt-0.5 rounded border-gray-300 text-brand focus:ring-brand"
+                    onChange={(e) => {
+                      markHydrationTouched('cloud_sync_enabled');
+                      setCloudSettings({ ...cloudSettings, cloud_sync_enabled: e.target.checked });
+                    }}
+                    className="mt-0.5 rounded border-gray-300 dark:border-border text-brand focus:ring-brand"
                   />
                   <div>
-                    <span className="text-sm font-medium text-gray-900 block">{cloudServicesStopped ? t('cloudEnableButton') : t('enableBillSync')}</span>
-                    <p className="text-xs text-gray-500 mt-1">{cloudServicesStopped ? t('cloudResumeHintStopped') : t('enableBillSyncHint')}</p>
+                    <span className="text-sm font-medium text-foreground block">{cloudServicesStopped ? t('cloudEnableButton') : t('enableBillSync')}</span>
+                    <p className="text-xs text-muted-foreground mt-1">{cloudServicesStopped ? t('cloudResumeHintStopped') : t('enableBillSyncHint')}</p>
                   </div>
                 </label>
 
                     {cloudSettings.cloud_last_sync && (
-                      <p className="text-xs text-gray-400">{t('lastSync', { time: formatDateTime(cloudSettings.cloud_last_sync) })}</p>
+                      <p className="text-xs text-muted-foreground">{t('lastSync', { time: formatDateTime(cloudSettings.cloud_last_sync) })}</p>
                     )}
                   </div>
               )}
@@ -4682,23 +5509,23 @@ export default function SettingsPage() {
             </div>
 
             {/* RevFlo — consolidated: download/QR + app (pairing) code + paired devices */}
-            <div className="bg-white rounded-xl border border-gray-100 p-6 space-y-5">
+            <div className="bg-card rounded-xl border border-border p-6 space-y-5">
               <div className="flex items-center gap-2">
-                <Smartphone size={20} className="text-gray-500" />
+                <Smartphone size={20} className="text-muted-foreground" />
                 <div>
-                  <h2 className="font-semibold text-gray-900">{revflo?.name || t('revflo')}</h2>
-                  <p className="text-xs text-gray-500 mt-0.5">{revflo?.tagline || t('revfloHint')}</p>
+                  <h2 className="font-semibold text-foreground">{revflo?.name || t('revflo')}</h2>
+                  <p className="text-xs text-muted-foreground mt-0.5">{revflo?.tagline || t('revfloHint')}</p>
                 </div>
               </div>
 
               {revflo?.available && (
-                <div className="flex flex-col sm:flex-row gap-5 items-start border border-gray-100 rounded-xl p-5">
+                <div className="flex flex-col sm:flex-row gap-5 items-start border border-border rounded-xl p-5">
                   <div className="shrink-0">
                     {revflo.qr_data_url ? (
                       <img src={revflo.qr_data_url} alt={t('appQrAlt', { name: revflo.name })}
-                        className="w-28 h-28 rounded-lg border border-gray-200" />
+                        className="w-28 h-28 rounded-lg border border-border" />
                     ) : (
-                      <div className="w-28 h-28 rounded-lg border border-gray-200 flex items-center justify-center text-gray-400">
+                      <div className="w-28 h-28 rounded-lg border border-border flex items-center justify-center text-muted-foreground">
                         <QrCode size={32} />
                       </div>
                     )}
@@ -4719,25 +5546,25 @@ export default function SettingsPage() {
               )}
 
               <div>
-                <p className="text-sm font-medium text-gray-900 mb-1">{t('mobileApp')}</p>
-                <p className="text-xs text-gray-500 mb-4">{t('mobileAppHint')}</p>
+                <p className="text-sm font-medium text-foreground mb-1">{t('mobileApp')}</p>
+                <p className="text-xs text-muted-foreground mb-4">{t('mobileAppHint')}</p>
                 {pairingUnavailable ? (
-                  <p className="text-sm text-gray-500">{t('mobilePairingNeedsCloud')}</p>
+                  <p className="text-sm text-muted-foreground">{t('mobilePairingNeedsCloud')}</p>
                 ) : pairingCode ? (
                   <div className="space-y-3">
                     <div className="flex items-center gap-4">
                       {pairingQrDataUrl && (
-                        <img src={pairingQrDataUrl} alt={t('pairingQrAlt')} className="w-28 h-28 rounded-lg border border-gray-200" />
+                        <img src={pairingQrDataUrl} alt={t('pairingQrAlt')} className="w-28 h-28 rounded-lg border border-border" />
                       )}
                       <div className="flex items-center gap-3 flex-1">
-                      <div className="flex-1 bg-gray-50 border border-gray-200 rounded-lg px-4 py-3 text-center">
-                        <span className="font-mono text-2xl font-bold tracking-[0.3em] text-gray-900">
+                      <div className="flex-1 bg-muted border border-border rounded-lg px-4 py-3 text-center">
+                        <span className="font-mono text-2xl font-bold tracking-[0.3em] text-foreground">
                           <Ltr>{pairingCode.toUpperCase()}</Ltr>
                         </span>
                       </div>
                       <button
                         onClick={copyPairingCode}
-                        className="p-2.5 border border-gray-200 rounded-lg hover:bg-gray-50 text-gray-500"
+                        className="p-2.5 border border-border rounded-lg hover:bg-muted text-muted-foreground"
                         title={t('copyCode')}
                       >
                         {copiedCode ? <Check size={18} className="text-green-600" /> : <Copy size={18} />}
@@ -4745,17 +5572,17 @@ export default function SettingsPage() {
                       </div>
                     </div>
                     {pairingExpiresAt && (
-                      <p className="text-xs text-gray-400">
+                      <p className="text-xs text-muted-foreground">
                         {t('codeExpires', { date: formatDate(pairingExpiresAt) })}
                       </p>
                     )}
-                    <p className="text-xs text-gray-500">
+                    <p className="text-xs text-muted-foreground">
                       {t('pairingCodeSingleUse')}
                     </p>
                     <button
                       onClick={rotatePairingCode}
                       disabled={rotatingCode}
-                      className="flex items-center gap-2 text-sm text-gray-600 hover:text-gray-900 disabled:opacity-50"
+                      className="flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground disabled:opacity-50"
                     >
                       <RefreshCw size={14} className={rotatingCode ? 'animate-spin' : ''} />
                       {rotatingCode ? t('generating') : t('generateNewCode')}
@@ -4776,31 +5603,31 @@ export default function SettingsPage() {
               </div>
 
               {!pairingUnavailable && (
-                <div className="pt-5 border-t border-gray-100">
-                  <p className="text-sm font-medium text-gray-900 mb-3">{t('pairedDevices')}</p>
+                <div className="pt-5 border-t border-border">
+                  <p className="text-sm font-medium text-foreground mb-3">{t('pairedDevices')}</p>
                   {devicesLoading ? (
-                    <p className="text-sm text-gray-400">{t('loading')}</p>
+                    <p className="text-sm text-muted-foreground">{t('loading')}</p>
                   ) : pairedDevices.length === 0 ? (
-                    <p className="text-sm text-gray-500">{t('noPairedDevices')}</p>
+                    <p className="text-sm text-muted-foreground">{t('noPairedDevices')}</p>
                   ) : (
                     <div className="space-y-2">
                       {pairedDevices.map((d) => (
-                        <div key={d.id} className="bg-gray-50 border border-gray-200 rounded-lg px-4 py-3 text-sm">
+                        <div key={d.id} className="bg-muted border border-border rounded-lg px-4 py-3 text-sm">
                           <div className="flex items-center justify-between">
-                            <span className="font-medium text-gray-900 capitalize">
+                            <span className="font-medium text-foreground capitalize">
                               {d.platform || t('unknownPlatform')}
                               {d.country ? ` · ${d.country}` : ''}
                             </span>
-                            <span className="text-xs text-gray-400">
+                            <span className="text-xs text-muted-foreground">
                               {t('lastActive', { date: formatDate(d.last_seen_at) })}
                             </span>
                           </div>
-                          <p className="text-xs text-gray-500 mt-1">
+                          <p className="text-xs text-muted-foreground mt-1">
                             {t('firstPaired', { date: formatDate(d.first_seen_at) })}
                             {d.app_version ? ` · v${d.app_version}` : ''}
                           </p>
                           {d.user_agent && (
-                            <p className="text-xs text-gray-400 mt-1 truncate" title={d.user_agent}>{d.user_agent}</p>
+                            <p className="text-xs text-muted-foreground mt-1 truncate" title={d.user_agent}>{d.user_agent}</p>
                           )}
                         </div>
                       ))}
@@ -4816,15 +5643,15 @@ export default function SettingsPage() {
         <TabsContent value="orderflow">
           <div className="pb-6 max-w-3xl space-y-6">
             <div className="space-y-6">
-            <h2 className="text-lg font-semibold text-gray-900">{t('tabOrderflow')}</h2>
+            <h2 className="text-lg font-semibold text-foreground">{t('tabOrderflow')}</h2>
 
             {/* OrderFlow — online orders */}
-            <div className="bg-white rounded-xl border border-gray-100 p-6 space-y-4">
+            <div className="bg-card rounded-xl border border-border p-6 space-y-4">
               <div className="flex items-center gap-2">
                 <Zap size={20} className="text-amber-500" />
                 <div>
-                  <h2 className="font-semibold text-gray-900">{t('orderflowOnlineOrders')}</h2>
-                  <p className="text-xs text-gray-500 mt-0.5">{t('orderflowOnlineOrdersHint')}</p>
+                  <h2 className="font-semibold text-foreground">{t('orderflowOnlineOrders')}</h2>
+                  <p className="text-xs text-muted-foreground mt-0.5">{t('orderflowOnlineOrdersHint')}</p>
                 </div>
               </div>
 
@@ -4832,10 +5659,13 @@ export default function SettingsPage() {
                 <input
                   type="checkbox"
                   checked={cloudSettings.cloud_orders_enabled}
-                  onChange={(e) => setCloudSettings({ ...cloudSettings, cloud_orders_enabled: e.target.checked })}
-                  className="rounded border-gray-300 text-brand focus:ring-brand"
+                    onChange={(e) => {
+                      markHydrationTouched('cloud_orders_enabled');
+                      setCloudSettings({ ...cloudSettings, cloud_orders_enabled: e.target.checked });
+                    }}
+                  className="rounded border-gray-300 dark:border-border text-brand focus:ring-brand"
                 />
-                <span className="text-sm text-gray-700">{t('enableOnlineOrderPolling')}</span>
+                <span className="text-sm text-foreground">{t('enableOnlineOrderPolling')}</span>
               </label>
 
             </div>
@@ -4846,9 +5676,9 @@ export default function SettingsPage() {
         {/* About tab */}
         <TabsContent value="about">
           <div className="pb-6 max-w-3xl space-y-6">
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
-              <h2 className="font-semibold text-gray-900 mb-4">{t('aboutFloCafe')}</h2>
-              <p className="text-sm text-gray-600 mb-6">
+            <div className="bg-card rounded-xl border border-border p-6">
+              <h2 className="font-semibold text-foreground mb-4">{t('aboutFloCafe')}</h2>
+              <p className="text-sm text-muted-foreground mb-6">
                 {t('aboutDescription')}
               </p>
               <div className="space-y-3">
@@ -4864,12 +5694,12 @@ export default function SettingsPage() {
             </div>
 
             {/* More Apps — moved here from the old Integrations tab */}
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            <div className="bg-card rounded-xl border border-border p-6">
               <div className="flex items-center gap-2 mb-4">
-                <Smartphone size={20} className="text-gray-500" />
-                <h2 className="font-semibold text-gray-900">{t('moreApps')}</h2>
+                <Smartphone size={20} className="text-muted-foreground" />
+                <h2 className="font-semibold text-foreground">{t('moreApps')}</h2>
               </div>
-              <p className="text-sm text-gray-500 mb-5">
+              <p className="text-sm text-muted-foreground mb-5">
                 {t('moreAppsHint')}
               </p>
 
@@ -4882,25 +5712,25 @@ export default function SettingsPage() {
               {!moreAppsLoading && (
                 <div className="space-y-4">
                   {moreApps.map((app) => (
-                    <div key={app.id} className="flex flex-col sm:flex-row gap-5 items-start border border-gray-100 rounded-xl p-5">
+                    <div key={app.id} className="flex flex-col sm:flex-row gap-5 items-start border border-border rounded-xl p-5">
                       <div className="shrink-0">
                         {app.qr_data_url ? (
                           <img src={app.qr_data_url} alt={t('appQrAlt', { name: app.name })}
-                            className="w-32 h-32 rounded-lg border border-gray-200" />
+                            className="w-32 h-32 rounded-lg border border-border" />
                         ) : (
-                          <div className="w-32 h-32 rounded-lg border border-gray-200 flex items-center justify-center text-gray-400">
+                          <div className="w-32 h-32 rounded-lg border border-border flex items-center justify-center text-muted-foreground">
                             <QrCode size={36} />
                           </div>
                         )}
                       </div>
                       <div className="flex-1">
                         <div className="flex items-center gap-2 mb-1">
-                          <h3 className="font-semibold text-gray-900">{app.name}</h3>
+                          <h3 className="font-semibold text-foreground">{app.name}</h3>
                           {!app.available && (
-                            <span className="text-xs font-medium text-gray-400 bg-gray-100 px-2 py-0.5 rounded-full">{t('comingSoon')}</span>
+                            <span className="text-xs font-medium text-muted-foreground bg-muted px-2 py-0.5 rounded-full">{t('comingSoon')}</span>
                           )}
                         </div>
-                        <p className="text-sm text-gray-500 mb-3">{app.tagline}</p>
+                        <p className="text-sm text-muted-foreground mb-3">{app.tagline}</p>
                         <div className="flex gap-3 text-sm">
                           {app.ios_url && (
                             <a href={app.ios_url} target="_blank" rel="noopener noreferrer" className="text-brand hover:underline">
@@ -4917,7 +5747,7 @@ export default function SettingsPage() {
                     </div>
                   ))}
                   {moreApps.length === 0 && (
-                    <p className="text-sm text-gray-400 text-center py-10">{t('noAppsToShow')}</p>
+                    <p className="text-sm text-muted-foreground text-center py-10">{t('noAppsToShow')}</p>
                   )}
                 </div>
               )}
@@ -4928,12 +5758,12 @@ export default function SettingsPage() {
         {/* Software Updates tab */}
         <TabsContent value="updates">
           <div className="pb-6 max-w-3xl space-y-6">
-            <div className="bg-white rounded-xl border border-gray-100 p-6">
+            <div className="bg-card rounded-xl border border-border p-6">
             <div className="flex items-center gap-2 mb-4">
-              <RefreshCw size={20} className="text-gray-500" />
-              <h2 className="font-semibold text-gray-900">{t('updates')}</h2>
+              <RefreshCw size={20} className="text-muted-foreground" />
+              <h2 className="font-semibold text-foreground">{t('updates')}</h2>
             </div>
-            <p className="text-sm text-gray-500 mb-6">
+            <p className="text-sm text-muted-foreground mb-6">
               {!isElectron
                 ? t('softwareUpdatesHintBrowser')
                 : updateStatus?.status === 'store-managed'
@@ -4948,14 +5778,14 @@ export default function SettingsPage() {
             {isElectron && updateStatus && updateStatus.status !== 'store-managed' && updateStatus.status !== 'linux-managed' && (
               <div className={`p-4 rounded-lg mb-4 ${
                 updateStatus.status === 'available' || updateStatus.status === 'ready-to-install'
-                  ? 'bg-green-50 border border-green-200'
+                  ? 'bg-green-50 border border-green-200 dark:bg-green-950/50 dark:border-green-800'
                   : updateStatus.status === 'up-to-date'
-                  ? 'bg-green-50 border border-green-200'
+                  ? 'bg-green-50 border border-green-200 dark:bg-green-950/50 dark:border-green-800'
                   : updateStatus.status === 'check-failed'
-                  ? 'bg-red-50 border border-red-200'
+                  ? 'bg-red-50 border border-red-200 dark:bg-red-950/50 dark:border-red-800'
                   : updateStatus.status === 'offline' || updateStatus.status === 'dev-mode'
-                  ? 'bg-yellow-50 border border-yellow-200'
-                  : 'bg-gray-50 border border-gray-200'
+                  ? 'bg-yellow-50 border border-yellow-200 dark:bg-yellow-950/50 dark:border-yellow-800'
+                  : 'bg-muted border border-border'
               }`}>
                 <div className="flex items-center gap-2 mb-2">
                   {(updateStatus.status === 'checking' || updateStatus.status === 'downloading') && <RefreshCw size={16} className="animate-spin text-brand" />}
@@ -4965,7 +5795,7 @@ export default function SettingsPage() {
                   {updateStatus.status === 'check-failed' && <span className="text-red-600">✕</span>}
                   {updateStatus.status === 'offline' && <span className="text-yellow-600">⚠</span>}
                   {updateStatus.status === 'dev-mode' && <span className="text-yellow-600">⚠</span>}
-                  {updateStatus.status === 'not-checked-yet' && <span className="text-gray-500">—</span>}
+                  {updateStatus.status === 'not-checked-yet' && <span className="text-muted-foreground">—</span>}
                   <span className="font-medium">
                     {updateStatus.status === 'available' ? t('updateStatusAvailable')
                      : updateStatus.status === 'up-to-date' ? t('updateStatusUpToDate')
@@ -4979,33 +5809,33 @@ export default function SettingsPage() {
                   </span>
                 </div>
                 {appVersion && (
-                  <p className="text-sm font-medium text-gray-900">{t('version')}: <Ltr>{appVersion}</Ltr></p>
+                  <p className="text-sm font-medium text-foreground">{t('version')}: <Ltr>{appVersion}</Ltr></p>
                 )}
                 {updateStatus.version && updateStatus.version !== appVersion && (
-                  <p className="text-sm text-gray-600 mt-1">{t('updateLatestAvailable')} <Ltr>{updateStatus.version}</Ltr></p>
+                  <p className="text-sm text-muted-foreground mt-1">{t('updateLatestAvailable')} <Ltr>{updateStatus.version}</Ltr></p>
                 )}
                 {updateStatus.percent !== undefined && (
                   <div className="mt-2">
-                    <div className="w-full bg-gray-200 rounded-full h-2">
+                    <div className="w-full bg-gray-200 dark:bg-muted rounded-full h-2">
                       <div
                         className="bg-brand h-2 rounded-full transition-all"
                         style={{ width: `${updateStatus.percent}%` }}
                       />
                     </div>
-                    <p className="text-xs text-gray-500 mt-1">{t('percentDownloaded', { percent: updateStatus.percent.toFixed(1) })}</p>
+                    <p className="text-xs text-muted-foreground mt-1">{t('percentDownloaded', { percent: updateStatus.percent.toFixed(1) })}</p>
                   </div>
                 )}
                 {updateStatus.status === 'up-to-date' && (
-                  <p className="text-sm text-gray-600">{t('upToDate')}</p>
+                  <p className="text-sm text-muted-foreground">{t('upToDate')}</p>
                 )}
                 {updateStatus.status === 'not-checked-yet' && (
-                  <p className="text-sm text-gray-600">{t('notCheckedYetHint')}</p>
+                  <p className="text-sm text-muted-foreground">{t('notCheckedYetHint')}</p>
                 )}
                 {updateStatus.status === 'dev-mode' && (
-                  <p className="text-sm text-yellow-700">{t('devModeDisabled')}</p>
+                  <p className="text-sm text-yellow-700 dark:text-yellow-300">{t('devModeDisabled')}</p>
                 )}
                 {(updateStatus.status === 'check-failed' || updateStatus.status === 'offline') && (
-                  <p className="text-sm mt-1 text-red-600">
+                  <p className="text-sm mt-1 text-red-600 dark:text-red-300">
                     {updateStatus.reason === 'manifest-missing'
                       ? t('updateErrorManifestMissing')
                       : updateStatus.reason === 'download-failed'
@@ -5017,8 +5847,8 @@ export default function SettingsPage() {
                 )}
                 {(updateStatus.status === 'check-failed' || updateStatus.status === 'offline') && updateStatus.error && (
                   <details className="mt-1">
-                    <summary className="text-xs text-gray-500 cursor-pointer">{t('errorDetails')}</summary>
-                    <p className="text-xs text-gray-500 mt-0.5 break-all"><Ltr>{updateStatus.error}</Ltr></p>
+                    <summary className="text-xs text-muted-foreground cursor-pointer">{t('errorDetails')}</summary>
+                    <p className="text-xs text-muted-foreground mt-0.5 break-all"><Ltr>{updateStatus.error}</Ltr></p>
                   </details>
                 )}
               </div>
@@ -5037,6 +5867,12 @@ export default function SettingsPage() {
               </div>
             )}
           </div>
+
+          {/* #463: beta/pre-release channel opt-in; feature-detects the
+              beta-release-channel IPC contract and degrades visibly when absent. */}
+          {isElectron && (
+            <BetaChannelToggle />
+          )}
           </div>
         </TabsContent>
 
@@ -5054,8 +5890,8 @@ export default function SettingsPage() {
           <div className="max-h-60 overflow-y-auto space-y-1.5">
             {tableInfo.map((row) => (
               <div key={row.name} className="flex justify-between text-sm">
-                <span className="text-gray-700 font-mono">{row.name}</span>
-                <span className="text-gray-500">{row.rows.toLocaleString()} {t('rows')}</span>
+                <span className="text-foreground font-mono">{row.name}</span>
+                <span className="text-muted-foreground">{row.rows.toLocaleString()} {t('rows')}</span>
               </div>
             ))}
           </div>
@@ -5125,8 +5961,8 @@ export default function SettingsPage() {
           <div className={`bg-gray-900 text-white px-6 py-4 rounded-full shadow-2xl flex items-center gap-6 pointer-events-auto ${shakeSaveBar ? 'animate-shake' : ''}`}>
             <span className="text-sm font-medium">{t('unsavedChanges')}</span>
             <div className="flex items-center gap-2">
-              <button onClick={resetAllSettings} disabled={savingBusiness || savingLoyalty || savingDiscount || savingCloud || savingOrderNumbering} className="px-4 py-1.5 text-sm bg-gray-800 hover:bg-gray-700 rounded-full transition-colors disabled:opacity-50 text-white">{t('discard')}</button>
-              <button onClick={saveAllSettings} disabled={savingBusiness || savingLoyalty || savingDiscount || savingCloud || savingOrderNumbering} className="px-4 py-1.5 text-sm bg-brand hover:opacity-90 rounded-full font-medium transition-colors disabled:opacity-50 text-white">{(savingBusiness || savingLoyalty || savingDiscount || savingCloud || savingOrderNumbering) ? t('saving') : t('saveChanges')}</button>
+              <button onClick={resetAllSettings} disabled={savingBusiness || savingLoyalty || savingDiscount || savingCloud || savingOrderNumbering || savingPrinting || savingAllSettings} className="px-4 py-1.5 text-sm bg-gray-800 hover:bg-gray-700 rounded-full transition-colors disabled:opacity-50 text-white">{t('discard')}</button>
+              <button onClick={saveAllSettings} disabled={savingBusiness || savingLoyalty || savingDiscount || savingCloud || savingOrderNumbering || savingPrinting || savingAllSettings} className="px-4 py-1.5 text-sm bg-brand hover:opacity-90 rounded-full font-medium transition-colors disabled:opacity-50 text-white">{(savingBusiness || savingLoyalty || savingDiscount || savingCloud || savingOrderNumbering || savingPrinting || savingAllSettings) ? t('saving') : t('saveChanges')}</button>
             </div>
           </div>
         </div>

@@ -27,13 +27,48 @@
 
 const fs = require('fs');
 const path = require('path');
+const ts = require('typescript');
 
 const ROOT = path.join(__dirname, '..');
 const MESSAGES_DIR = path.join(ROOT, 'frontend/src/lib/i18n/messages');
+const LANGUAGE_REGISTRY_FILE = path.join(ROOT, 'frontend/src/lib/i18n/languages.ts');
+const SHARED_CONCEPTS_FILE = path.join(ROOT, 'shared/print/concepts.ts');
 const OUT_FILE = path.join(ROOT, 'main/print/print-labels.generated.ts');
 
-/** Committed languages, in stable generation order (keep in sync with languages.ts). */
-const LANGUAGES = ['en', 'fa', 'es', 'pt'];
+/** Find a top-level const initializer without depending on source formatting. */
+function readConstInitializer(filePath, name) {
+  const source = fs.readFileSync(filePath, 'utf8');
+  const file = ts.createSourceFile(filePath, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  for (const statement of file.statements) {
+    if (!ts.isVariableStatement(statement)) continue;
+    for (const declaration of statement.declarationList.declarations) {
+      if (ts.isIdentifier(declaration.name) && declaration.name.text === name && declaration.initializer) {
+        let initializer = declaration.initializer;
+        while (ts.isAsExpression(initializer) || ts.isSatisfiesExpression(initializer) || ts.isParenthesizedExpression(initializer)) {
+          initializer = initializer.expression;
+        }
+        return initializer;
+      }
+    }
+  }
+  throw new Error(`Could not locate ${name} in ${filePath}`);
+}
+
+/** Derive print locales in canonical registry order; translations stay JSON-backed. */
+function readCanonicalLanguages() {
+  const initializer = readConstInitializer(LANGUAGE_REGISTRY_FILE, 'LANGUAGES');
+  if (!ts.isObjectLiteralExpression(initializer)) throw new Error('Canonical LANGUAGES registry must be an object');
+  const languages = initializer.properties
+    .filter((property) => ts.isPropertyAssignment(property))
+    .map((property) => property.name)
+    .filter((name) => name && (ts.isIdentifier(name) || ts.isStringLiteral(name)))
+    .map((name) => name.text);
+  if (languages.length === 0) throw new Error('Canonical LANGUAGES registry is empty');
+  return languages;
+}
+
+const LANGUAGES = readCanonicalLanguages();
+
 
 /**
  * New `print.*` keys owned by issue #440, in contract order. Dotted leaf
@@ -67,6 +102,25 @@ const PRINT_NAMESPACE_KEYS = [
   'print.kot.noPendingItems',
   'print.kot.end',
   'print.hsn',
+  'print.zReport.title',
+  'print.zReport.businessDate',
+  'print.zReport.periodStart',
+  'print.zReport.periodEnd',
+  'print.zReport.openingFloat',
+  'print.zReport.payments',
+  'print.zReport.refunds',
+  'print.zReport.tax',
+  'print.zReport.staff',
+  'print.zReport.expectedCash',
+  'print.zReport.countedCash',
+  'print.zReport.variance',
+  'print.zReport.closedBy',
+  'print.zReport.operatorSignature',
+  'print.zReport.footer',
+  'print.zReport.none',
+  'print.zReport.paymentCount',
+  'print.zReport.count',
+  'print.zReport.amount',
   'print.test.title',
   'print.test.networkUsb',
   'print.test.columns',
@@ -96,6 +150,7 @@ const BORROWED_KEYS = [
   'pos.discount',
   'pos.tax',
   'pos.delivery',
+  'pos.packaging',
   'receipt.totalTax',
   'receipt.serviceCharge',
   'receipt.taxDetails',
@@ -103,13 +158,54 @@ const BORROWED_KEYS = [
   'receipt.thankYou',
   'receipt.taxIncluded',
   'receipt.reprint',
+  'receipt.onlineOrder',
+  'pos.orderNumber',
+  'pos.orderTypeDineIn',
+  'pos.orderTypeDelivery',
+  'pos.orderTypeOnline',
+  'pos.orderTypeTakeaway',
   // Payment-method names, ported from web-print.ts's method mapping (#440).
   'pos.methodCash',
   'pos.methodCard',
   'pos.methodWallet',
+  'dashboard.zReport',
+  'dashboard.businessDateLabel',
+  'dashboard.periodStart',
+  'dashboard.periodEnd',
+  'dashboard.ticketCount',
+  'dashboard.ticketOperatorSignature',
+  'dashboard.openingFloat',
+  'dashboard.ticketSectionPayments',
+  'dashboard.ticketSectionRefunds',
+  'dashboard.ticketSectionTax',
+  'dashboard.ticketSectionStaff',
+  'dashboard.ticketSectionOperator',
+  'dashboard.ticketNoPayments',
+  'dashboard.ticketNoRefunds',
+  'dashboard.ticketNoTax',
+  'dashboard.ticketNoStaff',
+  'dashboard.ticketMethodCount',
+  'dashboard.expectedCash',
+  'dashboard.countedCash',
+  'dashboard.variance',
+  'dashboard.ticketFooter',
 ];
 
+function readSharedConcepts() {
+  const initializer = readConstInitializer(SHARED_CONCEPTS_FILE, 'PRINT_CONCEPT_IDS');
+  if (!ts.isArrayLiteralExpression(initializer)) throw new Error('Shared print-concept catalog must be an array');
+  const concepts = initializer.elements
+    .filter((element) => ts.isStringLiteral(element))
+    .map((element) => element.text);
+  if (concepts.length === 0) throw new Error('Shared print-concept catalog is empty');
+  return concepts;
+}
+
 const ALL_CONCEPTS = [...PRINT_NAMESPACE_KEYS, ...BORROWED_KEYS];
+const SHARED_CONCEPTS = readSharedConcepts();
+if (JSON.stringify(ALL_CONCEPTS) !== JSON.stringify(SHARED_CONCEPTS)) {
+  throw new Error('Shared print-concept catalog drifted from generator concept order');
+}
 
 function getLeaf(messages, dottedKey) {
   let node = messages;
@@ -145,12 +241,8 @@ function generateTypeScript(tables) {
   lines.push('// Derived view of frontend/src/lib/i18n/messages/*.json for backend thermal');
   lines.push('// printing (#440). Do not edit by hand: regeneration must be byte-identical.');
   lines.push('');
-  lines.push('/** Stable concept identifiers resolvable through printLabel(). */');
-  lines.push('export type PrintConceptId =');
-  for (const key of ALL_CONCEPTS) {
-    lines.push(`  | '${key}'`);
-  }
-  lines.push('  ;');
+  lines.push("import type { PrintConceptId } from '../../shared/print/concepts';");
+  lines.push('export type { PrintConceptId } from \'../../shared/print/concepts\';');
   lines.push('');
   lines.push('export const PRINT_LABEL_LANGUAGES = [');
   for (const lang of LANGUAGES) {
@@ -164,7 +256,7 @@ function generateTypeScript(tables) {
   lines.push('');
   lines.push('const PRINT_LABELS: Record<PrintLabelLanguage, PrintLabelTable> = {');
   for (const lang of LANGUAGES) {
-    lines.push(`  ${lang}: {`);
+    lines.push(`  ${JSON.stringify(lang)}: {`);
     for (const key of ALL_CONCEPTS) {
       lines.push(`    '${key}': ${JSON.stringify(tables[lang][key])},`);
     }
@@ -234,4 +326,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { LANGUAGES, PRINT_NAMESPACE_KEYS, BORROWED_KEYS, ALL_CONCEPTS, OUT_FILE, normalizeEol, regenerate };
+module.exports = { LANGUAGES, PRINT_NAMESPACE_KEYS, BORROWED_KEYS, ALL_CONCEPTS, OUT_FILE, normalizeEol, regenerate, readCanonicalLanguages, readSharedConcepts };

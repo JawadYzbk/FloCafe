@@ -2,6 +2,7 @@ import { test, expect, Page } from '@playwright/test';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import { E2E_BASE_URL as BASE } from './helpers/urls';
 
 /**
  * End-to-End verification of localized error fallbacks (#241).
@@ -16,7 +17,6 @@ import * as os from 'os';
  * toasts and inline error states) into the evidence directory.
  */
 
-const BASE = 'http://localhost:3001';
 const EVIDENCE_DIR =
   process.env.EVIDENCE_DIR ||
   path.join(os.tmpdir(), 'no-mistakes-evidence', '01M08KC186JQ29G9DS41MZFZH4');
@@ -76,7 +76,7 @@ async function setPosSetting(page: Page, key: string, value: boolean | string): 
 }
 
 test.describe('Localized Error Fallbacks', () => {
-  test('Login failure renders localized fallback across all 4 locales (EN, ES, PT, FA)', async ({ page }) => {
+  test('Login failure renders localized fallback across all 5 locales (EN, ES, FR, PT, FA)', async ({ page }) => {
     await page.route('**/api/auth/login', (route) => {
       route.fulfill({
         status: 500,
@@ -106,7 +106,19 @@ test.describe('Localized Error Fallbacks', () => {
     await expect(page.locator('text=RAW_SQLITE_INTERNAL_DB_FATAL_ERROR')).not.toBeVisible();
     await captureScreenshot(page, 'error-login-fallback-es.png');
 
-    // 3. Portuguese (pt)
+    // 3. French (fr)
+    await page.addInitScript(() => {
+      localStorage.setItem('pos-settings', JSON.stringify({ state: { language: 'fr' }, version: 3 }));
+    });
+    await page.goto(`${BASE}/auth/login`);
+    await page.locator('#email').fill('manager@flo.local');
+    await page.locator('#password').fill('WrongPassword!');
+    await page.locator('button[type="submit"]').click();
+    await expect(page.locator('text=Échec de la connexion')).toBeVisible();
+    await expect(page.locator('text=RAW_SQLITE_INTERNAL_DB_FATAL_ERROR')).not.toBeVisible();
+    await captureScreenshot(page, 'error-login-fallback-fr.png');
+
+    // 4. Portuguese (pt)
     await page.addInitScript(() => {
       localStorage.setItem('pos-settings', JSON.stringify({ state: { language: 'pt' }, version: 3 }));
     });
@@ -118,7 +130,7 @@ test.describe('Localized Error Fallbacks', () => {
     await expect(page.locator('text=RAW_SQLITE_INTERNAL_DB_FATAL_ERROR')).not.toBeVisible();
     await captureScreenshot(page, 'error-login-fallback-pt.png');
 
-    // 4. Persian (fa)
+    // 5. Persian (fa)
     await page.addInitScript(() => {
       localStorage.setItem('pos-settings', JSON.stringify({ state: { language: 'fa' }, version: 3 }));
     });

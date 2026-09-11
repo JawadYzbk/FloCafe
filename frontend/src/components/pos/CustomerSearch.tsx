@@ -21,14 +21,14 @@ interface Props {
 }
 
 const TAG_COLORS: Record<string, string> = {
-  veg:    'bg-green-100 text-green-700',
-  nonveg: 'bg-red-100 text-red-700',
-  vegan:  'bg-emerald-100 text-emerald-700',
-  spicy:  'bg-orange-100 text-orange-700',
+  veg:    'bg-green-100 text-green-700 dark:bg-green-950/40 dark:text-green-300',
+  nonveg: 'bg-red-100 text-red-700 dark:bg-red-950/40 dark:text-red-300',
+  vegan:  'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300',
+  spicy:  'bg-orange-100 text-orange-700 dark:bg-orange-950/40 dark:text-orange-300',
 };
 
 function tagColor(tag: string) {
-  return TAG_COLORS[tag.toLowerCase()] ?? 'bg-gray-100 text-gray-600';
+  return TAG_COLORS[tag.toLowerCase()] ?? 'bg-muted text-muted-foreground';
 }
 
 function digitsOnly(value: string | null | undefined): string {
@@ -82,13 +82,12 @@ export default function CustomerSearch({ onSelected, variant = 'default' }: Prop
   const customer = cart.customer;
   const isNew = searched && !matched;
 
-  // Reset the stale balance the moment the customer changes, read directly during render
-  // (React's recommended pattern for "adjusting state when a prop changes") so there's no
-  // flash of the previous customer's points; the actual fetch stays in the effect below.
+  // Reset stale points synchronously during render when customer changes
+  // to avoid flashing previous customer's loyalty balance.
   const [syncedCustomerId, setSyncedCustomerId] = useState(customer?.id ?? null);
   if ((customer?.id ?? null) !== syncedCustomerId) {
     setSyncedCustomerId(customer?.id ?? null);
-    if (!customer) setLoyaltyPoints(null);
+    setLoyaltyPoints(null);
   }
 
   useEffect(() => {
@@ -243,7 +242,7 @@ export default function CustomerSearch({ onSelected, variant = 'default' }: Prop
   ) : null;
 
   // ── Shared input classes ───────────────────────────────────────────────────
-  const baseInput = 'px-3 border border-gray-200 rounded-lg focus:ring-2 focus:ring-brand focus:border-brand outline-none text-sm';
+  const baseInput = 'min-h-11 px-3 border border-border rounded-lg focus:ring-2 focus:ring-brand focus:border-brand outline-none text-sm';
 
   // ── Customer already selected ──────────────────────────────────────────────
   if (customer) {
@@ -252,25 +251,25 @@ export default function CustomerSearch({ onSelected, variant = 'default' }: Prop
     if (variant === 'topbar') {
       return (
         <>
-          <div className="h-10 flex items-center gap-2 px-3 bg-brand-light rounded-lg min-w-0 w-full">
+          <div className="min-h-11 flex items-center gap-2 px-3 bg-brand-light dark:bg-[var(--color-brand-light)] rounded-lg min-w-0 w-full">
             <button
               onClick={() => setEditingCustomer(true)}
               title={t('editCustomer')}
-              className="flex-1 min-w-0 flex items-center gap-x-2 flex-wrap text-start group"
+              className="touch-target flex-1 min-w-0 justify-start gap-x-2 flex-wrap text-start"
             >
-              <span className="font-semibold text-brand text-sm truncate group-hover:underline">{customer.name}</span>
-              <span className="text-brand/70 text-xs shrink-0"><Ltr>{customer.phone}</Ltr></span>
-              <Pencil size={11} className="text-brand/50 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity" />
+              <span className="font-semibold text-brand dark:text-indigo-300 text-sm truncate">{customer.name}</span>
+              <span className="text-brand/70 dark:text-indigo-300 text-xs shrink-0"><Ltr>{customer.phone}</Ltr></span>
+              <Pencil size={14} className="text-brand/60 dark:text-indigo-300 shrink-0" />
               {!!loyaltyPoints && loyaltyPoints > 0 && (
-                <span className="flex items-center gap-0.5 text-xs font-medium text-brand bg-white/70 rounded-full px-1.5 py-0.5 shrink-0">
+                <span className="flex items-center gap-0.5 text-xs font-medium text-brand dark:text-indigo-300 bg-card/70 rounded-full px-1.5 py-0.5 shrink-0">
                   <Gift size={11} />
                   {t('loyaltyPointsShort', { count: loyaltyPoints })}
                 </span>
               )}
               {hasTags && <TagBadges counts={customer.tag_counts!} />}
             </button>
-            <button onClick={handleClear} className="text-brand hover:text-brand-hover shrink-0 ms-auto">
-              <X size={14} />
+            <button onClick={handleClear} className="touch-target rounded-full text-brand dark:text-indigo-300 hover:text-brand-hover active:bg-card/60 shrink-0 ms-auto" aria-label={t('remove')}>
+              <X size={16} />
             </button>
           </div>
           {editingCustomer && (
@@ -286,18 +285,18 @@ export default function CustomerSearch({ onSelected, variant = 'default' }: Prop
 
     return (
       <div className="space-y-1">
-        <div className="flex items-center justify-between px-3 py-2 bg-brand-light rounded-lg text-sm">
-          <button onClick={() => setEditingCustomer(true)} className="flex-1 min-w-0 flex items-center gap-2 text-start group">
-            <span className="font-medium text-brand truncate group-hover:underline">{customer.name}</span>
-            {customer.phone && <span className="text-xs text-gray-500"><Ltr>{customer.phone}</Ltr></span>}
-            <Pencil size={11} className="text-brand/50 opacity-0 group-hover:opacity-100 transition-opacity shrink-0" />
+        <div className="flex items-center justify-between px-3 py-2 bg-brand-light dark:bg-[var(--color-brand-light)] rounded-lg text-sm">
+          <button onClick={() => setEditingCustomer(true)} className="touch-target flex-1 min-w-0 justify-start gap-2 text-start">
+            <span className="font-medium text-brand dark:text-indigo-300 truncate">{customer.name}</span>
+            {customer.phone && <span className="text-xs text-muted-foreground"><Ltr>{customer.phone}</Ltr></span>}
+            <Pencil size={14} className="text-brand/60 dark:text-indigo-300 shrink-0" />
           </button>
-          <button onClick={handleClear} className="text-brand hover:text-brand-hover ms-2 shrink-0">
-            <X size={14} />
+          <button onClick={handleClear} className="touch-target rounded-full text-brand dark:text-indigo-300 hover:text-brand-hover active:bg-card/60 ms-2 shrink-0" aria-label={t('remove')}>
+            <X size={16} />
           </button>
         </div>
         {!!loyaltyPoints && loyaltyPoints > 0 && (
-          <span className="inline-flex items-center gap-0.5 text-xs font-medium text-brand bg-brand-light rounded-full px-1.5 py-0.5">
+          <span className="inline-flex items-center gap-0.5 text-xs font-medium text-brand dark:text-indigo-300 bg-brand-light dark:bg-[var(--color-brand-light)] rounded-full px-1.5 py-0.5">
             <Gift size={11} />
             {t('loyaltyPointsShort', { count: loyaltyPoints })}
           </span>
@@ -327,7 +326,7 @@ export default function CustomerSearch({ onSelected, variant = 'default' }: Prop
             onChange={handlePhoneChange}
             onKeyDown={handlePhoneKeyDown}
             placeholder={dialCode ? `${dialCode} ${t('phone')}` : t('phone')}
-            className="h-10 w-48 shrink-0 px-3 text-sm border border-amber-400 bg-amber-50 placeholder:text-amber-600/70 rounded-lg focus:ring-2 focus:ring-amber-200 focus:border-amber-500 outline-none"
+            className="h-10 w-48 shrink-0 px-3 text-sm border border-amber-400 bg-amber-50 placeholder:text-amber-600/70 dark:border-amber-600 dark:bg-amber-950/40 dark:placeholder:text-amber-400/70 rounded-lg focus:ring-2 focus:ring-amber-200 focus:border-amber-500 dark:focus:ring-amber-800 dark:focus:border-amber-600 outline-none"
             dir="ltr"
           />
           <input
@@ -344,15 +343,15 @@ export default function CustomerSearch({ onSelected, variant = 'default' }: Prop
             placeholder={searched ? (matched ? '' : t('enterName')) : t('nameAutoFills')}
             className={`h-10 w-48 shrink-0 px-3 text-sm border rounded-lg focus:ring-2 outline-none transition-colors duration-150 ${
               matched
-                ? 'border-gray-200 bg-gray-50 cursor-pointer focus:ring-brand/20 focus:border-brand'
-                : 'border-indigo-200 bg-indigo-50 placeholder:text-indigo-400/80 focus:ring-indigo-200 focus:border-indigo-400'
+                ? 'border-border bg-muted cursor-pointer focus:ring-brand/20 focus:border-brand'
+                : 'border-indigo-200 bg-indigo-50 placeholder:text-indigo-400/80 dark:border-indigo-600 dark:bg-indigo-950/40 dark:placeholder:text-indigo-400/60 focus:ring-indigo-200 focus:border-indigo-400 dark:focus:ring-indigo-800 dark:focus:border-indigo-600'
             }`}
             onClick={matched ? handleSelectMatched : undefined}
           />
           {matched && (
             <button
               onClick={handleSelectMatched}
-              className="h-10 shrink-0 px-3 bg-brand text-white text-xs rounded-lg hover:bg-brand-hover whitespace-nowrap"
+              className="touch-target shrink-0 px-3 bg-brand text-white text-xs rounded-lg hover:bg-brand-hover active:bg-brand-hover whitespace-nowrap"
             >
               {t('select')}
             </button>
@@ -361,7 +360,7 @@ export default function CustomerSearch({ onSelected, variant = 'default' }: Prop
             <button
               onClick={handleCreate}
               disabled={creating}
-              className="h-10 shrink-0 px-3 bg-brand text-white text-xs rounded-lg hover:bg-brand-hover disabled:opacity-50 whitespace-nowrap"
+              className="touch-target shrink-0 px-3 bg-brand text-white text-xs rounded-lg hover:bg-brand-hover active:bg-brand-hover disabled:opacity-50 whitespace-nowrap"
             >
               {creating ? t('loadingEllipsis') : tCommon('add')}
             </button>
@@ -371,8 +370,8 @@ export default function CustomerSearch({ onSelected, variant = 'default' }: Prop
         {searched && (
           <div className="absolute start-0 top-full mt-1 z-20 w-72 min-w-full">
             {matchesListEl || (
-              <div className="rounded-md border border-gray-100 bg-white px-2 py-1 shadow-sm">
-                <span className="text-xs text-red-500 font-medium">{t('newCustomerEnterName')}</span>
+              <div className="rounded-md border border-border bg-card px-2 py-1 shadow-sm">
+                <span className="text-xs text-red-500 dark:text-red-400 font-medium">{t('newCustomerEnterName')}</span>
               </div>
             )}
           </div>
@@ -410,7 +409,7 @@ export default function CustomerSearch({ onSelected, variant = 'default' }: Prop
           }}
           readOnly={!!matched}
           placeholder={searched ? (matched ? '' : t('enterName')) : t('nameAutoFills')}
-          className={`${baseInput} w-full py-2 ${matched ? 'bg-gray-50 cursor-pointer' : ''}`}
+          className={`${baseInput} w-full py-2 ${matched ? 'bg-muted cursor-pointer' : ''}`}
           onClick={matched ? handleSelectMatched : undefined}
         />
       </div>
@@ -419,17 +418,17 @@ export default function CustomerSearch({ onSelected, variant = 'default' }: Prop
         <div className="space-y-1.5">
           {matchesListEl ? (
             <>
-              <p className="text-xs text-green-600 font-medium">{t('customerFoundClick')}</p>
+              <p className="text-xs text-green-600 dark:text-green-400 font-medium">{t('customerFoundClick')}</p>
               {matchesListEl}
             </>
           ) : (
             <>
-              <p className="text-xs text-red-500 font-medium">{t('newCustomerEnterName')}</p>
+              <p className="text-xs text-red-500 dark:text-red-400 font-medium">{t('newCustomerEnterName')}</p>
               {name.trim() && (
                 <button
                   onClick={handleCreate}
                   disabled={creating}
-                  className="w-full py-1.5 bg-brand text-white text-sm rounded-lg hover:bg-brand-hover disabled:opacity-50"
+                  className="touch-target w-full bg-brand text-white text-sm rounded-lg hover:bg-brand-hover active:bg-brand-hover disabled:opacity-50"
                 >
                   {creating ? t('creating') : t('addName', { name: name.trim() })}
                 </button>

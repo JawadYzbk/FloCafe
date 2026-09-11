@@ -11,7 +11,8 @@ import { registerRoutes } from './routes';
 import { getJWTSecret } from './routes/auth';
 import { databaseMaintenanceMiddleware, getDbHealth, isDatabaseMaintenanceActive, isKdsEnabled } from './db';
 import { setupKdsWebSocket } from './services/kds';
-import { rateLimit, staticRouteRateLimit, corsOptions, getUserAuthStatus, isTokenRevoked, isTokenStale } from './middleware/security';
+import expressRateLimit from 'express-rate-limit';
+import { staticRouteRateLimit, corsOptions, getUserAuthStatus, isAllowedPrivateIp, isTokenRevoked, isTokenStale } from './middleware/security';
 import { initFromDb as initWhatsAppFromDb } from './services/whatsapp';
 import { API_JSON_BODY_LIMIT } from './http-limits';
 import { buildCspHeader } from './csp';
@@ -26,23 +27,6 @@ let stopping = false;
 
 const PORT = parseInt(process.env.PORT || '3001', 10);
 let activePort = PORT;
-
-/**
- * Resolve the running app version. server.ts runs both inside the packaged
- * Electron shell and under the standalone dev/backend server (dev-server.js),
- * so it cannot rely on Electron's `app.getVersion()` being available. Read it
- * from package.json — the same source Electron itself uses and the pattern
- * already used by cloud-sync/support-ticket/tax-packs.
- * (`npm_package_version` is unset in the packaged app, so the old fallback
- * always reported a stale hardcoded version.)
- */
-function getAppVersion(): string {
-  try {
-    return String(require('../package.json').version);
-  } catch {
-    return 'unknown';
-  }
-}
 
 /**
  * JWT verification middleware. Skips health check and auth routes (those
@@ -72,8 +56,7 @@ function requireAuth(req: Request, res: Response, next: NextFunction): void {
     }
     const decoded = jwt.verify(token, getJWTSecret()) as any;
 
-    // Reject tokens for users deactivated (or deleted) since the token was
-    // issued, instead of trusting the JWT's signature/expiry alone (vuln-0001).
+    // Reject tokens for users deactivated (or deleted) since token was issued.
     const freshKdsAuth = req.path.startsWith('/api/kds')
       || req.path.startsWith('/api/kitchen')
       || req.path.startsWith('/api/order-items');
@@ -83,14 +66,13 @@ function requireAuth(req: Request, res: Response, next: NextFunction): void {
       return;
     }
 
-    // Reject tokens issued before the user's password/PIN was last changed (#173).
+    // Reject tokens issued before user password/PIN was last changed.
     if (isTokenStale(decoded.iat, status.tokensValidAfter)) {
       res.status(401).json({ error: 'Invalid or expired token' });
       return;
     }
 
-    // Use the DB's current role rather than the JWT's role claim, so a role
-    // change takes effect without waiting for the token to expire.
+    // Use current DB role rather than JWT role claim for immediate updates.
     (req as any).user = { ...decoded, role: status.role };
     next();
   } catch {
@@ -106,12 +88,7 @@ export function getServerPort(): number {
   return activePort;
 }
 
-/**
- * Locate the Next.js static export directory.
- *
- * Dev build  → <repo-root>/frontend/out
- * Packaged   → <resourcesPath>/frontend-out   (see electron-builder extraResources)
- */
+/** Locate Next.js static export directory for dev or packaged builds. */
 function getFrontendDir(): string | null {
   const candidates = [
     // Development / unpackaged: relative to dist/main/ (compiled output of
@@ -129,10 +106,7 @@ function getFrontendDir(): string | null {
   return null;
 }
 
-/**
- * Helper to rewrite dotted Next.js static segment file requests to nested paths on Windows.
- * E.g., /products/__next.!KGRhc2hib2FyZCk.products.__PAGE__.txt -> /products/__next.!KGRhc2hib2FyZCk/products/__PAGE__.txt
- */
+/** Helper to rewrite dotted Next.js static segment file requests on Windows. */
 function rewriteNextExportPath(reqPath: string): string {
   const nextIndex = reqPath.indexOf('__next.');
   if (nextIndex === -1) return reqPath;
@@ -182,9 +156,7 @@ export function startServer(): Promise<void> {
       }
       next(error);
     });
-    // body-parser 2.x (bundled with Express 5) leaves req.body undefined
-    // instead of {} when a request has no parseable body -- restore the
-    // old default so route handlers can destructure req.body directly.
+    // Restore empty body default for Express 5 compatibility.
     app.use((req: Request, _res: Response, next: NextFunction) => {
       if (req.body === undefined) req.body = {};
       next();
@@ -192,11 +164,17 @@ export function startServer(): Promise<void> {
     app.use(databaseMaintenanceMiddleware);
 
     // ── Global API rate limiting ───────────────────────────────────────
-    app.use('/api', rateLimit({ windowMs: 60 * 1000, max: 100 }));
+    // Protect all API routes with express-rate-limit and LAN bypass.
+    app.use('/api', expressRateLimit({
+      windowMs: 60 * 1000,
+      limit: 100,
+      standardHeaders: true,
+      legacyHeaders: false,
+      skip: (req: Request) => isAllowedPrivateIp(req.ip || req.socket.remoteAddress || ''),
+    }));
 
     // ── Content Security Policy ────────────────────────────────────────
-    // Blocks eval() and remote code. 'unsafe-inline' is required for
-    // Next.js RSC hydration scripts and Tailwind-generated style tags.
+    // Blocks eval() and remote code; unsafe-inline allowed for Next.js and Tailwind.
     app.use((req: Request, res: Response, next: NextFunction) => {
       res.setHeader('X-Content-Type-Options', 'nosniff');
       res.setHeader('Content-Security-Policy', buildCspHeader(req));
@@ -231,9 +209,6 @@ export function startServer(): Promise<void> {
       console.log(`[Server] Serving frontend from: ${frontendDir}`);
 
       // Middleware to patch Windows-specific Next.js static export path nesting.
-      // On Windows, the Next.js static export uses dotted segments (e.g.
-      // __next.!KGRhc2hib2FyZCk.products.__PAGE__.txt) instead of nested
-      // directories. This rewrite is only needed when the app runs on Windows.
       if (process.platform === 'win32') {
         app.use(staticRouteRateLimit(), (req: Request, res: Response, next: NextFunction) => {
           if (req.path.includes('__next.')) {
@@ -252,9 +227,7 @@ export function startServer(): Promise<void> {
 
       app.use(express.static(frontendDir, { dotfiles: 'allow', index: false }));
 
-      // Serve each Next.js static route's own index. Returning the root export
-      // for /whatsapp (or any direct link/refresh) runs app/page.tsx and sends
-      // the user to Dashboard instead of the requested page.
+      // Serve each Next.js static route index directly to avoid root redirects.
       app.get(/^(?!\/api|\/kds).*$/, staticRouteRateLimit(), (req: Request, res: Response) => {
         res.sendFile(resolveStaticPage(frontendDir, req.path), { dotfiles: 'allow' });
       });
@@ -282,96 +255,102 @@ export function startServer(): Promise<void> {
       res.status(status).json({ error: status >= 500 ? 'Internal server error' : (err.message || 'Client error') });
     });
 
-    let currentPort = PORT;
+    const basePort = parseInt(process.env.PORT || '3001', 10);
+    let currentPort = basePort;
     let attempts = 0;
 
-    let listeningServer: http.Server;
-    const onListening = () => {
-      if (stopping) {
-        try { listeningServer.close(); } catch { return; }
-        return;
-      }
-      startReject = null;
-      const address = listeningServer.address();
-      activePort = address && typeof address !== 'string' ? address.port : currentPort;
-      console.log(`[Server] HTTP server running on http://localhost:${activePort}`);
-
-      if (listeningServer) {
-        // noServer + a manual 'upgrade' handler (rather than passing `server`
-        // straight to WebSocketServer) so a disabled KDS can 404 the upgrade
-        // instead of completing it — checked fresh on every request since
-        // kds_enabled can change at runtime without a restart (issue #133).
-        const websocketServer = new WebSocketServer({ noServer: true });
-        wss = websocketServer;
-        setupKdsWebSocket(websocketServer);
-
-        listeningServer.on('upgrade', (request, socket, head) => {
-          const pathname = (request.url || '').split('?')[0];
-          if (pathname !== '/kds') {
-            socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
-            socket.destroy();
-            return;
-          }
-
-          if (isDatabaseMaintenanceActive()) {
-            socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
-            socket.destroy();
-            return;
-          }
-
-          if (!isKdsEnabled()) {
-            // Pretend the endpoint doesn't exist rather than confirming it's
-            // just disabled — less to probe from a stale/misconfigured KDS
-            // device on the LAN (issue #133).
-            socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
-            socket.destroy();
-            return;
-          }
-
-          try {
-            websocketServer.handleUpgrade(request, socket, head, (ws) => {
-              websocketServer.emit('connection', ws, request);
-            });
-          } catch (error) {
-            console.error('[Server] KDS WebSocket upgrade failed:', error);
-            socket.destroy();
-          }
-        });
-
-        console.log(`[Server] KDS WebSocket running on ws://localhost:${activePort}/kds`);
-      }
-
-      // main/index.ts (Electron) also calls this; dev-server and pm2 boot
-      // through here instead and would otherwise start with module defaults.
-      try {
-        initWhatsAppFromDb();
-      } catch (error) {
-        console.error('[Server] WhatsApp startup initialization failed:', error);
-      }
-
-      resolve();
-    };
-    listeningServer = app.listen(currentPort, '0.0.0.0', onListening);
+    const listeningServer = http.createServer(app);
     server = listeningServer;
     installHttpShutdownTracking(listeningServer);
 
-    listeningServer.on('error', (err: NodeJS.ErrnoException) => {
-      if (stopping) return;
-      if (err.code === 'EADDRINUSE') {
-        attempts++;
-        if (attempts >= 10) {
-          const errorMsg = `[Server] Failed to bind to any port after 10 attempts starting from ${PORT}`;
-          console.error(errorMsg);
-          reject(new Error(errorMsg));
+    const tryListen = () => {
+      const attemptedPort = currentPort;
+      const onListening = () => {
+        if (stopping) {
+          try { listeningServer.close(); } catch { return; }
           return;
         }
-        currentPort++;
-        console.log(`[Server] Port ${currentPort - 1} in use, trying ${currentPort}`);
-        listeningServer.listen(currentPort, '0.0.0.0');
-      } else {
+        startReject = null;
+        listeningServer.off('error', onError);
+        const address = listeningServer.address();
+        activePort = address && typeof address !== 'string' ? address.port : attemptedPort;
+        console.log(`[Server] HTTP server running on http://localhost:${activePort}`);
+
+        if (listeningServer) {
+          // Manual upgrade handler allows checking runtime KDS enablement dynamically per connection.
+          const websocketServer = new WebSocketServer({ noServer: true });
+          wss = websocketServer;
+          setupKdsWebSocket(websocketServer);
+
+          listeningServer.on('upgrade', (request, socket, head) => {
+            const pathname = (request.url || '').split('?')[0];
+            if (pathname !== '/kds') {
+              socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+              socket.destroy();
+              return;
+            }
+
+            if (isDatabaseMaintenanceActive()) {
+              socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+              socket.destroy();
+              return;
+            }
+
+            if (!isKdsEnabled()) {
+              // Return 404 when disabled to avoid revealing KDS presence to LAN clients.
+              socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+              socket.destroy();
+              return;
+            }
+
+            try {
+              websocketServer.handleUpgrade(request, socket, head, (ws) => {
+                websocketServer.emit('connection', ws, request);
+              });
+            } catch (error) {
+              console.error('[Server] KDS WebSocket upgrade failed:', error);
+              socket.destroy();
+            }
+          });
+
+          console.log(`[Server] KDS WebSocket running on ws://localhost:${activePort}/kds`);
+        }
+
+        // This is the single startup owner for WhatsApp in every server mode.
+        try {
+          initWhatsAppFromDb();
+        } catch (error) {
+          console.error('[Server] WhatsApp startup initialization failed:', error);
+        }
+
+        resolve();
+      };
+
+      const onError = (err: NodeJS.ErrnoException) => {
+        if (stopping) return;
+        listeningServer.off('listening', onListening);
+        if (err.code === 'EADDRINUSE' || err.code === 'EACCES') {
+          attempts++;
+          if (attempts >= 10) {
+            const errorMsg = `[Server] Failed to bind to any port after 10 attempts starting from ${basePort}`;
+            console.error(errorMsg);
+            reject(new Error(errorMsg));
+            return;
+          }
+          currentPort++;
+          console.log(`[Server] Port ${attemptedPort} in use (${err.code}), trying ${currentPort}`);
+          tryListen();
+          return;
+        }
         reject(err);
-      }
-    });
+      };
+
+      listeningServer.once('listening', onListening);
+      listeningServer.once('error', onError);
+      listeningServer.listen(attemptedPort, '0.0.0.0');
+    };
+
+    tryListen();
   });
 }
 

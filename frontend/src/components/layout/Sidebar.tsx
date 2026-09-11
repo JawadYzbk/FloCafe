@@ -13,7 +13,6 @@ import {
   UserCog,
   Settings,
   LogOut,
-  PanelLeft,
   ChefHat,
   UserCircle,
   MessageCircle,
@@ -21,6 +20,10 @@ import {
   Banknote,
   Receipt,
   BarChart3,
+  ChevronUp,
+  Sun,
+  Moon,
+  Monitor,
   type LucideIcon,
 } from 'lucide-react';
 import { useTranslations, type AppConfig } from 'use-intl';
@@ -29,6 +32,15 @@ import { usePosSettingsStore } from '@/store/pos-settings';
 import { getLandingPage } from '@/components/layout/AuthGuard';
 import api from '@/lib/api';
 import { useConfirm } from '@/hooks/use-confirm';
+import { useThemeModeToggle } from '@/hooks/useThemeModeToggle';
+import { ROLE_ACCESS, hasRole, type Role } from '@shared/role-permissions';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import {
   Sidebar,
   SidebarContent,
@@ -51,47 +63,56 @@ interface NavItem {
   href: string;
   labelKey: NavKey;
   icon: LucideIcon;
-  roles: string[];
+  roles: readonly Role[];
   businessTypes: string[] | null;
 }
 
 // null = show for all business types
 const ALL_NAV_ITEMS: NavItem[] = [
-  { href: '/pos', labelKey: 'pos', icon: ShoppingCart, roles: ['owner', 'manager', 'cashier'], businessTypes: null },
-  { href: '/dashboard', labelKey: 'dashboard', icon: LayoutDashboard, roles: ['owner'], businessTypes: null },
-  { href: '/reports', labelKey: 'reports', icon: BarChart3, roles: ['owner', 'manager'], businessTypes: null },
-  { href: '/orders', labelKey: 'orders', icon: ClipboardList, roles: ['owner', 'manager', 'cashier'], businessTypes: null },
-  { href: '/shift', labelKey: 'shift', icon: Banknote, roles: ['owner', 'manager'], businessTypes: null },
-  { href: '/expenses', labelKey: 'expenses', icon: Receipt, roles: ['owner', 'manager'], businessTypes: null },
-  { href: '/whatsapp', labelKey: 'whatsapp', icon: MessageCircle, roles: ['owner', 'manager', 'cashier'], businessTypes: null },
-  { href: '/products', labelKey: 'products', icon: Package, roles: ['owner', 'manager'], businessTypes: null },
-  { href: '/tables', labelKey: 'tables', icon: Grid3X3, roles: ['owner', 'manager'], businessTypes: ['restaurant'] },
-  { href: '/settings?tab=kds', labelKey: 'kds', icon: ChefHat, roles: ['owner', 'manager'], businessTypes: ['restaurant'] },
-  { href: '/customers', labelKey: 'customers', icon: Users, roles: ['owner', 'manager'], businessTypes: null },
-  { href: '/staff', labelKey: 'staff', icon: UserCog, roles: ['owner', 'manager'], businessTypes: null },
-  { href: '/settings', labelKey: 'settings', icon: Settings, roles: ['owner', 'manager'], businessTypes: null },
+  { href: '/pos', labelKey: 'pos', icon: ShoppingCart, roles: ROLE_ACCESS.ownerManagerCashier, businessTypes: null },
+  { href: '/dashboard', labelKey: 'dashboard', icon: LayoutDashboard, roles: ROLE_ACCESS.owner, businessTypes: null },
+  { href: '/reports', labelKey: 'reports', icon: BarChart3, roles: ROLE_ACCESS.ownerManager, businessTypes: null },
+  { href: '/orders', labelKey: 'orders', icon: ClipboardList, roles: ROLE_ACCESS.ownerManagerCashier, businessTypes: null },
+  { href: '/shift', labelKey: 'shift', icon: Banknote, roles: ROLE_ACCESS.ownerManager, businessTypes: null },
+  { href: '/expenses', labelKey: 'expenses', icon: Receipt, roles: ROLE_ACCESS.ownerManager, businessTypes: null },
+  { href: '/whatsapp', labelKey: 'whatsapp', icon: MessageCircle, roles: ROLE_ACCESS.ownerManagerCashier, businessTypes: null },
+  { href: '/products', labelKey: 'products', icon: Package, roles: ROLE_ACCESS.ownerManager, businessTypes: null },
+  { href: '/tables', labelKey: 'tables', icon: Grid3X3, roles: ROLE_ACCESS.ownerManager, businessTypes: ['restaurant'] },
+  { href: '/settings?tab=kds', labelKey: 'kds', icon: ChefHat, roles: ROLE_ACCESS.ownerManager, businessTypes: ['restaurant'] },
+  { href: '/customers', labelKey: 'customers', icon: Users, roles: ROLE_ACCESS.ownerManager, businessTypes: null },
+  { href: '/staff', labelKey: 'staff', icon: UserCog, roles: ROLE_ACCESS.ownerManager, businessTypes: null },
+  { href: '/settings', labelKey: 'settings', icon: Settings, roles: ROLE_ACCESS.ownerManager, businessTypes: null },
 ];
 
 export default function AppSidebar() {
   const pathname = usePathname();
   const { user, currentTenant, logout } = useAuthStore();
   const { tablesRequired, kdsEnabled, whatsappEnabled, setTablesRequired, setKdsEnabled, setWhatsappEnabled } = usePosSettingsStore();
-  const { isMobile, setOpenMobile, toggleSidebar } = useSidebar();
+  const { isMobile, setOpenMobile } = useSidebar();
   const t = useTranslations('nav');
   const tCommon = useTranslations('common');
   const { confirm, ConfirmDialog } = useConfirm();
   const [emailNeedsAttention, setEmailNeedsAttention] = useState(false);
   const closeMobile = () => { if (isMobile) setOpenMobile(false); };
+  const tSettings = useTranslations('settings');
+  const { mode: themeMode, cycle: cycleThemeMode } = useThemeModeToggle();
+  const themeModeIcon = themeMode === 'light' ? Sun : themeMode === 'dark' ? Moon : Monitor;
+  const themeModeLabel = themeMode === 'light'
+    ? tSettings('themeLight')
+    : themeMode === 'dark'
+      ? tSettings('themeDark')
+      : tSettings('themeSystem');
+  const ThemeModeIcon = themeModeIcon;
 
   const role = currentTenant?.role || 'cashier';
   const businessType = currentTenant?.business_type || 'restaurant';
   const navItems = ALL_NAV_ITEMS.filter((item) => {
     if (item.href === '/tables' && !tablesRequired) return false;
-    // KDS disabled → hide the nav entry entirely (issue #133).
+    // Hide KDS settings navigation when KDS is disabled.
     if (item.href === '/settings?tab=kds' && !kdsEnabled) return false;
     // WhatsApp integration not enabled on this tenant → hide the nav entry.
     if (item.href === '/whatsapp' && !whatsappEnabled) return false;
-    return item.roles.includes(role)
+    return hasRole(role, item.roles)
       && (item.businessTypes === null || item.businessTypes.includes(businessType));
   });
   const homeHref = getLandingPage();
@@ -106,17 +127,15 @@ export default function AppSidebar() {
     api.get('/settings/kds_enabled')
       .then((res) => setKdsEnabled(res.data.setting?.value !== 'false'))
       .catch(() => { });
-    // Sync the WhatsApp enabled flag from the backend so the sidebar shows
-    // the nav entry only when the integration is actually enabled on this
-    // tenant. The WhatsApp page also writes the store on enable/disable so
-    // the sidebar updates without a refetch when the user toggles.
+    // Sync WhatsApp status from backend so sidebar only shows the entry
+    // when integration is enabled on this tenant.
     api.get('/whatsapp/status')
       .then((res) => setWhatsappEnabled(!!res.data?.enabled))
       .catch(() => { });
   }, [currentTenant, setTablesRequired, setKdsEnabled, setWhatsappEnabled]);
 
   useEffect(() => {
-    if (role !== 'owner') return;
+    if (!hasRole(role, ROLE_ACCESS.owner)) return;
     let active = true;
     const refreshCloudAttention = async () => {
       try {
@@ -192,35 +211,54 @@ export default function AppSidebar() {
       <SidebarFooter>
         <SidebarMenu>
           <SidebarMenuItem>
-            <SidebarMenuButton asChild isActive={pathname === '/support'} tooltip={t('support')}>
-              <Link href="/support" onClick={closeMobile}>
-                <LifeBuoy />
-                <span>{t('support')}</span>
-              </Link>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
-          <SidebarMenuItem>
-            <SidebarMenuButton onClick={toggleSidebar} tooltip={t('toggleSidebar')}>
-              <PanelLeft />
-              <span>{t('collapse')}</span>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
-          <SidebarMenuItem>
-            {/* Identity label, not a button — nothing to click through to, so it
-                deliberately skips SidebarMenuButton's interactive/hover styling. */}
-            <div
-              title={user?.name || user?.email || t('user')}
-              className="flex w-full items-center gap-2 rounded-md p-2 text-start text-sm text-sidebar-foreground/70 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-2! [&>span:last-child]:truncate [&>svg]:size-4 [&>svg]:shrink-0"
+            <SidebarMenuButton
+              onClick={cycleThemeMode}
+              tooltip={`${tSettings('themeTitle')}: ${themeModeLabel}`}
             >
-              <UserCircle />
-              <span className="truncate">{user?.name || user?.email || t('user')}</span>
-            </div>
+              <ThemeModeIcon className="size-4 shrink-0" />
+              <span>{tSettings('themeTitle')}</span>
+              <span className="ms-auto text-xs text-muted-foreground group-data-[collapsible=icon]:hidden">
+                {themeModeLabel}
+              </span>
+            </SidebarMenuButton>
           </SidebarMenuItem>
           <SidebarMenuItem>
-            <SidebarMenuButton onClick={async () => { if (await confirm(t('confirmLogout'))) logout(); }} tooltip={t('logoutTooltip')}>
-              <LogOut />
-              <span>{t('logout')}</span>
-            </SidebarMenuButton>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <SidebarMenuButton
+                  className="rounded-xl border-0 bg-sidebar-accent/60 hover:bg-sidebar-accent hover:shadow-xs data-[state=open]:bg-sidebar-accent/90 transition-all h-9 px-3 font-normal group-data-[collapsible=icon]:h-8! group-data-[collapsible=icon]:p-2! group-data-[collapsible=icon]:bg-transparent group-data-[collapsible=icon]:rounded-lg"
+                  tooltip={user?.name || user?.email || t('user')}
+                >
+                  <UserCircle className="size-4 shrink-0 text-sidebar-primary" />
+                  <span className="font-medium text-sm truncate group-data-[collapsible=icon]:hidden text-sidebar-foreground">
+                    {user?.name || user?.email || t('user')}
+                  </span>
+                  <ChevronUp className="ms-auto size-4 shrink-0 text-muted-foreground group-data-[collapsible=icon]:hidden transition-transform duration-200 group-data-[state=open]:rotate-180" />
+                </SidebarMenuButton>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                side={isMobile ? "bottom" : "top"}
+                align={isMobile ? "end" : "start"}
+                className="w-56 rounded-lg"
+              >
+                <DropdownMenuItem asChild className="cursor-pointer">
+                  <Link href="/support" onClick={closeMobile} className="flex items-center gap-2">
+                    <LifeBuoy className="size-4 shrink-0" />
+                    <span>{t('support')}</span>
+                  </Link>
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onClick={async () => {
+                    if (await confirm(t('confirmLogout'))) logout();
+                  }}
+                  className="cursor-pointer text-red-600 focus:text-red-600 focus:bg-red-50 dark:focus:bg-red-950/50 flex items-center gap-2"
+                >
+                  <LogOut className="size-4 shrink-0" />
+                  <span>{t('logout')}</span>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarFooter>

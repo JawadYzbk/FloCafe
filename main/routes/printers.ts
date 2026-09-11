@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { getDatabase, now, attachEffectiveAddons, isKotPrintingEnabled, parseItemJson } from '../db';
 import { getOrderWithItems } from './bills';
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'node:crypto';
 import { printViaNetwork, printViaUSB, buildTestPage, printReceiptDetailed, printKOTDetailed, detectConnectedPrinters, prepareReceipt, escPosToText } from '../printers/thermal';
 import { BILL_LANGUAGE_POLICY_KEY, KOT_LANGUAGE_POLICY_KEY, parseStoredLanguagePolicy } from '../lib/print-language-settings';
 import {
@@ -9,17 +9,19 @@ import {
   resolveReceiptLanguages,
   type KotLanguagePolicy,
   type ReceiptLanguagePolicy,
+  isKotItemPending,
 } from '../../shared/print';
-import { getSupportedPrinterProfiles, resolvePrinterProfile } from '../printers/profiles';
+import { getSupportedPrinterProfiles, resolvePrinterProfile, capabilitiesForPrinter } from '../printers/profiles';
 import { requireRole } from '../middleware/security';
-import { getCountryByCode, getCurrencySymbol } from '../countries';
+import { ROLE_ACCESS } from '../../shared/role-permissions';
+import { getCountryByCode, getCurrencySymbol, resolveTenantCurrency } from '../countries';
 import { asyncHandler } from '../middleware/async-handler';
 import { getHttpRequestSignal } from '../shutdown';
 
 const router = Router();
 
-// Printer name must contain only safe characters (no shell metacharacters)
-const PRINTER_NAME_REGEX = /^[a-zA-Z0-9 _\-\.]+$/;
+// Allows standard OS printer queue characters while rejecting control characters.
+const PRINTER_NAME_REGEX = /^[^\x00-\x1f\x7f]{1,128}$/;
 const CONNECTION_TYPES = ['network', 'usb', 'webusb'] as const;
 const PRINTER_COLUMN_WIDTHS = ['cols-32', 'cols-36', 'cols-40', 'cols-42', 'cols-44', 'cols-48'] as const;
 
@@ -29,7 +31,7 @@ function isValidPort(port: unknown): port is number {
 
 function validatePrinterFields(body: any, existing?: any): string | null {
   if (body.name !== undefined && (typeof body.name !== 'string' || body.name.length === 0 || !PRINTER_NAME_REGEX.test(body.name))) {
-    return 'name contains invalid characters. Only letters, numbers, spaces, hyphens, underscores, and dots are allowed.';
+    return 'name must be 1-128 characters and cannot contain control characters.';
   }
   if (body.connection_type !== undefined && !CONNECTION_TYPES.includes(body.connection_type)) {
     return 'connection_type must be network | usb | webusb';
@@ -39,6 +41,9 @@ function validatePrinterFields(body: any, existing?: any): string | null {
   }
   if (body.is_default !== undefined && typeof body.is_default !== 'boolean') {
     return 'is_default must be a boolean';
+  }
+  if (body.cash_drawer_pulse_enabled !== undefined && typeof body.cash_drawer_pulse_enabled !== 'boolean') {
+    return 'cash_drawer_pulse_enabled must be a boolean';
   }
   if (body.paper_width !== undefined && !PRINTER_COLUMN_WIDTHS.includes(body.paper_width)) {
     return 'paper_width must be cols-32, cols-36, cols-40, cols-42, cols-44, or cols-48';
@@ -63,6 +68,7 @@ function ensureDefaultPrinter(db: any): void {
 function printerShape(printer: any) {
   if (!printer) return printer;
   const profile = resolvePrinterProfile(printer);
+  const capabilities = capabilitiesForPrinter(profile, printer.paper_width || profile.defaultPaperWidth);
   return {
     id: printer.id,
     name: printer.name,
@@ -70,17 +76,17 @@ function printerShape(printer: any) {
     ip_address: printer.ip_address,
     port: printer.port,
     is_default: printer.is_default,
+    cash_drawer_pulse_enabled: printer.cash_drawer_pulse_enabled,
     paper_width: printer.paper_width,
     created_at: printer.created_at,
     updated_at: printer.updated_at,
     profile_id: profile.id,
     profile_name: `${profile.make} ${profile.model}`,
+    capabilities,
   };
 }
 
-// Keep receipt and KOT callers on one item hydration contract. Database rows
-// may still contain legacy JSON fields, while selected add-ons now live in the
-// normalized order_item_addons table.
+// Hydrates order items with add-ons from normalized order_item_addons.
 export function getEffectiveOrderItems(db: any, orderId: string): any[] {
   return attachEffectiveAddons(
     db,
@@ -137,13 +143,15 @@ router.get('/:id', (req: Request, res: Response) => {
 });
 
 // POST /api/printers — create
-router.post('/', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.post('/', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
-    const { name, connection_type, ip_address, port, paper_width, is_default } = req.body;
+    const { connection_type, ip_address, port, paper_width, is_default, cash_drawer_pulse_enabled } = req.body;
+    // Trim accidental whitespace so the name matches the OS print queue exactly.
+    const name = typeof req.body.name === 'string' ? req.body.name.trim() : req.body.name;
 
     if (!name) return res.status(400).json({ error: 'name is required' });
     if (typeof name !== 'string' || !PRINTER_NAME_REGEX.test(name)) {
-      return res.status(400).json({ error: 'name contains invalid characters. Only letters, numbers, spaces, hyphens, underscores, and dots are allowed.' });
+      return res.status(400).json({ error: 'name must be 1-128 characters and cannot contain control characters.' });
     }
     if (!connection_type) return res.status(400).json({ error: 'connection_type is required' });
     if (!CONNECTION_TYPES.includes(connection_type)) {
@@ -159,7 +167,7 @@ router.post('/', requireRole('owner', 'manager'), (req: Request, res: Response) 
     }
 
     const db = getDatabase();
-    const id = uuidv4();
+    const id = randomUUID();
 
     db.transaction(() => {
       const existingPrinters = db.prepare('SELECT COUNT(*) as count FROM printers').get() as any;
@@ -167,14 +175,15 @@ router.post('/', requireRole('owner', 'manager'), (req: Request, res: Response) 
       const shouldBeDefault = Boolean(is_default) || isFirstPrinter;
       if (shouldBeDefault) db.prepare('UPDATE printers SET is_default = 0').run();
       db.prepare(`
-        INSERT INTO printers (id, name, connection_type, ip_address, port, paper_width, is_default, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO printers (id, name, connection_type, ip_address, port, paper_width, is_default, cash_drawer_pulse_enabled, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         id, name, connection_type,
         ip_address ?? null,
         port ?? 9100,
         paper_width ?? 'cols-42',
         shouldBeDefault ? 1 : 0,
+        cash_drawer_pulse_enabled === true ? 1 : 0,
         now(), now()
       );
       ensureDefaultPrinter(db);
@@ -189,15 +198,16 @@ router.post('/', requireRole('owner', 'manager'), (req: Request, res: Response) 
 });
 
 // PUT /api/printers/:id — update
-router.put('/:id', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.put('/:id', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const existing = db.prepare('SELECT * FROM printers WHERE id = ?').get(req.params.id) as any;
     if (!existing) return res.status(404).json({ error: 'Printer not found' });
 
-    const { name, connection_type, ip_address, port, paper_width, is_default } = req.body;
+    const { connection_type, ip_address, port, paper_width, is_default, cash_drawer_pulse_enabled } = req.body;
+    const name = typeof req.body.name === 'string' ? req.body.name.trim() : req.body.name;
 
-    const fieldError = validatePrinterFields(req.body, existing);
+    const fieldError = validatePrinterFields({ ...req.body, name }, existing);
     if (fieldError) return res.status(400).json({ error: fieldError });
 
     db.transaction(() => {
@@ -207,7 +217,7 @@ router.put('/:id', requireRole('owner', 'manager'), (req: Request, res: Response
       db.prepare(`
         UPDATE printers SET
           name = ?, connection_type = ?, ip_address = ?, port = ?,
-          paper_width = ?, is_default = ?, updated_at = ?
+          paper_width = ?, is_default = ?, cash_drawer_pulse_enabled = ?, updated_at = ?
         WHERE id = ?
       `).run(
         name !== undefined ? name : existing.name,
@@ -216,6 +226,7 @@ router.put('/:id', requireRole('owner', 'manager'), (req: Request, res: Response
         port !== undefined ? port : existing.port,
         paper_width !== undefined ? paper_width : existing.paper_width,
         becameDefault ? 1 : (is_default === false ? 0 : existing.is_default),
+        cash_drawer_pulse_enabled !== undefined ? (cash_drawer_pulse_enabled ? 1 : 0) : existing.cash_drawer_pulse_enabled,
         now(), req.params.id
       );
       if (becameDefault) db.prepare('UPDATE printers SET is_default = 0 WHERE id != ?').run(req.params.id);
@@ -237,7 +248,7 @@ router.put('/:id', requireRole('owner', 'manager'), (req: Request, res: Response
 });
 
 // DELETE /api/printers/:id
-router.delete('/:id', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.delete('/:id', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const printer = db.prepare('SELECT * FROM printers WHERE id = ?').get(req.params.id) as any;
@@ -263,7 +274,7 @@ router.delete('/:id', requireRole('owner', 'manager'), (req: Request, res: Respo
 });
 
 // POST /api/printers/:id/set-default
-router.post('/:id/set-default', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.post('/:id/set-default', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const printer = db.prepare('SELECT * FROM printers WHERE id = ?').get(req.params.id);
@@ -282,14 +293,21 @@ router.post('/:id/set-default', requireRole('owner', 'manager'), (req: Request, 
 });
 
 // POST /api/printers/:id/test — send a test print job
-router.post('/:id/test', requireRole('owner', 'manager'), asyncHandler(async (req: Request, res: Response) => {
+router.post('/:id/test', requireRole(...ROLE_ACCESS.ownerManager), asyncHandler(async (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const printer = db.prepare('SELECT * FROM printers WHERE id = ?').get(req.params.id) as any;
     if (!printer) return res.status(404).json({ error: 'Printer not found' });
 
     const profile = resolvePrinterProfile(printer);
-    const testData = buildTestPage(printer.paper_width || profile.defaultPaperWidth, profile.cutMode, tenantLanguage(db));
+    const capabilities = capabilitiesForPrinter(profile, printer.paper_width || profile.defaultPaperWidth);
+    const testData = buildTestPage(
+      printer.paper_width || profile.defaultPaperWidth,
+      profile.cutMode,
+      tenantLanguage(db),
+      tenantSettingValue(db, 'timezone') || 'Asia/Kolkata',
+      req.body?.rasterProbe === true ? capabilities : undefined,
+    );
     let result: { ok: boolean; detail?: string } = { ok: false };
 
     switch (printer.connection_type) {
@@ -308,9 +326,7 @@ router.post('/:id/test', requireRole('owner', 'manager'), asyncHandler(async (re
     if (result.ok) {
       res.json({ success: true });
     } else {
-      // Surface the actual reason (offline, paper out, name mismatch, driver
-      // rejection, etc.) instead of a generic message — this is the button a
-      // merchant reaches for while troubleshooting, so it should say why.
+      // Surface the specific printer failure reason rather than a generic message.
       res.status(502).json({ error: result.detail || 'Printer did not respond or print failed', detail: result.detail });
     }
   } catch (error: any) {
@@ -351,7 +367,7 @@ router.post('/print-raw', requireRole('owner', 'manager', 'cashier'), asyncHandl
 }));
 
 // POST /api/printers/print-bill — print bill via backend (desktop app)
-router.post('/print-bill', requireRole('owner', 'manager', 'cashier'), asyncHandler(async (req: Request, res: Response) => {
+router.post('/print-bill', requireRole(...ROLE_ACCESS.ownerManagerCashier), asyncHandler(async (req: Request, res: Response) => {
   try {
     const { billId, orderId, useUnicode = false, isReprint = false, preview = false } = req.body;
     // Renderer's global "Arabic/Persian shaping" setting (#437). Only an
@@ -434,9 +450,9 @@ router.post('/print-bill', requireRole('owner', 'manager', 'cashier'), asyncHand
       ).get(bill.id) as { total: number };
       pointsRedeemed = redeemed.total;
 
-      if (settings.loyalty_enabled === 'true') {
+      if (['true', '1'].includes(settings.loyalty_enabled || '')) {
         const credits = db.prepare(
-          `SELECT COALESCE(SUM(amount), 0) as total FROM loyalty_ledger WHERE customer_id = ? AND type = 'credit' AND (expires_at IS NULL OR expires_at > datetime('now'))`
+          `SELECT COALESCE(SUM(amount), 0) as total FROM loyalty_ledger WHERE customer_id = ? AND type = 'credit'`
         ).get(bill.customer_id) as { total: number };
         const debits = db.prepare(
           `SELECT COALESCE(SUM(amount), 0) as total FROM loyalty_ledger WHERE customer_id = ? AND type = 'debit'`
@@ -445,13 +461,17 @@ router.post('/print-bill', requireRole('owner', 'manager', 'cashier'), asyncHand
       }
     }
 
+    const country = settings.country || 'IN';
+    const currency = resolveTenantCurrency(settings.currency, country);
     const business = {
       name: settings.business_name || '',
       address: settings.business_address || '',
       phone: settings.business_phone || '',
       taxRegistrationNumber: settings.tax_registration_number || '',
-      currency_symbol: getCurrencySymbol(settings.currency || 'INR', getCountryByCode(settings.country || 'IN')?.locale) || settings.currency_symbol || '₹',
-      country: settings.country || 'IN',
+      currency,
+      // Derive from resolved currency before stored symbol to avoid stale currency symbols.
+      currency_symbol: getCurrencySymbol(currency, getCountryByCode(country)?.locale) || settings.currency_symbol || currency,
+      country,
       instagram_handle: settings.instagram_handle || '',
       customer_name: customer?.name || '',
       customer_phone: customer?.phone
@@ -463,6 +483,7 @@ router.post('/print-bill', requireRole('owner', 'manager', 'cashier'), asyncHand
       points_redeemed: pointsRedeemed,
       points_balance: pointsBalance,
       trim_decimals: settings.printer_trim_decimals === 'true',
+      timezone: settings.timezone || 'Asia/Kolkata',
       show_name: settings.bill_show_name !== 'false',
       show_address: settings.bill_show_address !== 'false',
       show_phone: settings.bill_show_phone !== 'false',
@@ -474,18 +495,12 @@ router.post('/print-bill', requireRole('owner', 'manager', 'cashier'), asyncHand
       footer_note: settings.bill_footer_message || '',
     };
     const billTemplate = settings.bill_template;
-    // Receipt label languages (#443): the tenant's `bill_language_policy`
-    // (kernel B) resolves against the tenant `language` setting through the
-    // shared kernel; primary first, optional additional second.
+    // Resolves primary and optional secondary receipt languages from tenant policy.
     const receiptLanguages = resolveTenantReceiptLanguages(db);
     console.log('[Print Bill] Preparing receipt', { template: billTemplate || 'classic' });
 
     if (preview === true) {
-      // Preview and production share one code path (#443): prepareReceipt →
-      // formatReceipt renders through PrintDocument for classic + compact
-      // (plugin templates keep their dedicated renderer). Merchant templates
-      // (#447) resolve through the same document pipeline inside
-      // formatReceipt, so previews need no special-casing here.
+      // Previews and prints share the same document formatting pipeline.
       const prepared = prepareReceipt(order, bill, business, billTemplate || 'classic', useUnicode, isReprint, arabicShapingOverride, receiptLanguages.primary, receiptLanguages.additional);
       return res.json({
         success: true,
@@ -501,12 +516,19 @@ router.post('/print-bill', requireRole('owner', 'manager', 'cashier'), asyncHand
     // Use existing printReceipt function with template support
     console.log('[Print Bill] Calling printReceipt...');
     const result = await printReceiptDetailed(order, bill, business, billTemplate || 'classic', useUnicode, isReprint, getHttpRequestSignal(req), arabicShapingOverride, receiptLanguages.primary, receiptLanguages.additional);
-    console.log('[Print Bill] Print completed', result);
+    console.log('[Print Bill] Print completed', {
+      ok: result.ok,
+      code: result.code,
+      correlation_id: result.correlationId,
+      stage: result.stage,
+      failure_class: result.failureClass,
+      warning_count: result.warnings?.length || 0,
+    });
 
     if (result.ok) {
       res.json({ success: true, warnings: result.warnings || [] });
     } else {
-      res.status(502).json({ error: 'Print failed. Check printer connection and settings.', code: result.code, correlation_id: result.correlationId, stage: result.stage });
+      res.status(502).json({ error: result.detail || 'Print failed. Check printer connection and settings.', detail: result.detail, failure_class: result.failureClass, code: result.code, correlation_id: result.correlationId, stage: result.stage, warnings: result.warnings || [] });
     }
   } catch (error: any) {
     console.error('[Print Bill] Error:', error);
@@ -515,11 +537,7 @@ router.post('/print-bill', requireRole('owner', 'manager', 'cashier'), asyncHand
   }
 }));
 
-// Groups order items across active, fully-configured kitchen stations (has both
-// a category allowlist and a linked printer). Items whose category isn't claimed
-// by any station fall back to the default printer under the generic 'Kitchen'
-// label — this is also what happens for the whole order when no station is
-// configured at all, so stores not using stations see no behavior change.
+// Routes items to kitchen stations by category, falling back to default kitchen.
 export function routeItemsToStations(db: any, orderItems: any[]): { stationName: string; printer: any; items: any[] }[] {
   const rawStations = db.prepare(
     `SELECT * FROM kitchen_stations WHERE is_active = 1 AND printer_id IS NOT NULL AND category_ids IS NOT NULL AND category_ids != ''`
@@ -569,17 +587,16 @@ export function routeItemsToStations(db: any, orderItems: any[]): { stationName:
   return result;
 }
 
-// POST /api/printers/print-kot — print KOT via backend (desktop app)
-router.post('/print-kot', requireRole('owner', 'manager', 'cashier'), asyncHandler(async (req: Request, res: Response) => {
-  // Coarser than auto_print_kot — when this is off, no KOT print command
-  // should ever be sent, automatic or manual (issue #133).
+// POST /api/printers/print-kot — print KOT via backend (desktop app).
+// Uses `sales` so the waiter terminal's "server" role can print its own orders.
+router.post('/print-kot', requireRole(...ROLE_ACCESS.sales), asyncHandler(async (req: Request, res: Response) => {
+  // Enforce master KOT printing toggle for all automatic and manual print requests.
   if (!isKotPrintingEnabled()) {
     return res.status(403).json({ error: 'KOT printing is disabled for this business' });
   }
   try {
     const { orderId, stationName, items, useUnicode = false } = req.body;
-    // Renderer's global "Arabic/Persian shaping" setting (#437). Only an
-    // explicit boolean overrides the printer profile's declared capability.
+    // Global text shaping setting; explicit boolean overrides printer profile capability.
     const arabicShapingOverride = typeof req.body?.arabicShaping === 'boolean' ? req.body.arabicShaping : undefined;
 
     if (!orderId) {
@@ -608,29 +625,36 @@ router.post('/print-kot', requireRole('owner', 'manager', 'cashier'), asyncHandl
     // Fetch order items from database
     const orderItems: any[] = getEffectiveOrderItems(db, orderId);
 
-    // Fetch table info if available
+    // Fetch table/customer info if available so backend KOT metadata matches
+    // the browser and WebUSB paths.
     if (order.table_id) {
       const table: any = db.prepare('SELECT * FROM tables WHERE id = ?').get(order.table_id);
       if (table) {
         order.table = { name: table.number };
       }
     }
+    if (order.customer_id) {
+      const customer = db.prepare('SELECT name FROM customers WHERE id = ?').get(order.customer_id) as { name: string } | null;
+      if (customer) order.customer = { name: customer.name };
+    }
 
-    // An explicit stationName/items override (not used by the current frontend,
-    // but kept for any external caller) always prints a single ticket, as before.
-    // Otherwise, auto-route items to their configured kitchen stations.
+    // Specific station prints one ticket; unassigned item overrides route by station.
     let success = true;
     const warnings: NonNullable<Awaited<ReturnType<typeof printKOTDetailed>>['warnings']> = [];
     let failure: Awaited<ReturnType<typeof printKOTDetailed>> | null = null;
-    if (stationName || items) {
-      const kotItems = items || orderItems;
+    const kotSourceItems = (Array.isArray(items) ? items : orderItems)
+      .filter((item: any) => isKotItemPending(item?.status));
+
+    if (stationName) {
       const station = stationName || 'Kitchen';
-      const result = await printKOTDetailed(order, kotItems, station, useUnicode, undefined, getHttpRequestSignal(req), arabicShapingOverride, kotLanguage);
-      success = result.ok;
-      failure = result.ok ? null : result;
-      warnings.push(...(result.warnings || []));
+      if (kotSourceItems.length > 0) {
+        const result = await printKOTDetailed(order, kotSourceItems, station, useUnicode, undefined, getHttpRequestSignal(req), arabicShapingOverride, kotLanguage);
+        success = result.ok;
+        failure = result.ok ? null : result;
+        warnings.push(...(result.warnings || []));
+      }
     } else {
-      const groups = routeItemsToStations(db, orderItems).filter((g) => g.items.length > 0);
+      const groups = routeItemsToStations(db, kotSourceItems).filter((g) => g.items.length > 0);
       for (const group of groups) {
         const result = await printKOTDetailed(order, group.items, group.stationName, useUnicode, group.printer || undefined, getHttpRequestSignal(req), arabicShapingOverride, kotLanguage);
         success = success && result.ok;
@@ -642,7 +666,7 @@ router.post('/print-kot', requireRole('owner', 'manager', 'cashier'), asyncHandl
     if (success) {
       res.json({ success: true, warnings });
     } else {
-      res.status(502).json({ error: 'KOT print failed. Check printer connection.', code: failure?.code, correlation_id: failure?.correlationId, stage: failure?.stage });
+      res.status(502).json({ error: failure?.detail || 'KOT print failed. Check printer connection.', detail: failure?.detail, failure_class: failure?.failureClass, code: failure?.code, correlation_id: failure?.correlationId, stage: failure?.stage });
     }
   } catch (error: any) {
     console.error('[Print KOT] Error:', error);
@@ -653,11 +677,8 @@ router.post('/print-kot', requireRole('owner', 'manager', 'cashier'), asyncHandl
 
 export const printerRoutes = router;
 
-/**
- * Tenant-configured language for print label selection (#440). Defaults to
- * 'en' when unset; unknown values fall back to English at render time.
- */
-function tenantLanguage(db: ReturnType<typeof getDatabase>): string {
+/** Tenant-configured language for print labels, defaulting to 'en'. */
+export function tenantLanguage(db: ReturnType<typeof getDatabase>): string {
   try {
     const row = db.prepare("SELECT value FROM settings WHERE key = 'language'").get() as { value?: string } | undefined;
     return row?.value || 'en';
@@ -675,12 +696,7 @@ function tenantSettingValue(db: ReturnType<typeof getDatabase>, key: string): st
   }
 }
 
-/**
- * Receipt label languages for one print request (#443). The stored
- * `bill_language_policy` is resolved through the shared kernel against the
- * tenant `language` setting; malformed stored values fall back to the
- * inherit/none default (read-side parse never breaks printing).
- */
+/** Resolves primary and optional secondary receipt languages from tenant policy. */
 function resolveTenantReceiptLanguages(db: ReturnType<typeof getDatabase>): { primary: string; additional?: string } {
   const policy = parseStoredLanguagePolicy(
     BILL_LANGUAGE_POLICY_KEY,
@@ -692,10 +708,7 @@ function resolveTenantReceiptLanguages(db: ReturnType<typeof getDatabase>): { pr
     : { primary: languages[0] };
 }
 
-/**
- * Kitchen ticket label language (#443): `kot_language_policy` resolved
- * through the kernel, independently of the receipt language policy.
- */
+/** Resolves kitchen ticket label language from tenant policy. */
 function resolveTenantKotLanguage(db: ReturnType<typeof getDatabase>): string {
   const policy = parseStoredLanguagePolicy(
     KOT_LANGUAGE_POLICY_KEY,

@@ -1,17 +1,4 @@
-/**
- * Merchant template → classic thermal receipt renderer (#447, epic #438).
- *
- * Resolves an ACTIVE merchant template through the PrintDocument pipeline:
- * authoritative rows → PrintData/PrintContext → buildBillDocument →
- * applyMerchantTemplate (semantic block selection/order/label variants) →
- * classic token lines → bytes. Because the template is applied at the
- * SEMANTIC layer, every renderer that consumes the applied document produces
- * the same content — the parity harness asserts this byte-equivalence in
- * merchant-template mode.
- *
- * v1 renders merchant receipt documents through the classic layout pipeline;
- * compact/KOT adoption of merchant docs belongs to their owning issues.
- */
+/** Merchant template to classic thermal receipt renderer; resolves active template through PrintDocument pipeline. */
 
 import { loadActiveMerchantPrintTemplate } from '../services/merchant-print-templates';
 import { validateMerchantTemplate } from '../../shared/print';
@@ -26,6 +13,8 @@ import {
 } from './document-classic';
 import { buildEscPos, type PrintWarning } from './thermal';
 import type { PrinterCutMode } from './profiles';
+import type { ThermalPrinterCapabilities } from '../../shared/print/thermal-capabilities';
+import type { RasterSemanticLineGroup } from '../../shared/print/raster';
 
 export interface MerchantDocumentRenderResult {
   readonly data: Buffer;
@@ -33,16 +22,12 @@ export interface MerchantDocumentRenderResult {
   readonly warnings: PrintWarning[];
   /** True when the stored payload failed validation and classic was used. */
   readonly fellBackToClassic: boolean;
+  readonly rasterGroups: readonly RasterSemanticLineGroup[];
 }
 
 type RawPrintRecord = Record<string, unknown>;
 
-/**
- * Render a bill through a merchant template row. Fail-closed on render too:
- * if the stored payload no longer validates against this build's schema
- * (e.g. written by a newer version), a warning is recorded and the plain
- * classic document is rendered instead of garbage or nothing.
- */
+/** Render bill through merchant template; falls back to classic if invalid. */
 export function renderMerchantReceiptViaDocument(
   order: RawPrintRecord,
   bill: RawPrintRecord,
@@ -57,10 +42,10 @@ export function renderMerchantReceiptViaDocument(
     useUnicode: boolean;
     arabicShaping: boolean;
     cutMode: PrinterCutMode;
+    capabilities?: ThermalPrinterCapabilities;
   },
 ): MerchantDocumentRenderResult {
   const warnings: PrintWarning[] = [];
-
   const printContext = buildBillPrintContext({
     columns: opts.columns,
     language: opts.language,
@@ -72,20 +57,30 @@ export function renderMerchantReceiptViaDocument(
     language: printContext.languages[0],
     locale: printContext.locale,
     ...(printContext.timezone !== undefined ? { timezone: printContext.timezone } : {}),
+    currency: printContext.currency,
     currencySymbol: printContext.currencySymbol,
     trimDecimals: printContext.trimDecimals,
     useUnicode: opts.useUnicode,
     arabicShaping: opts.arabicShaping,
     cutMode: opts.cutMode,
+    capabilities: opts.capabilities,
   } as const;
 
-  const finish = (lines: string[], fellBackToClassic: boolean) => {
-    const data = buildEscPos(lines, opts.useUnicode, {
+  const renderDocument = (document: Parameters<typeof renderBillDocumentToClassicLines>[0]) => {
+    const rasterGroups: RasterSemanticLineGroup[] = [];
+    const lines = renderBillDocumentToClassicLines(document, { ...baseOptions, rasterGroups });
+    return { lines, rasterGroups };
+  };
+
+  const finish = (rendered: { lines: string[]; rasterGroups: RasterSemanticLineGroup[] }, fellBackToClassic: boolean) => {
+    const data = buildEscPos(rendered.lines, opts.useUnicode, {
       cutMode: opts.cutMode,
       arabicShaping: opts.arabicShaping,
       columns: opts.columns,
+      language: opts.language,
+      capabilities: opts.capabilities,
     }, warnings);
-    return { data, lines, warnings, fellBackToClassic };
+    return { data, lines: rendered.lines, warnings, fellBackToClassic, rasterGroups: rendered.rasterGroups };
   };
 
   const row = loadActiveMerchantPrintTemplate(templateId);
@@ -96,7 +91,7 @@ export function renderMerchantReceiptViaDocument(
       message: `Merchant template ${templateId} is not active; rendered with the classic layout.`,
     });
     return finish(
-      renderBillDocumentToClassicLines(buildBillDocument(buildBillPrintData(order, bill, business, opts.isReprint), printContext), baseOptions),
+      renderDocument(buildBillDocument(buildBillPrintData(order, bill, business, opts.isReprint), printContext)),
       true,
     );
   }
@@ -118,9 +113,9 @@ export function renderMerchantReceiptViaDocument(
       text: templateId,
       message: `Merchant template ${templateId} failed validation (${validation.errors[0]}); rendered with the classic layout.`,
     });
-    return finish(renderBillDocumentToClassicLines(buildBillDocument(printData, printContext), baseOptions), true);
+    return finish(renderDocument(buildBillDocument(printData, printContext)), true);
   }
 
   const document = applyMerchantTemplate(buildBillDocument(printData, printContext), validation.payload);
-  return finish(renderBillDocumentToClassicLines(document, baseOptions), false);
+  return finish(renderDocument(document), false);
 }

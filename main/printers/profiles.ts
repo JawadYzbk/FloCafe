@@ -1,3 +1,10 @@
+import {
+  GENERIC_THERMAL_CAPABILITIES,
+  LATIN_THERMAL_CAPABILITIES,
+  mergeThermalCapabilities,
+  type ThermalPrinterCapabilities,
+} from '../../shared/print/thermal-capabilities';
+
 export type PrinterCommandSet = 'escpos';
 export type PrinterCutMode = 'full' | 'partial';
 
@@ -13,15 +20,10 @@ export interface SupportedPrinterProfile {
   fontBColumns: number;
   printWidthMm?: number;
   cutMode: PrinterCutMode;
-  /**
-   * Whether the printer's firmware performs Arabic/Persian contextual shaping
-   * and bidirectional ordering. Generic ESC/POS printers do NOT — they render
-   * isolated glyph forms or garbage for Persian — so this defaults to unset
-   * (false), which makes the encoders skip Arabic-script text instead of
-   * printing corrupted output. Only set true after a real print on the
-   * specific hardware proves shaped Persian output.
-   */
+  /** Legacy override for Arabic shaping capability. @deprecated Use capabilities.shaping.arabic. */
   arabicShaping?: boolean;
+  /** Text encoding, shaping, representability, transliteration, and warning policy. */
+  capabilities: ThermalPrinterCapabilities;
   notes?: string;
 }
 
@@ -38,6 +40,15 @@ export const SUPPORTED_PRINTER_PROFILES: SupportedPrinterProfile[] = [
     fontBColumns: 64,
     printWidthMm: 72,
     cutMode: 'partial',
+    capabilities: {
+      ...LATIN_THERMAL_CAPABILITIES,
+      raster: {
+        enabled: true,
+        widthDots: 576,
+        maxBandHeight: 200,
+        modes: ['mixed', 'whole-receipt'],
+      },
+    },
     notes: '80mm ESC/POS receipt printer. Vendor specs list 72mm print width, 576 dots/line, Font A 42/48 columns, Font B 56/64 columns.',
   },
   {
@@ -51,6 +62,15 @@ export const SUPPORTED_PRINTER_PROFILES: SupportedPrinterProfile[] = [
     fontAColumns: 48,
     fontBColumns: 64,
     cutMode: 'partial',
+    capabilities: {
+      ...LATIN_THERMAL_CAPABILITIES,
+      raster: {
+        enabled: true,
+        widthDots: 576,
+        maxBandHeight: 200,
+        modes: ['mixed', 'whole-receipt'],
+      },
+    },
   },
   {
     id: 'generic-escpos-80',
@@ -63,6 +83,16 @@ export const SUPPORTED_PRINTER_PROFILES: SupportedPrinterProfile[] = [
     fontAColumns: 42,
     fontBColumns: 64,
     cutMode: 'full',
+    capabilities: {
+      ...GENERIC_THERMAL_CAPABILITIES,
+      encoding: { codePages: ['ascii'], preferredCodePage: 'ascii' },
+      raster: {
+        enabled: true,
+        widthDots: 576,
+        maxBandHeight: 200,
+        modes: ['mixed', 'whole-receipt'],
+      },
+    },
   },
   {
     id: 'generic-escpos-58',
@@ -75,6 +105,16 @@ export const SUPPORTED_PRINTER_PROFILES: SupportedPrinterProfile[] = [
     fontAColumns: 32,
     fontBColumns: 56,
     cutMode: 'full',
+    capabilities: {
+      ...GENERIC_THERMAL_CAPABILITIES,
+      encoding: { codePages: ['ascii'], preferredCodePage: 'ascii' },
+      raster: {
+        enabled: true,
+        widthDots: 384,
+        maxBandHeight: 200,
+        modes: ['mixed', 'whole-receipt'],
+      },
+    },
   },
 ];
 
@@ -113,4 +153,35 @@ export function resolvePrinterProfile(printer: any): SupportedPrinterProfile {
   return String(paperWidth || '').startsWith('58mm')
     ? SUPPORTED_PRINTER_PROFILES.find((p) => p.id === 'generic-escpos-58')!
     : SUPPORTED_PRINTER_PROFILES.find((p) => p.id === 'generic-escpos-80')!;
+}
+
+export function getPrinterCapabilities(
+  profile: SupportedPrinterProfile,
+  arabicShapingOverride?: boolean,
+): ThermalPrinterCapabilities {
+  return mergeThermalCapabilities(profile.capabilities || GENERIC_THERMAL_CAPABILITIES, arabicShapingOverride);
+}
+
+/** Maps paper_width string to canonical raster dot width, or null if unrecognized. */
+export function dotsForPaperWidth(paperWidth: string): number | null {
+  const colsMatch = String(paperWidth || '').match(/^cols-(3[2-9]|4[0-8])$/);
+  const cols = colsMatch ? Number(colsMatch[1]) : ({ '58mm': 32, '58mm-36': 36, '80mm-42': 42, '80mm': 48 } as Record<string, number>)[paperWidth] ?? null;
+  if (cols === null) return null;
+  if (cols <= 32) return 384;
+  if (cols <= 36) return 432;
+  if (cols <= 40) return 480;
+  return 576;
+}
+
+/** Returns printer capabilities, capping raster widthDots if paper_width is narrower than hardware. */
+export function capabilitiesForPrinter(
+  profile: SupportedPrinterProfile,
+  paperWidth: string | null | undefined,
+  arabicShapingOverride?: boolean,
+): ThermalPrinterCapabilities {
+  const capabilities = getPrinterCapabilities(profile, arabicShapingOverride);
+  if (!capabilities.raster.enabled || !capabilities.raster.widthDots) return capabilities;
+  const configuredDots = dotsForPaperWidth(String(paperWidth || ''));
+  if (configuredDots === null || configuredDots >= capabilities.raster.widthDots) return capabilities;
+  return { ...capabilities, raster: { ...capabilities.raster, widthDots: configuredDots } };
 }

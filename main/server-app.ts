@@ -4,7 +4,7 @@ import jwt from 'jsonwebtoken';
 import * as http from 'http';
 import * as path from 'path';
 import * as fs from 'fs';
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'node:crypto';
 import { closeServerResources, createShutdownCancellationError, getHttpRequestSignal, installHttpShutdownTracking, trackHttpRequestWork } from './shutdown';
 import { databaseMaintenanceMiddleware, getDatabase, isServerAppEnabled } from './db';
 import { getJWTSecret } from './routes/auth';
@@ -14,13 +14,20 @@ import { getDefaultServerAppPort, getServerAppPort as getActiveServerAppPort, se
 import { API_JSON_BODY_LIMIT } from './http-limits';
 import { buildCspHeader } from './csp';
 import { resolveContainedPath } from './lib/path-containment';
+import { ROLE_ACCESS } from '../shared/role-permissions';
+import {
+  getCountryByCode,
+  getCurrencyFractionDigits,
+  getCurrencySymbol,
+  resolveTenantCurrency,
+} from './countries';
 
 let serverApp: http.Server | null = null;
 let stopPromise: Promise<void> | null = null;
 let startReject: ((error: Error) => void) | null = null;
 let stopping = false;
 const SERVER_APP_PORT = getDefaultServerAppPort();
-const SERVER_APP_ALLOWED_ROLES = new Set(['server', 'manager', 'owner']);
+const SERVER_APP_ALLOWED_ROLES = new Set(ROLE_ACCESS.serverApp);
 
 type ServerAppUser = {
   userId: string;
@@ -28,6 +35,22 @@ type ServerAppUser = {
   role: string;
   iat?: number;
 };
+
+function currencyPosition(locale: string, currency: string): 'prefix' | 'suffix' {
+  try {
+    const parts = new Intl.NumberFormat(locale, {
+      style: 'currency',
+      currency,
+      currencyDisplay: 'narrowSymbol',
+    }).formatToParts(1);
+    return parts.findIndex((part) => part.type === 'currency')
+      < parts.findIndex((part) => part.type === 'integer')
+      ? 'prefix'
+      : 'suffix';
+  } catch {
+    return 'prefix';
+  }
+}
 
 function normalizeEmail(email: unknown): string {
   return String(email || '').trim().toLowerCase();
@@ -179,9 +202,18 @@ export function startServerApp(): Promise<void> {
       const rows = getDatabase().prepare('SELECT key, value FROM settings').all() as { key: string; value: string }[];
       const settings: Record<string, string> = {};
       for (const row of rows) settings[row.key] = row.value;
+      const country = getCountryByCode(settings.country) || getCountryByCode('IN')!;
+      const currency = resolveTenantCurrency(settings.currency, country.code);
+      const currencySymbol = settings.currency_symbol?.trim()
+        || getCurrencySymbol(currency, country.locale)
+        || currency;
       res.json({
         language: settings.language || null,
-        country: settings.country || null,
+        country: country.code,
+        currency,
+        currency_symbol: currencySymbol,
+        currency_position: currencyPosition(country.locale, currency),
+        currency_fraction_digits: getCurrencyFractionDigits(currency),
         kds_enabled: settings.kds_enabled !== 'false',
       });
     });
@@ -212,7 +244,7 @@ export function startServerApp(): Promise<void> {
         }
 
         const token = jwt.sign(
-          { userId: user.id, email: user.email, role: user.role, jti: uuidv4() },
+          { userId: user.id, email: user.email, role: user.role, jti: randomUUID() },
           getJWTSecret(),
           { expiresIn: remember_me ? '10d' : '24h' },
         );
@@ -249,6 +281,7 @@ export function startServerApp(): Promise<void> {
     app.get('/api/customers-search', requireServerAppAuth, (req, res) => forwardToMainApi(req, res, '/customers-search'));
     app.get('/api/crm/lookup', requireServerAppAuth, (req, res) => forwardToMainApi(req, res, '/crm/lookup'));
     app.post('/api/customers', requireServerAppAuth, (req, res) => forwardToMainApi(req, res, '/customers'));
+    app.post('/api/printers/print-kot', requireServerAppAuth, (req, res) => forwardToMainApi(req, res, '/printers/print-kot'));
 
     const staticDir = getStaticDir();
     if (staticDir) {
@@ -294,7 +327,8 @@ export function startServerApp(): Promise<void> {
       res.status(500).json({ error: 'Internal server error' });
     });
 
-    let currentPort = SERVER_APP_PORT;
+    const baseServerAppPort = parseInt(process.env.SERVER_APP_PORT || String(SERVER_APP_PORT), 10);
+    let currentPort = baseServerAppPort;
     let attempts = 0;
     const listeningServer = http.createServer(app);
     serverApp = listeningServer;
@@ -316,16 +350,16 @@ export function startServerApp(): Promise<void> {
       const onError = (err: NodeJS.ErrnoException) => {
         if (stopping) return;
         listeningServer.off('listening', onListening);
-        if (err.code === 'EADDRINUSE') {
+        if (err.code === 'EADDRINUSE' || err.code === 'EACCES') {
           attempts++;
           if (attempts >= 10) {
-            const errorMsg = `[Server App] Failed to bind to any port after 10 attempts starting from ${SERVER_APP_PORT}`;
+            const errorMsg = `[Server App] Failed to bind to any port after 10 attempts starting from ${baseServerAppPort}`;
             console.error(errorMsg);
             reject(new Error(errorMsg));
             return;
           }
           currentPort++;
-          console.log(`[Server App] Port ${attemptedPort} in use, trying ${currentPort}`);
+          console.log(`[Server App] Port ${attemptedPort} in use (${err.code}), trying ${currentPort}`);
           tryListen();
           return;
         }

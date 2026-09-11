@@ -4,6 +4,7 @@ import { getDatabase, now } from '../db';
 import { cloudSync, DEFAULT_CLOUD_SERVER_URL, normalizeCloudServerUrl } from '../services/cloud-sync';
 import { googleDrive } from '../services/google-drive';
 import { requireRole } from '../middleware/security';
+import { ROLE_ACCESS } from '../../shared/role-permissions';
 import { requireMasterPin } from '../middleware/master-pin';
 import { resolveTaxIdFormat, validateTaxRegistrationNumber } from '../services/tax';
 import { sendEvent } from '../services/telemetry';
@@ -26,13 +27,16 @@ import { asyncHandler } from '../middleware/async-handler';
 import { normalizeOptionalPhone } from '../lib/phone';
 import { CORE_BILL_TEMPLATES, isAvailableBillTemplate, listInstalledPrintTemplates, upgradeBillTemplateValue } from '../services/print-templates';
 import { listMerchantPrintTemplates } from '../services/merchant-print-templates';
+import { isSyntacticallyValidCurrencyCode } from '../../shared/print/currency';
 import {
   BILL_LANGUAGE_POLICY_KEY,
   KOT_LANGUAGE_POLICY_KEY,
+  Z_REPORT_LANGUAGE_POLICY_KEY,
   LANGUAGE_POLICY_SETTING_KEYS,
   defaultLanguagePolicySettingJson,
   validateLanguagePolicySetting,
 } from '../lib/print-language-settings';
+import { isThemeMode } from '../title-bar-theme';
 
 const router = Router();
 const settingsReadRateLimit = expressRateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: true, legacyHeaders: false });
@@ -69,7 +73,7 @@ function upsertSettings(db: ReturnType<typeof getDatabase>, entries: Record<stri
 
 function validBusinessLocation(timezone: unknown, currency: unknown, country: unknown): boolean {
   if (timezone !== undefined && !isValidTimeZone(timezone)) return false;
-  if (currency !== undefined && (typeof currency !== 'string' || !/^[A-Z]{3}$/.test(currency))) return false;
+  if (currency !== undefined && !isSyntacticallyValidCurrencyCode(currency)) return false;
   if (country !== undefined && (typeof country !== 'string' || !/^[A-Z]{2}$/.test(country))) return false;
   return true;
 }
@@ -95,6 +99,8 @@ const OPTIONAL_SETTING_DEFAULTS: Record<string, string> = {
   currency_display: 'rial',
   number_digits: 'locale',
   calendar: 'locale',
+  // Returns 'system' if not yet explicitly saved by the user.
+  theme_mode: 'system',
 };
 
 function maskSetting(key: string, value: string): string {
@@ -119,9 +125,7 @@ function boolFlag(value: unknown): string | undefined {
   return value ? 'true' : 'false';
 }
 
-// Country-scoped locale display preferences (#390). A region without declared
-// localeOptions supports only the neutral default for each group: canonical
-// currency unit (rial), locale digits, and locale calendar.
+// Neutral fallback preferences for locales without specific options.
 const NEUTRAL_LOCALE_PREFERENCES = {
   currency_display: 'rial',
   number_digits: 'locale',
@@ -151,9 +155,7 @@ function resolveStoredLocalePreference(key: LocalePreferenceKey, stored: string 
   return NEUTRAL_LOCALE_PREFERENCES[key];
 }
 
-// cloud_sync_enabled/cloud_orders_enabled/cloud_reports_enabled/cloud_command_polling_enabled
-// mirror FloAdmin's own `stores` table and are read elsewhere (cloud-sync.ts) as a strict
-// '1' check, not boolFlag()'s 'true'/'false' — keep this route's writes on that convention.
+// Flags stored as strict '1'/'0' to match cloud database conventions.
 function bool01Flag(value: unknown): string | undefined {
   const flag = boolFlag(value);
   return flag === undefined ? undefined : flag === 'true' ? '1' : '0';
@@ -171,6 +173,7 @@ function businessShape(s: Record<string, string>) {
   return {
     business_name: s.business_name || '',
     timezone: s.timezone || 'Asia/Kolkata',
+    business_day_start_time: s.business_day_start_time || '00:00',
     currency: s.currency || 'INR',
     country: s.country || 'IN',
     language: s.language || 'en',
@@ -193,9 +196,7 @@ function businessShape(s: Record<string, string>) {
     currency_display: resolveStoredLocalePreference('currency_display', s.currency_display, s.country || 'IN'),
     number_digits: resolveStoredLocalePreference('number_digits', s.number_digits, s.country || 'IN'),
     calendar: resolveStoredLocalePreference('calendar', s.calendar, s.country || 'IN'),
-    // Informational only — the active country pack's format if it declares
-    // one, else the static main/countries.ts fallback, else null. Never
-    // blocks the save; the UI uses this to show a non-blocking warning.
+    // Non-blocking informational tax format description for the UI.
     tax_id_format: resolveTaxIdFormat(s.country || 'IN'),
   };
 }
@@ -213,7 +214,7 @@ function taxShape(s: Record<string, string>) {
 
 // ── Specific routes (must come BEFORE /:key wildcard) ─────────────────────
 
-router.get('/business', requireRole('owner', 'manager', 'cashier', 'server', 'chef'), (req: Request, res: Response) => {
+router.get('/business', requireRole(...ROLE_ACCESS.allStaff), (req: Request, res: Response) => {
   try {
     const s = getAllSettings(getDatabase());
     res.json(businessShape(s));
@@ -223,27 +224,32 @@ router.get('/business', requireRole('owner', 'manager', 'cashier', 'server', 'ch
   }
 });
 
-router.put('/business', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.put('/business', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
-    const { business_name, timezone, currency, country, language,
+    const { business_name, timezone, business_day_start_time, currency, country, language,
       tax_registration_number, state_code, business_address, business_phone, instagram_handle,
       billing_type, tables_required, tax_registered,
       bill_show_name, bill_show_address, bill_show_phone, bill_show_tax_id,
       bill_show_tax_breakdown, bill_show_customer_name, bill_show_customer_phone, bill_show_table_number,
       currency_display, number_digits, calendar } = req.body;
+    const normalizedCurrency = typeof currency === 'string' ? currency.trim().toUpperCase() : currency;
 
-    if (!validBusinessLocation(timezone, currency, country)) {
+    if (!validBusinessLocation(timezone, normalizedCurrency, country)) {
       return res.status(400).json({ error: 'Invalid timezone, currency, or country' });
+    }
+
+    if (business_day_start_time !== undefined) {
+      if (typeof business_day_start_time !== 'string' || !/^(?:0\d|1[01]):[0-5]\d$/.test(business_day_start_time.trim())) {
+        return res.status(400).json({ error: 'Invalid business_day_start_time format (must be HH:mm between 00:00 and 11:59)' });
+      }
     }
 
     const db = getDatabase();
     const currentSettings = getAllSettings(db);
     const effectiveCountry = country || currentSettings.country || 'IN';
-    const effectiveCurrency = currency || currentSettings.currency || 'INR';
+    const effectiveCurrency = normalizedCurrency || currentSettings.currency || 'INR';
 
-    // Validate explicitly supplied locale preferences against the effective
-    // country's declared options, and normalize stale legacy values (e.g. a
-    // Toman/Persian preference left behind by an IR -> US transition).
+    // Validate locale preferences against country options, normalizing unsupported legacy values.
     const localeUpdates: Record<string, string> = {};
     for (const { key, submitted } of [
       { key: 'currency_display', submitted: currency_display },
@@ -280,12 +286,15 @@ router.put('/business', requireRole('owner', 'manager'), (req: Request, res: Res
     }
 
     upsertSettings(db, {
-      business_name, timezone, currency, country, language,
+      business_name, timezone,
+      business_day_start_time: business_day_start_time !== undefined ? business_day_start_time.trim() : undefined,
+      currency: normalizedCurrency,
       // The store's currency IS the base currency — keep the multi-currency
       // base_currency setting in lockstep so the Currencies panel and the POS
       // never disagree about which currency is the base.
-      base_currency: currency !== undefined ? String(currency).toUpperCase() : undefined,
-      currency_symbol: (currency !== undefined || country !== undefined)
+      base_currency: normalizedCurrency !== undefined ? String(normalizedCurrency).toUpperCase() : undefined,
+      country, language,
+      currency_symbol: (normalizedCurrency !== undefined || country !== undefined)
         ? deriveCurrencySymbol(effectiveCurrency, effectiveCountry)
         : undefined,
       tax_registration_number, state_code, business_address,
@@ -295,9 +304,7 @@ router.put('/business', requireRole('owner', 'manager'), (req: Request, res: Res
       bill_show_name, bill_show_address, bill_show_phone, bill_show_tax_id,
       bill_show_tax_breakdown, bill_show_customer_name, bill_show_customer_phone, bill_show_table_number,
       ...localeUpdates,
-      // This form PUTs every field, so a merchant saving their phone number
-      // re-sends the country untouched. Only a country that actually changed
-      // is evidence anyone chose it.
+      // Only mark country as user-confirmed if it actually changed in this submission.
       ...countryConfirmationPatch(country, currentSettings.country, req.body.country_selected),
     });
     cloudSync.refreshRegistrationProfile();
@@ -323,7 +330,7 @@ function currenciesShape(s: Record<string, string>) {
   };
 }
 
-router.get('/currencies', requireRole('owner', 'manager', 'cashier', 'server', 'chef'), (req: Request, res: Response) => {
+router.get('/currencies', requireRole(...ROLE_ACCESS.allStaff), (req: Request, res: Response) => {
   try {
     res.json(currenciesShape(getAllSettings(getDatabase())));
   } catch (error: any) {
@@ -332,7 +339,7 @@ router.get('/currencies', requireRole('owner', 'manager', 'cashier', 'server', '
   }
 });
 
-router.put('/currencies', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.put('/currencies', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const { base_currency, secondary_currencies, fx_refresh_minutes } = req.body;
     const db = getDatabase();
@@ -419,7 +426,7 @@ router.put('/currencies', requireRole('owner', 'manager'), (req: Request, res: R
 });
 
 // Force an immediate Frankfurter refresh (e.g. the owner tapping "Update rates").
-router.post('/currencies/refresh', requireRole('owner', 'manager'), asyncHandler(async (req: Request, res: Response) => {
+router.post('/currencies/refresh', requireRole(...ROLE_ACCESS.ownerManager), asyncHandler(async (req: Request, res: Response) => {
   const updated = await refreshRates();
   res.json({ updated, ...currenciesShape(getAllSettings(getDatabase())) });
 }));
@@ -428,7 +435,7 @@ router.post('/currencies/refresh', requireRole('owner', 'manager'), asyncHandler
 // so the Currencies UI can auto-fill the rate the moment the owner switches a
 // currency's source to "Live (Frankfurter)". Returns { base, code, rate } or a
 // 4xx/502 when the pair isn't quotable (e.g. an LBP base) or the fetch fails.
-router.get('/currencies/live-rate', requireRole('owner', 'manager'), asyncHandler(async (req: Request, res: Response) => {
+router.get('/currencies/live-rate', requireRole(...ROLE_ACCESS.ownerManager), asyncHandler(async (req: Request, res: Response) => {
   const s = getAllSettings(getDatabase());
   const base = (isValidCurrencyCode(s.base_currency) ? s.base_currency : (s.currency || 'INR')).toUpperCase();
   const code = String(req.query.code || '').toUpperCase();
@@ -452,7 +459,7 @@ router.get('/currencies/live-rate', requireRole('owner', 'manager'), asyncHandle
 // Standalone exchange-rate trail for a currency (newest first), so the owner
 // can audit how a rate moved over time. Per-order rates at sale time live on
 // bills.payment_details; this is the independent rate log.
-router.get('/currencies/rate-history', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.get('/currencies/rate-history', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const code = String(req.query.code || '').toUpperCase();
     if (!isValidCurrencyCode(code)) {
@@ -466,7 +473,7 @@ router.get('/currencies/rate-history', requireRole('owner', 'manager'), (req: Re
   }
 });
 
-router.get('/tax', requireRole('owner', 'manager', 'cashier', 'server', 'chef'), (req: Request, res: Response) => {
+router.get('/tax', requireRole(...ROLE_ACCESS.allStaff), (req: Request, res: Response) => {
   try {
     const s = getAllSettings(getDatabase());
     res.json(taxShape(s));
@@ -476,7 +483,7 @@ router.get('/tax', requireRole('owner', 'manager', 'cashier', 'server', 'chef'),
   }
 });
 
-router.put('/tax', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.put('/tax', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const { tax_registered, tax_registration_number, state_code, tax_scheme, country } = req.body;
 
@@ -514,7 +521,7 @@ router.put('/tax', requireRole('owner', 'manager'), (req: Request, res: Response
   }
 });
 
-router.get('/loyalty', requireRole('owner', 'manager', 'cashier', 'server', 'chef'), (req: Request, res: Response) => {
+router.get('/loyalty', requireRole(...ROLE_ACCESS.allStaff), (req: Request, res: Response) => {
   try {
     const s = getAllSettings(getDatabase());
     res.json({
@@ -527,7 +534,7 @@ router.get('/loyalty', requireRole('owner', 'manager', 'cashier', 'server', 'che
   }
 });
 
-router.put('/loyalty', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.put('/loyalty', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const { loyalty_enabled, global_cashback_percent } = req.body;
 
@@ -557,7 +564,7 @@ router.put('/loyalty', requireRole('owner', 'manager'), (req: Request, res: Resp
 
 // ─── Discount settings ──────────────────────────────────────────────────────
 
-router.get('/discount', requireRole('owner', 'manager', 'cashier', 'server', 'chef'), (req: Request, res: Response) => {
+router.get('/discount', requireRole(...ROLE_ACCESS.allStaff), (req: Request, res: Response) => {
   try {
     const s = getAllSettings(getDatabase());
     res.json({
@@ -572,7 +579,7 @@ router.get('/discount', requireRole('owner', 'manager', 'cashier', 'server', 'ch
   }
 });
 
-router.put('/discount', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.put('/discount', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const {
       discount_max_percentage,
@@ -594,8 +601,8 @@ router.put('/discount', requireRole('owner', 'manager'), (req: Request, res: Res
         return res.status(400).json({ error: 'discount_max_amount must be a number between 0 and 999999' });
       }
     }
-    if (discount_mode !== undefined && !['percentage', 'flat', 'both'].includes(discount_mode)) {
-      return res.status(400).json({ error: 'discount_mode must be "percentage", "flat", or "both"' });
+    if (discount_mode !== undefined && !['percentage', 'flat', 'both', 'none'].includes(discount_mode)) {
+      return res.status(400).json({ error: 'discount_mode must be "percentage", "flat", "both", or "none"' });
     }
 
     const db = getDatabase();
@@ -620,10 +627,7 @@ router.put('/discount', requireRole('owner', 'manager'), (req: Request, res: Res
 
 // ─── KDS settings (must come BEFORE /:key wildcard) ─────────────────────────
 
-// The public `/api/kds/info` already exposes `kds_default_view`, but it lives
-// on the KDS server (different origin) and isn't reachable from the
-// dashboard's settings page. This is the dashboard-side mirror — read-only
-// from the client's perspective; the PUT below is the only mutator.
+// Mirrors KDS default view for the dashboard settings page.
 router.get('/kds', (_req: Request, res: Response) => {
   try {
     const s = getAllSettings(getDatabase());
@@ -636,7 +640,7 @@ router.get('/kds', (_req: Request, res: Response) => {
   }
 });
 
-router.put('/kds', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.put('/kds', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const { kds_default_view } = req.body;
     if (kds_default_view !== undefined && !['tabs', 'kanban'].includes(kds_default_view)) {
@@ -672,7 +676,8 @@ function orderNumberingShape(s: Record<string, string>) {
   };
 }
 
-const ORDER_NUMBER_PREFIX_PATTERN = /^[A-Za-z0-9_-]{0,12}$/;
+// Alphanumeric only to avoid collisions with automatic hyphen separators.
+const ORDER_NUMBER_PREFIX_PATTERN = /^[A-Za-z0-9]{0,12}$/;
 const INVOICE_RESET_PERIODS = new Set(['never', 'daily', 'monthly', 'financial_year']);
 
 function parseBoundedInt(value: unknown, min: number, max: number, fallback: number): number {
@@ -680,7 +685,7 @@ function parseBoundedInt(value: unknown, min: number, max: number, fallback: num
   return Number.isInteger(parsed) && parsed >= min && parsed <= max ? parsed : fallback;
 }
 
-router.get('/order-numbering', requireRole('owner', 'manager', 'cashier', 'server', 'chef'), (req: Request, res: Response) => {
+router.get('/order-numbering', requireRole(...ROLE_ACCESS.allStaff), (req: Request, res: Response) => {
   try {
     const s = getAllSettings(getDatabase());
     res.json(orderNumberingShape(s));
@@ -690,7 +695,7 @@ router.get('/order-numbering', requireRole('owner', 'manager', 'cashier', 'serve
   }
 });
 
-router.put('/order-numbering', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.put('/order-numbering', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const {
       order_number_prefix,
@@ -704,10 +709,10 @@ router.put('/order-numbering', requireRole('owner', 'manager'), (req: Request, r
     } = req.body;
 
     if (order_number_prefix !== undefined && !ORDER_NUMBER_PREFIX_PATTERN.test(order_number_prefix)) {
-      return res.status(400).json({ error: 'order_number_prefix must be up to 12 characters (letters, numbers, - or _)' });
+      return res.status(400).json({ error: 'order_number_prefix must be up to 12 letters and numbers only' });
     }
     if (invoice_number_prefix !== undefined && !ORDER_NUMBER_PREFIX_PATTERN.test(invoice_number_prefix)) {
-      return res.status(400).json({ error: 'invoice_number_prefix must be up to 12 characters (letters, numbers, - or _)' });
+      return res.status(400).json({ error: 'invoice_number_prefix must be up to 12 letters and numbers only' });
     }
     if (invoice_number_reset_period !== undefined && !INVOICE_RESET_PERIODS.has(invoice_number_reset_period)) {
       return res.status(400).json({ error: 'invoice_number_reset_period must be one of never, daily, monthly, financial_year' });
@@ -764,7 +769,7 @@ const CLOUD_ACCOUNT_UNAVAILABLE_ERROR = 'Cloud account services are unavailable 
 
 // ─── Cloud Sync settings (must come BEFORE /:key wildcard) ──────────────────
 
-router.get('/cloud', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.get('/cloud', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     res.json(cloudSync.getStatus());
   } catch (error: any) {
@@ -773,7 +778,7 @@ router.get('/cloud', requireRole('owner', 'manager'), (req: Request, res: Respon
   }
 });
 
-router.put('/cloud', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.put('/cloud', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const {
       cloud_server_url,
@@ -825,7 +830,7 @@ router.put('/cloud', requireRole('owner', 'manager'), (req: Request, res: Respon
   }
 });
 
-router.post('/cloud/register', requireRole('owner', 'manager'), asyncHandler(async (req: Request, res: Response) => {
+router.post('/cloud/register', requireRole(...ROLE_ACCESS.ownerManager), asyncHandler(async (req: Request, res: Response) => {
   try {
     const deletionRequest = await cloudSync.getDeletionRequestStatus({
       allowRemote: cloudSync.isCloudAccountAvailable(),
@@ -860,7 +865,7 @@ router.post('/cloud/register', requireRole('owner', 'manager'), asyncHandler(asy
   }
 }));
 
-router.post('/cloud/test', requireRole('owner', 'manager'), asyncHandler(async (req: Request, res: Response) => {
+router.post('/cloud/test', requireRole(...ROLE_ACCESS.ownerManager), asyncHandler(async (req: Request, res: Response) => {
   try {
     const result = await cloudSync.testConnection(getHttpRequestSignal(req));
     res.json(result);
@@ -870,7 +875,7 @@ router.post('/cloud/test', requireRole('owner', 'manager'), asyncHandler(async (
   }
 }));
 
-router.get('/cloud/account', requireRole('owner'), asyncHandler(async (req: Request, res: Response) => {
+router.get('/cloud/account', requireRole(...ROLE_ACCESS.owner), asyncHandler(async (req: Request, res: Response) => {
   try {
     const cloudAccountAvailable = cloudSync.isCloudAccountAvailable();
     const signal = getHttpRequestSignal(req);
@@ -898,7 +903,7 @@ router.get('/cloud/account', requireRole('owner'), asyncHandler(async (req: Requ
   }
 }));
 
-router.put('/cloud/account/preferences', requireRole('owner'), asyncHandler(async (req: Request, res: Response) => {
+router.put('/cloud/account/preferences', requireRole(...ROLE_ACCESS.owner), asyncHandler(async (req: Request, res: Response) => {
   if (!cloudSync.isCloudAccountAvailable()) {
     return res.status(409).json({ error: CLOUD_ACCOUNT_UNAVAILABLE_ERROR });
   }
@@ -912,7 +917,7 @@ router.put('/cloud/account/preferences', requireRole('owner'), asyncHandler(asyn
   }
 }));
 
-router.post('/cloud/account/verification', requireRole('owner'), asyncHandler(async (req: Request, res: Response) => {
+router.post('/cloud/account/verification', requireRole(...ROLE_ACCESS.owner), asyncHandler(async (req: Request, res: Response) => {
   if (!cloudSync.isCloudAccountAvailable()) {
     return res.status(409).json({ error: CLOUD_ACCOUNT_UNAVAILABLE_ERROR });
   }
@@ -923,7 +928,7 @@ router.post('/cloud/account/verification', requireRole('owner'), asyncHandler(as
   }
 }));
 
-router.get('/cloud/delete-data/status', requireRole('owner'), asyncHandler(async (req: Request, res: Response) => {
+router.get('/cloud/delete-data/status', requireRole(...ROLE_ACCESS.owner), asyncHandler(async (req: Request, res: Response) => {
   try {
     const deletionRequest = await cloudSync.getDeletionRequestStatus({ allowRemote: true, signal: getHttpRequestSignal(req) });
     res.json({
@@ -935,11 +940,11 @@ router.get('/cloud/delete-data/status', requireRole('owner'), asyncHandler(async
   }
 }));
 
-router.post('/cloud/stop-all', requireRole('owner'), asyncHandler(async (req: Request, res: Response) => {
+router.post('/cloud/stop-all', requireRole(...ROLE_ACCESS.owner), asyncHandler(async (req: Request, res: Response) => {
   res.json(await cloudSync.stopAllCloudServices(getHttpRequestSignal(req)));
 }));
 
-router.post('/cloud/delete-data', requireRole('owner'), requireMasterPin, asyncHandler(async (req: Request, res: Response) => {
+router.post('/cloud/delete-data', requireRole(...ROLE_ACCESS.owner), requireMasterPin, asyncHandler(async (req: Request, res: Response) => {
   if (req.body?.confirmation !== 'DELETE CLOUD DATA') {
     return res.status(400).json({ error: 'Type DELETE CLOUD DATA to confirm' });
   }
@@ -950,7 +955,7 @@ router.post('/cloud/delete-data', requireRole('owner'), requireMasterPin, asyncH
   }
 }));
 
-router.post('/cloud/delete-data/cancel', requireRole('owner'), requireMasterPin, asyncHandler(async (req: Request, res: Response) => {
+router.post('/cloud/delete-data/cancel', requireRole(...ROLE_ACCESS.owner), requireMasterPin, asyncHandler(async (req: Request, res: Response) => {
   try {
     res.json(await cloudSync.cancelDeletionRequest(getHttpRequestSignal(req)));
   } catch {
@@ -958,12 +963,8 @@ router.post('/cloud/delete-data/cancel', requireRole('owner'), requireMasterPin,
   }
 }));
 
-// ─── Google Drive backups (must come BEFORE /:key wildcard) ─────────────────
-// See #129. Off by default — connect/disconnect/backup-now are the only
-// actions that ever touch Google's API, and only owner can trigger them
-// (mirrors how database.ts gates the raw backup/restore actions).
-
-router.get('/google-drive', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+// Google Drive backups — owner only, off by default.
+router.get('/google-drive', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     res.json(googleDrive.getStatus());
   } catch (error: any) {
@@ -972,7 +973,7 @@ router.get('/google-drive', requireRole('owner', 'manager'), (req: Request, res:
   }
 });
 
-router.put('/google-drive', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.put('/google-drive', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const { frequency, retention_count } = req.body;
     res.json(googleDrive.updatePreferences({ frequency, retention_count }));
@@ -982,7 +983,7 @@ router.put('/google-drive', requireRole('owner', 'manager'), (req: Request, res:
   }
 });
 
-router.post('/google-drive/connect', requireRole('owner'), asyncHandler(async (req: Request, res: Response) => {
+router.post('/google-drive/connect', requireRole(...ROLE_ACCESS.owner), asyncHandler(async (req: Request, res: Response) => {
   try {
     const status = await trackHttpRequestWork(req, googleDrive.connect(getHttpRequestSignal(req)));
     res.json(status);
@@ -997,7 +998,7 @@ router.post('/google-drive/connect', requireRole('owner'), asyncHandler(async (r
   }
 }));
 
-router.post('/google-drive/disconnect', requireRole('owner'), asyncHandler(async (_req: Request, res: Response) => {
+router.post('/google-drive/disconnect', requireRole(...ROLE_ACCESS.owner), asyncHandler(async (_req: Request, res: Response) => {
   try {
     const status = await googleDrive.disconnect();
     res.json(status);
@@ -1007,7 +1008,7 @@ router.post('/google-drive/disconnect', requireRole('owner'), asyncHandler(async
   }
 }));
 
-router.post('/google-drive/backup-now', requireRole('owner'), asyncHandler(async (req: Request, res: Response) => {
+router.post('/google-drive/backup-now', requireRole(...ROLE_ACCESS.owner), asyncHandler(async (req: Request, res: Response) => {
   try {
     const status = await trackHttpRequestWork(req, googleDrive.backupNow(getHttpRequestSignal(req)));
     res.json(status);
@@ -1038,19 +1039,21 @@ const ALLOWED_WILDCARD_KEYS = new Set([
   'language',
   'kds_default_view',
   'printer_method', 'paper_size', 'bill_template', 'bill_footer_message', 'printer_trim_decimals',
+  'cash_drawer_pulse_enabled', 'cash_drawer_pulse_methods',
   'telemetry_enabled',
   'diagnostics_consent',
   'kds_enabled', 'server_app_enabled', 'kot_printing_enabled',
   'split_checks_enabled',
-  BILL_LANGUAGE_POLICY_KEY, KOT_LANGUAGE_POLICY_KEY,
+  BILL_LANGUAGE_POLICY_KEY, KOT_LANGUAGE_POLICY_KEY, Z_REPORT_LANGUAGE_POLICY_KEY,
   'currency_display', 'number_digits', 'calendar',
+  'theme_mode',
 ]);
 
 function isAllowedWildcardKey(key: string): boolean {
   return ALLOWED_WILDCARD_KEYS.has(key) || /^tax_plugin_request:[A-Z]{2}$/.test(key);
 }
 
-router.get('/', requireRole('owner', 'manager', 'cashier', 'server', 'chef'), (req: Request, res: Response) => {
+router.get('/', requireRole(...ROLE_ACCESS.allStaff), (req: Request, res: Response) => {
   try {
     const s = getAllSettings(getDatabase());
     res.json({ settings: publicSettingsShape(s) });
@@ -1060,7 +1063,7 @@ router.get('/', requireRole('owner', 'manager', 'cashier', 'server', 'chef'), (r
   }
 });
 
-router.get('/bill-templates', requireRole('owner', 'manager'), (_req: Request, res: Response) => {
+router.get('/bill-templates', requireRole(...ROLE_ACCESS.ownerManager), (_req: Request, res: Response) => {
   try {
     const plugins = listInstalledPrintTemplates().map((template) => {
       let storedWidths: string[] = [];
@@ -1083,9 +1086,7 @@ router.get('/bill-templates', requireRole('owner', 'manager'), (_req: Request, r
         packVersionId: template.pack_version_id,
       };
     });
-    // Merchant templates (#447): provenance is informational only — a cloned
-    // origin references a compliance-pack template id WITHOUT transferring
-    // any compliance trust. Only active rows are selectable.
+    // Active merchant print templates for receipt formatting.
     const merchant = listMerchantPrintTemplates().map((template) => ({
       id: template.id,
       displayName: template.name,
@@ -1103,7 +1104,103 @@ router.get('/bill-templates', requireRole('owner', 'manager'), (_req: Request, r
   }
 });
 
-router.get('/:key', settingsReadRateLimit, requireRole('owner', 'manager', 'cashier', 'server', 'chef'), (req: Request, res: Response) => {
+const PRINTING_BOOLEAN_KEYS = [
+  'printer_trim_decimals',
+  'bill_show_name',
+  'bill_show_address',
+  'bill_show_phone',
+  'bill_show_tax_id',
+  'bill_show_tax_breakdown',
+  'bill_show_customer_name',
+  'bill_show_customer_phone',
+  'bill_show_table_number',
+] as const;
+
+const PRINTING_BATCH_KEYS = new Set<string>([
+  ...PRINTING_BOOLEAN_KEYS,
+  BILL_LANGUAGE_POLICY_KEY,
+  KOT_LANGUAGE_POLICY_KEY,
+  Z_REPORT_LANGUAGE_POLICY_KEY,
+  'cash_drawer_pulse_enabled',
+  'cash_drawer_pulse_methods',
+]);
+
+router.put('/printing', settingsWriteRateLimit, requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+  try {
+    const payload = req.body;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return res.status(400).json({ error: 'Printing settings payload must be an object' });
+    }
+
+    const values = payload as Record<string, unknown>;
+    const unknownKey = Object.keys(values).find((key) => !PRINTING_BATCH_KEYS.has(key));
+    if (unknownKey) {
+      return res.status(400).json({ error: `Unknown printing setting: ${unknownKey}` });
+    }
+
+    for (const key of PRINTING_BOOLEAN_KEYS) {
+      if (typeof values[key] !== 'boolean') {
+        return res.status(400).json({ error: `${key} must be a boolean` });
+      }
+    }
+
+    const billLanguagePolicy = validateLanguagePolicySetting(BILL_LANGUAGE_POLICY_KEY, values[BILL_LANGUAGE_POLICY_KEY]);
+    if (!billLanguagePolicy.ok) {
+      return res.status(400).json({ error: billLanguagePolicy.error });
+    }
+    const kotLanguagePolicy = validateLanguagePolicySetting(KOT_LANGUAGE_POLICY_KEY, values[KOT_LANGUAGE_POLICY_KEY]);
+    if (!kotLanguagePolicy.ok) {
+      return res.status(400).json({ error: kotLanguagePolicy.error });
+    }
+    const hasZReportLanguagePolicy = Object.prototype.hasOwnProperty.call(values, Z_REPORT_LANGUAGE_POLICY_KEY);
+    const zReportLanguagePolicy = hasZReportLanguagePolicy
+      ? validateLanguagePolicySetting(Z_REPORT_LANGUAGE_POLICY_KEY, values[Z_REPORT_LANGUAGE_POLICY_KEY])
+      : null;
+    if (zReportLanguagePolicy && !zReportLanguagePolicy.ok) {
+      return res.status(400).json({ error: zReportLanguagePolicy.error });
+    }
+
+    const hasCashDrawerEnabled = Object.prototype.hasOwnProperty.call(values, 'cash_drawer_pulse_enabled');
+    const hasCashDrawerMethods = Object.prototype.hasOwnProperty.call(values, 'cash_drawer_pulse_methods');
+    if (hasCashDrawerEnabled !== hasCashDrawerMethods) {
+      return res.status(400).json({ error: 'Cash drawer settings must be provided together' });
+    }
+    if (hasCashDrawerEnabled && typeof values.cash_drawer_pulse_enabled !== 'boolean') {
+      return res.status(400).json({ error: 'cash_drawer_pulse_enabled must be a boolean' });
+    }
+    if (
+      hasCashDrawerMethods
+      && (!Array.isArray(values.cash_drawer_pulse_methods)
+        || values.cash_drawer_pulse_methods.some((method) => typeof method !== 'string' || method.trim().length === 0))
+    ) {
+      return res.status(400).json({ error: 'cash_drawer_pulse_methods must be a non-empty string array' });
+    }
+
+    const entries: Record<string, string> = {
+      printer_trim_decimals: values.printer_trim_decimals ? 'true' : 'false',
+      [BILL_LANGUAGE_POLICY_KEY]: billLanguagePolicy.stored,
+      [KOT_LANGUAGE_POLICY_KEY]: kotLanguagePolicy.stored,
+    };
+    if (zReportLanguagePolicy?.ok) {
+      entries[Z_REPORT_LANGUAGE_POLICY_KEY] = zReportLanguagePolicy.stored;
+    }
+    for (const key of PRINTING_BOOLEAN_KEYS.slice(1)) {
+      entries[key] = values[key] ? 'true' : 'false';
+    }
+    if (hasCashDrawerEnabled) {
+      entries.cash_drawer_pulse_enabled = values.cash_drawer_pulse_enabled ? 'true' : 'false';
+      entries.cash_drawer_pulse_methods = JSON.stringify(values.cash_drawer_pulse_methods);
+    }
+
+    upsertSettings(getDatabase(), entries);
+    res.json({ settings: entries });
+  } catch (error: any) {
+    console.error("[API] Internal error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+router.get('/:key', settingsReadRateLimit, requireRole(...ROLE_ACCESS.allStaff), (req: Request, res: Response) => {
   try {
     if (SENSITIVE_SETTING_KEYS.has(req.params.key as string)) {
       return res.status(403).json({ error: 'This setting is sensitive and cannot be read directly' });
@@ -1125,7 +1222,7 @@ router.get('/:key', settingsReadRateLimit, requireRole('owner', 'manager', 'cash
   }
 });
 
-router.put('/:key', settingsWriteRateLimit, requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.put('/:key', settingsWriteRateLimit, requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     if (!isAllowedWildcardKey(req.params.key as string)) {
       return res.status(403).json({ error: 'This setting cannot be updated via wildcard route' });
@@ -1134,14 +1231,20 @@ router.put('/:key', settingsWriteRateLimit, requireRole('owner', 'manager'), (re
     if (value === undefined) {
       return res.status(400).json({ error: 'Value is required' });
     }
-    // bill_template accepts every legacy bare value AND the structured
-    // { source, id } form; whichever the client sends, the canonical
-    // structured JSON is persisted — legacy strings upgrade transparently on
-    // their next save (#447).
+    // Upgrades legacy string values to canonical structured JSON on save.
     if (req.params.key === 'bill_template' && !isAvailableBillTemplate(value)) {
       return res.status(400).json({ error: 'Unsupported bill template' });
     }
+    if (req.params.key === 'theme_mode' && !isThemeMode(value)) {
+      return res.status(400).json({ error: 'Invalid theme_mode value' });
+    }
     let valueToPersist: unknown = value;
+    if (req.params.key === 'currency') {
+      valueToPersist = typeof value === 'string' ? value.trim().toUpperCase() : value;
+      if (!isSyntacticallyValidCurrencyCode(valueToPersist)) {
+        return res.status(400).json({ error: 'Invalid currency' });
+      }
+    }
     if (req.params.key === 'bill_template') {
       valueToPersist = upgradeBillTemplateValue(value);
     }
@@ -1170,9 +1273,7 @@ router.put('/:key', settingsWriteRateLimit, requireRole('owner', 'manager'), (re
       valueToPersist = phoneRes.e164 || '';
     }
 
-    // KDS turning off → invalidate any outstanding pairing tokens. Without
-    // this, a token minted while KDS was on would still let a device pair
-    // in after it's been switched off (issue #133).
+    // Invalidate outstanding pairing tokens when KDS is disabled.
     if (req.params.key === 'kds_enabled') {
       const wasEnabled = getAllSettings(db).kds_enabled !== 'false';
       const turningOff = boolFlag(value) === 'false';
@@ -1186,9 +1287,7 @@ router.put('/:key', settingsWriteRateLimit, requireRole('owner', 'manager'), (re
       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
     `).run(req.params.key, valueToPersist as string, now());
 
-    // Keep the legacy setting as a compatibility mirror. The canonical runtime
-    // switch is telemetry_enabled; this route is the only user-facing writer,
-    // so both stay aligned whenever the owner changes the toggle.
+    // Sync legacy anonymous_data_consent mirror with canonical telemetry_enabled.
     if (req.params.key === 'telemetry_enabled') {
       db.prepare(`
         INSERT INTO settings (key, value, updated_at) VALUES ('anonymous_data_consent', ?, ?)
@@ -1196,9 +1295,7 @@ router.put('/:key', settingsWriteRateLimit, requireRole('owner', 'manager'), (re
       `).run(value, now());
     }
 
-    // Tell FloAdmin the merchant's current choice so stores.diagnostics_consent
-    // matches in both directions, not just inferred from "an event arrived."
-    // Best-effort — never blocks the setting save on cloud reachability.
+    // Best-effort push of diagnostics consent to FloAdmin.
     if (req.params.key === 'diagnostics_consent') {
       void cloudSync.setDiagnosticsConsent(boolFlag(value) === 'true');
     }

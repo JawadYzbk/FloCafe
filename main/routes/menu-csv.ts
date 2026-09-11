@@ -1,7 +1,8 @@
 import { Router, Request, Response } from 'express';
 import { getDatabase, now, generateShortId, getSettingValue } from '../db';
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'node:crypto';
 import { requireRole } from '../middleware/security';
+import { ROLE_ACCESS } from '../../shared/role-permissions';
 import { getActiveCountryPack, hasConfiguredTaxCategories } from '../services/tax';
 
 const router = Router();
@@ -192,11 +193,7 @@ function toCsvRow(fields: (string | number | null | undefined)[]): string {
   return fields
     .map((f) => {
       let s = String(f ?? '');
-      // Neutralize spreadsheet formula injection (CWE-1236 / GHSA-vrxh-633p-fhgm):
-      // a cell beginning with = + - @ would be evaluated as a formula by Excel
-      // or LibreOffice when the export is opened. Prefix with a single quote so
-      // the cell is treated as literal text. Numeric fields are exempt so
-      // legitimate negative numbers are not mangled.
+      // Escape spreadsheet formula triggers (=, +, -, @) on non-numeric strings with a leading quote.
       if (typeof f !== 'number' && /^[=+\-@]/.test(s)) {
         s = "'" + s;
       }
@@ -247,7 +244,7 @@ const TEMPLATES: Record<string, string> = {
   ].join('\n'),
 };
 
-router.get('/template/:type', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.get('/template/:type', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   const type = req.params.type as string;
   const csv = TEMPLATES[type];
   if (!csv) return res.status(404).json({ error: 'Unknown template type' });
@@ -258,7 +255,7 @@ router.get('/template/:type', requireRole('owner', 'manager'), (req: Request, re
 
 // ─── Export ──────────────────────────────────────────────────────────────────
 
-router.get('/export/categories', requireRole('owner', 'manager'), (_req: Request, res: Response) => {
+router.get('/export/categories', requireRole(...ROLE_ACCESS.ownerManager), (_req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const rows = db
@@ -276,7 +273,7 @@ router.get('/export/categories', requireRole('owner', 'manager'), (_req: Request
   }
 });
 
-router.get('/export/products', requireRole('owner', 'manager'), (_req: Request, res: Response) => {
+router.get('/export/products', requireRole(...ROLE_ACCESS.ownerManager), (_req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const rows = db
@@ -310,7 +307,7 @@ router.get('/export/products', requireRole('owner', 'manager'), (_req: Request, 
   }
 });
 
-router.get('/export/addons', requireRole('owner', 'manager'), (_req: Request, res: Response) => {
+router.get('/export/addons', requireRole(...ROLE_ACCESS.ownerManager), (_req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const groups = db
@@ -335,7 +332,7 @@ router.get('/export/addons', requireRole('owner', 'manager'), (_req: Request, re
 
 // ─── Import ──────────────────────────────────────────────────────────────────
 
-router.post('/import/categories', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.post('/import/categories', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const { csv } = req.body as { csv: string };
     if (typeof csv !== 'string' || !csv) return res.status(400).json({ error: 'No CSV data provided' });
@@ -367,7 +364,7 @@ router.post('/import/categories', requireRole('owner', 'manager'), (req: Request
       db.prepare(
         `INSERT INTO categories (id, name, slug, description, color, icon, sort_order, is_active, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`
-      ).run(uuidv4(), r.name, slug, r.description || null, r.color || null, r.icon || null,
+      ).run(randomUUID(), r.name, slug, r.description || null, r.color || null, r.icon || null,
         sortOrder.value, now(), now());
       created++;
     } })();
@@ -378,7 +375,7 @@ router.post('/import/categories', requireRole('owner', 'manager'), (req: Request
   }
 });
 
-router.post('/import/products', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.post('/import/products', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const { csv } = req.body as { csv: string };
     if (typeof csv !== 'string' || !csv) return res.status(400).json({ error: 'No CSV data provided' });
@@ -527,7 +524,7 @@ router.post('/import/products', requireRole('owner', 'manager'), (req: Request, 
   }
 });
 
-router.post('/import/addons', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.post('/import/addons', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const { csv } = req.body as { csv: string };
     if (typeof csv !== 'string' || !csv) return res.status(400).json({ error: 'No CSV data provided' });
@@ -679,7 +676,7 @@ router.post('/import/addons', requireRole('owner', 'manager'), (req: Request, re
             groupsUpdated++;
           }
         } else {
-          groupId = uuidv4();
+          groupId = randomUUID();
           db.prepare(
             `INSERT INTO addon_groups (id, name, is_required, min_selection, max_selection, is_active, sort_order, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?)`
@@ -707,7 +704,7 @@ router.post('/import/addons', requireRole('owner', 'manager'), (req: Request, re
       db.prepare(
         `INSERT INTO addons (id, addon_group_id, name, price, is_active, sort_order, created_at, updated_at)
          VALUES (?, ?, ?, ?, 1, 0, ?, ?)`
-      ).run(uuidv4(), groupId, r.addon_name, price, now(), now());
+      ).run(randomUUID(), groupId, r.addon_name, price, now(), now());
       addonsCreated++;
     } })();
 

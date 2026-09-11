@@ -35,7 +35,6 @@ import { renderClassicReceiptViaDocument } from '../main/printers/document-class
 import {
   formatClassicReceiptLegacy,
   formatCompactReceiptLegacy,
-  formatKOTLegacy,
 } from './helpers/legacy-thermal-oracle';
 import { printLabel } from '../main/print/print-labels.generated';
 import {
@@ -113,7 +112,7 @@ export function buildParityFixtures() {
         unit_price: 250,
         total: 500,
         tax_amount: 0,
-        addons: [{ name: 'Oat milk', price: 40 }],
+        addons: [{ name: 'Oat milk', price: 40, quantity: 2 }],
         special_instructions: 'Less sugar',
       },
       {
@@ -142,12 +141,12 @@ export function buildParityFixtures() {
     subtotal: 1220,
     discount_amount: 120,
     tax_amount: 0,
-    service_charge: 0,
-    delivery_charge: 0,
-    total: 1100,
+    delivery_charge: 8,
+    packaging_charge: 9,
+    total: 1117,
     payment_details: [
       { method: 'cash', amount: 600 },
-      { method: 'card', amount: 500 },
+      { method: 'card', amount: 517 },
     ],
   };
   // Frontend renderers navigate bill.order for items/table/customer.
@@ -209,6 +208,23 @@ function contentRows(text: string): string[] {
   return raw.map((row) => row.replace(/<[^>]+>/g, ' '));
 }
 
+/** Normalize transport/layout markers before comparing semantic fixture content. */
+export function normalizeSemanticContent(text: string): string {
+  const ampersandMarker = '\u0000ampersand\u0000';
+  return text
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&gt;/g, '>')
+    .replace(/&lt;/g, '<')
+    .replace(/&amp;/g, ampersandMarker)
+    .replace(/&/g, ampersandMarker)
+    .replace(/&quot;|&#39;/g, '')
+    .replace(/[×]/g, 'x')
+    .replace(/\*\*|>>/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
 /** First row whose label matches `pattern` (optionally excluding `except`). */
 function labeledRow(rows: string[], pattern: RegExp, except?: RegExp): string | undefined {
   return rows.find((row) => pattern.test(row) && !(except && except.test(row)));
@@ -235,15 +251,17 @@ function expectContent(
     reprintStyle?: 'ascii' | 'html';
     businessName: string;
     truncationMarker?: boolean;
+    addons?: Array<{ name: string; quantity?: number }>;
+    instructions?: string[];
   },
   warn: (ok: boolean, msg: string) => void
 ): void {
-  const normalized = text.replace(/[,\s]/g, '');
+  const normalized = normalizeSemanticContent(text).replace(/[,\s]/g, '');
   for (const item of expectations.items) {
-    warn(normalized.includes(item.replace(/[,\s]/g, '')), `${label}: item "${item.slice(0, 24)}${item.length > 24 ? '…' : ''}" present`);
+    warn(normalized.includes(normalizeSemanticContent(item).replace(/[,\s]/g, '')), `${label}: item "${item.slice(0, 24)}${item.length > 24 ? '…' : ''}" present`);
   }
   for (const absent of expectations.absentItems ?? []) {
-    warn(!text.includes(absent), `${label}: known-absent item correctly not rendered verbatim`);
+    warn(!normalized.includes(normalizeSemanticContent(absent).replace(/[,\s]/g, '')), `${label}: known-absent item correctly not rendered verbatim`);
   }
   // Amount assertions are field-scoped: each expected amount must appear on
   // the row carrying its own label (Subtotal / Discount / TOTAL), so stray
@@ -267,7 +285,24 @@ function expectContent(
   }
   warn(text.includes(expectations.businessName), `${label}: business header`);
   if (expectations.truncationMarker) {
-    warn(text.includes(LONG_NAME_STEM) && text.includes('..'), `${label}: long item truncated with marker`);
+    const stemRowIndex = rows.findIndex((r) => r.includes(LONG_NAME_STEM));
+    const stemRow = stemRowIndex >= 0 ? rows[stemRowIndex] : '';
+    const amountStart = stemRow.search(/(?:Rs|INR|USD|EUR|GBP|\$|\u20b9)?\s*420(?:[.,]00)?\s*$/);
+    const itemNamePortion = amountStart >= 0 ? stemRow.slice(0, amountStart) : stemRow;
+    const hasExplicitMarker = /\.(?:\s+\d+)?\s*$/.test(itemNamePortion) || itemNamePortion.includes('\u2026');
+    const hasWrappedContinuation = stemRowIndex >= 0
+      && rows.slice(stemRowIndex + 1, stemRowIndex + 12).some((row) => row.includes('Drizzle'));
+    const isTruncatedOrWrapped = stemRowIndex >= 0 && (hasExplicitMarker || hasWrappedContinuation);
+    warn(isTruncatedOrWrapped, `${label}: long item truncated with marker or wrapped`);
+  }
+  for (const addon of expectations.addons ?? []) {
+    const normalizedText = normalizeSemanticContent(text);
+    const quantitySuffix = addon.quantity && addon.quantity > 1 ? `x${addon.quantity}` : '';
+    warn(normalizedText.includes(normalizeSemanticContent(addon.name)) && (!quantitySuffix || normalizedText.includes(quantitySuffix)), `${label}: add-on ${addon.name}${quantitySuffix ? ` quantity ${addon.quantity}` : ''}`);
+  }
+  const normalizedText = normalizeSemanticContent(text);
+  for (const instruction of expectations.instructions ?? []) {
+    warn(normalizedText.includes(normalizeSemanticContent(instruction)), `${label}: special instruction content`);
   }
 }
 
@@ -294,13 +329,17 @@ function section(title: string): void {
 }
 
 function run(): void {
-  const { order, bill, business, tenant } = buildParityFixtures();
+  const { order: fullOrder, bill: fullBill, business, tenant } = buildParityFixtures();
+  const order = { ...fullOrder, items: fullOrder.items.filter((item: any) => item.product_name !== PERSIAN_ITEM) };
+  const bill = { ...fullBill, order };
   const fe = loadFrontendPrintModules();
 
   const baseExpect = {
     items: [LATIN_ITEM, LONG_NAME_STEM],
+    addons: [{ name: 'Oat milk', quantity: 2 }],
+    instructions: ['Less sugar'],
     discount: 120,
-    total: 1100,
+    total: 1117,
     payments: ['Cash', 'Card'],
     businessName: 'Flo Parity Cafe',
     truncationMarker: true,
@@ -309,20 +348,20 @@ function run(): void {
   // ------------------------------------------------------------------
   // 1. Backend ESC/POS — classic + compact at 32/42/48 columns
   // ------------------------------------------------------------------
+  {
+    const refusalWarnings: Warnings = [];
+    const refusal = formatReceipt(fullOrder, fullBill, business, 'compact', 48, false, false, undefined, refusalWarnings);
+    warn(refusal.length === 0, 'backend refuses unsupported paid Persian rows before transport');
+    warn(refusalWarnings.some((warning) => warning.kind === 'financial'), 'backend refusal identifies the unsupported paid row as financial');
+  }
   for (const template of ['classic', 'compact'] as const) {
     for (const cols of [32, 42, 48]) {
       section(`Backend ${template} @ ${cols} cols`);
-      const warnings: Warnings = [];
       const text = escPosToText(
-        formatReceipt(order, bill, business, template, cols, false, false, undefined, warnings)
+        formatReceipt(order, bill, business, template, cols, false, false, undefined, [])
       );
-      // LEGACY: Persian-script line is skipped by the unsupported-character
-      // guard (see #437/#355 history). This documents current behavior; do
-      // not treat it as the future architecture contract.
       const withSubtotal = template === 'classic' ? { subtotal: 1220 } : {};
       expectContent(`${template}/${cols}`, text, { ...baseExpect, ...withSubtotal, absentItems: [PERSIAN_ITEM] }, warn);
-      warn(warnings.some((w) => (w.message ?? w.text ?? '').includes('Persian/Arabic')),
-        `${template}/${cols}: skip produced explicit Persian/Arabic warning`);
 
       section(`Backend ${template} @ ${cols} cols — reprint`);
       const reText = escPosToText(
@@ -333,41 +372,37 @@ function run(): void {
   }
 
   // ------------------------------------------------------------------
-  // 2. Frontend WebUSB ESC/POS — classic + compact at 58mm(42c)/80mm(48c)
+  // 2. Frontend WebUSB ESC/POS — classic + compact at 58mm(32c)/80mm(48c)
   // ------------------------------------------------------------------
   for (const variant of ['classic', 'compact'] as const) {
     for (const paperWidth of [58, 80] as const) {
       section(`WebUSB ${variant} @ ${paperWidth}mm`);
       const warnings: Warnings = [];
       const bytes = variant === 'classic'
-        ? fe.receiptEncoder.buildClassicReceiptBytes(bill as any, tenant as any, { paperWidth }, warnings as any)
-        : fe.receiptEncoder.buildCompactReceiptBytes(bill as any, tenant as any, { paperWidth }, warnings as any);
+        ? fe.receiptEncoder.buildClassicReceiptBytes(fullBill as any, tenant as any, { paperWidth }, warnings as any)
+        : fe.receiptEncoder.buildCompactReceiptBytes(fullBill as any, tenant as any, { paperWidth }, warnings as any);
       const text = new TextDecoder().decode(bytes);
-      // LEGACY: same skip-with-warning contract as backend (safePrinterText).
       const feSubtotal = variant === 'classic' ? { subtotal: 1220 } : {};
-      // LEGACY: the WebUSB 4-column layout truncates over-long item names with
-      // a '…' ellipsis, which is itself non-ASCII — so the unsupported-char
-      // guard drops the ENTIRE row (with a warning). The desktop path
-      // truncates with '..' and keeps the line. This asymmetry is today's
-      // documented behavior, not the target architecture.
+      // WebUSB uses the configured 32-column logical width for 58mm and keeps
+      // truncated item rows printable with an ASCII marker.
       expectContent(`webusb/${variant}/${paperWidth}`, text, {
         ...baseExpect,
         ...feSubtotal,
         items: [LATIN_ITEM],
-        absentItems: [PERSIAN_ITEM, LONG_NAME_STEM],
-        truncationMarker: false,
+        absentItems: [PERSIAN_ITEM],
+        truncationMarker: true,
       }, warn);
       warn(warnings.some((w) => (w.message ?? '').includes('Persian/Arabic')),
         `webusb/${variant}/${paperWidth}: skip produced explicit Persian/Arabic warning`);
-      warn(warnings.some((w) => (w.message ?? '').includes('unsupported characters') && (w.text ?? '').includes('Extra Long')),
-        `webusb/${variant}/${paperWidth}: long-name row skipped with explicit unsupported-chars warning`);
+      warn(!warnings.some((w) => (w.message ?? '').includes('unsupported characters') && (w.text ?? '').includes('Extra Long')),
+        `webusb/${variant}/${paperWidth}: ASCII-truncated long-name row does not create a false unsupported-chars warning`);
     }
   }
 
   section('WebUSB reprint banner');
   {
     const bytes = fe.receiptEncoder.buildClassicReceiptBytes(
-      bill as any,
+      fullBill as any,
       tenant as any,
       { paperWidth: 80, isReprint: true },
       []
@@ -376,10 +411,146 @@ function run(): void {
       ...baseExpect,
       subtotal: 1220,
       items: [LATIN_ITEM],
-      absentItems: [PERSIAN_ITEM, LONG_NAME_STEM],
-      truncationMarker: false,
+      absentItems: [PERSIAN_ITEM],
+      truncationMarker: true,
       reprint: true,
     }, warn);
+  }
+
+  // ------------------------------------------------------------------
+  // 2b. Financial parity — backend normalization must match the proven
+  // frontend add-on extension (`price × addonQty × itemQty`) and retain
+  // existing charge totals.
+  // ------------------------------------------------------------------
+  section('Add-on quantity and charge parity');
+  {
+    const quantityOrder = {
+      order_number: 'ORD-FINANCIAL-PARITY',
+      created_at: '2026-08-21 18:42:00',
+      items: [{
+        product_name: 'Tea',
+        quantity: 2,
+        unit_price: 10,
+        total: 20,
+        addons: [
+          { name: 'Extra shot', price: 5, quantity: 3 },
+          { name: 'Vanilla syrup', price: 2, quantity: 2 },
+        ],
+      }],
+    };
+    const quantityBill = {
+      bill_number: 'INV-FINANCIAL-PARITY',
+      subtotal: 50,
+      discount_amount: 0,
+      tax_amount: 0,
+      service_charge: 7,
+      delivery_charge: 8,
+      packaging_charge: 9,
+      total: 74,
+      payment_details: [{ method: 'cash', amount: 74 }],
+      order: quantityOrder,
+    };
+    const quantityBusiness = { ...business, name: 'Flo Parity Cafe' };
+    const backendOutputs = ['classic', 'compact'].map((template) => escPosToText(
+      formatReceipt(quantityOrder, quantityBill, quantityBusiness, template, 48, true, false, 'full', []),
+    ));
+    const frontendText = new TextDecoder().decode(
+      fe.receiptEncoder.buildClassicReceiptBytes(quantityBill as any, { ...tenant, business_name: 'Flo Parity Cafe' } as any, { paperWidth: 80, useUnicode: true }, []),
+    );
+    const browserHtml = fe.webPrint.generateBillHtml(
+      quantityBill as any,
+      { ...tenant, business_name: 'Flo Parity Cafe' } as any,
+      { paperSize: 'thermal80', businessName: 'Flo Parity Cafe' },
+    );
+
+    for (const [renderer, text] of [['backend/classic', backendOutputs[0]], ['backend/compact', backendOutputs[1]], ['frontend/webusb/classic', frontendText]] as const) {
+      const addonRow = contentRows(text).find((row) => /Extra shot/.test(row));
+      warn(addonRow != null && digitsOf(addonRow).includes('3000'), `${renderer}: addon 5 × 3 × 2 renders 30.00`);
+      const secondAddonRow = contentRows(text).find((row) => /Vanilla syrup/.test(row));
+      warn(secondAddonRow != null && digitsOf(secondAddonRow).includes('800'), `${renderer}: second addon extension renders 8.00`);
+      for (const [label, amount] of [['Service Charge', '700'], ['Delivery', '800'], ['Packaging', '900']] as const) {
+        const chargeRow = contentRows(text).find((row) => row.includes(label));
+        warn(chargeRow != null && digitsOf(chargeRow).includes(amount), `${renderer}: ${label} charge renders its persisted amount`);
+      }
+    }
+    warn(browserHtml.includes('Extra shot') && browserHtml.includes('×3'), 'browser: addon quantity remains visible');
+    for (const [label, amount] of [['Service Charge', '700'], ['Delivery Charge', '800'], ['Packaging', '900']] as const) {
+      const chargeRow = contentRows(browserHtml).find((row) => row.includes(label));
+      warn(chargeRow != null && digitsOf(chargeRow).includes(amount), `browser: ${label} charge renders its persisted amount`);
+    }
+
+    const zeroChargeBill = {
+      ...quantityBill,
+      service_charge: 0,
+      delivery_charge: 0,
+      packaging_charge: 0,
+      total: 50,
+    };
+    for (const [renderer, build] of [
+      ['frontend/webusb/classic', fe.receiptEncoder.buildClassicReceiptBytes],
+      ['frontend/webusb/compact', fe.receiptEncoder.buildCompactReceiptBytes],
+    ] as const) {
+      const zeroText = new TextDecoder().decode(build(zeroChargeBill as any, { ...tenant, business_name: 'Flo Parity Cafe' } as any, { paperWidth: 80, useUnicode: true }, []));
+      const zeroRows = zeroText.split(/\r?\n/);
+      warn(
+        !zeroRows.some((row) => row.includes('Service Charge') || row.includes('Delivery') || row.includes('Packaging')),
+        `${renderer}: zero charges do not create rows`,
+      );
+    }
+
+    let malformedPrintSucceeded = true;
+    for (const addons of [
+      [null, 'legacy-addon', { name: 'Safe extra', price: 4, quantity: 2 }],
+      'legacy-addon',
+      { legacy: true },
+    ]) {
+      const malformedBill = {
+        ...quantityBill,
+        order: {
+          ...quantityOrder,
+          items: [{ ...quantityOrder.items[0], addons }],
+        },
+      };
+      try {
+        fe.receiptEncoder.buildClassicReceiptBytes(malformedBill as any, { ...tenant, business_name: 'Flo Parity Cafe' } as any, { paperWidth: 80 }, []);
+        fe.receiptEncoder.buildCompactReceiptBytes(malformedBill as any, { ...tenant, business_name: 'Flo Parity Cafe' } as any, { paperWidth: 80 }, []);
+        fe.webPrint.generateBillHtml(malformedBill as any, { ...tenant, business_name: 'Flo Parity Cafe' } as any, { paperSize: 'thermal80' });
+      } catch {
+        malformedPrintSucceeded = false;
+      }
+    }
+    warn(malformedPrintSucceeded, 'frontend: malformed add-on containers and entries do not crash printing');
+  }
+
+  // ------------------------------------------------------------------
+  // 2c. Loyalty semantic parity — classic receipt surfaces expose the same
+  // earned-points content; compact remains intentionally loyalty-free.
+  // ------------------------------------------------------------------
+  section('Classic receipt loyalty content parity');
+  {
+    const loyaltyBill = { ...bill, points_earned: 14, points_redeemed: 5, points_balance: 30 };
+    const loyaltyBusiness = { ...business, points_earned: 14, points_redeemed: 5, points_balance: 30 };
+    const backendText = escPosToText(formatReceipt(
+      order, loyaltyBill, loyaltyBusiness, 'classic', 48, true, false, 'full', [], false, 'en',
+    ));
+    const webUsbText = new TextDecoder().decode(fe.receiptEncoder.buildClassicReceiptBytes(
+      loyaltyBill as any,
+      tenant as any,
+      { paperWidth: 80, useUnicode: true, languages: ['en'] },
+      [],
+    ));
+    const browserHtml = fe.webPrint.generateBillHtml(
+      loyaltyBill as any,
+      tenant as any,
+      { paperSize: 'thermal80', businessName: business.name, languages: ['en'] },
+    );
+    const earnedLabel = printLabel('en', 'print.pointsEarned');
+    for (const [renderer, text] of [['backend', backendText], ['webusb', webUsbText], ['browser', browserHtml]] as const) {
+      const semantic = normalizeSemanticContent(text);
+      warn(semantic.includes(earnedLabel.toLowerCase()) && semantic.includes('14'), `${renderer}: loyalty earned-points line`);
+      warn(semantic.includes(printLabel('en', 'print.pointsRedeemed').toLowerCase()) && semantic.includes('5'), `${renderer}: loyalty redeemed-points line`);
+      warn(semantic.includes(printLabel('en', 'print.pointsBalance').toLowerCase()) && semantic.includes('30'), `${renderer}: loyalty balance line`);
+    }
   }
 
   // ------------------------------------------------------------------
@@ -387,7 +558,7 @@ function run(): void {
   // ------------------------------------------------------------------
   for (const paperSize of ['thermal58', 'thermal80'] as const) {
     section(`Browser HTML @ ${paperSize}`);
-    const html = fe.webPrint.generateBillHtml(bill as any, tenant as any, {
+    const html = fe.webPrint.generateBillHtml(fullBill as any, tenant as any, {
       paperSize,
       address: business.address,
       phone: business.phone,
@@ -405,7 +576,7 @@ function run(): void {
 
   section('Browser HTML reprint banner');
   {
-    const html = fe.webPrint.generateBillHtml(bill as any, tenant as any, {
+    const html = fe.webPrint.generateBillHtml(fullBill as any, tenant as any, {
       paperSize: 'thermal80',
       businessName: business.name,
       isReprint: true,
@@ -415,7 +586,7 @@ function run(): void {
 
   section('Browser HTML uses semantic catalog labels and fallback');
   {
-    const html = fe.webPrint.generateBillHtml(bill as any, tenant as any, {
+    const html = fe.webPrint.generateBillHtml(fullBill as any, tenant as any, {
       paperSize: 'thermal80',
       businessName: business.name,
       address: business.address,
@@ -436,6 +607,7 @@ function run(): void {
       ['receipt.amount', 'Amount'],
       ['pos.subtotal', 'Subtotal'],
       ['pos.discount', 'Discount'],
+      ['pos.packaging', 'Packaging'],
       ['receipt.grandTotal', 'Grand Total'],
       ['receipt.payments', 'Payments'],
       ['pos.methodCash', 'Cash'],
@@ -444,7 +616,7 @@ function run(): void {
     ] as const) {
       warn(html.includes(expected), `browser semantic label ${concept} renders as ${expected}`);
     }
-    const fallback = fe.webPrint.generateBillHtml(bill as any, tenant as any, {
+    const fallback = fe.webPrint.generateBillHtml(fullBill as any, tenant as any, {
       languages: ['unknown-language'] as any,
     });
     warn(fallback.includes('<strong>Grand Total</strong>') && !fallback.includes('receipt.grandTotal'),
@@ -462,6 +634,7 @@ function run(): void {
     created_at: order.created_at,
     table: { name: '4' },
   };
+  const typedKotOrder = { ...kotOrder, type: 'dine_in' };
 
   section('PrintDocument vs legacy classic');
   for (const cols of [32, 42, 48]) {
@@ -490,10 +663,6 @@ function run(): void {
         ...(isReprint ? { reprint: true } : {}),
       }, warn);
       warn(docResult.document.version === 1 && docResult.document.blocks.length > 0, `${label}: PrintDocument v1 with blocks`);
-      if (!isReprint) {
-        warn(docResult.warnings.some((w) => (w.message ?? w.text ?? '').includes('Persian/Arabic')),
-          `${label}: skip produced explicit Persian/Arabic warning`);
-      }
     }
   }
 
@@ -520,25 +689,25 @@ function run(): void {
   for (const cols of [32, 42, 48]) {
     const label = `kot-document/${cols}`;
     section(label);
-    const legacyWarnings: Warnings = [];
-    const legacyBuf = formatKOTLegacy(kotOrder, order.items, 'Main Kitchen', cols, false, 'full', 'en-US', { timeZone: 'Asia/Kolkata' }, legacyWarnings, false, 'en');
-    const migratedBuf = formatKOT(kotOrder, order.items, 'Main Kitchen', cols, false, 'full', 'en-US', { timeZone: 'Asia/Kolkata' }, [], false, 'en');
-    warn(legacyBuf.equals(migratedBuf), `${label}: byte-identical output to legacy KOT`);
+    const migratedBuf = formatKOT(kotOrder, fullOrder.items, 'Main Kitchen', cols, false, 'full', 'en-US', { timeZone: 'Asia/Kolkata' }, [], false, 'en');
     const kotText = escPosToText(migratedBuf);
     warn(kotText.includes('Main Kitchen'), `${label}: station block rendered`);
+    warn(kotText.includes('Order #ORD-PARITY-001'), `${label}: shared order-number format rendered`);
     warn(kotText.includes('2x  Espresso Doppio'), `${label}: item rows with quantity prefix`);
     warn(kotText.includes('+ Oat milk'), `${label}: addon lines rendered`);
-    warn(kotText.includes('** Less sugar **'), `${label}: instruction lines rendered`);
+    warn(kotText.includes('>> Less sugar'), `${label}: instruction lines rendered`);
     if (cols >= 42) warn(!kotText.includes(PERSIAN_ITEM), `${label}: unsupported-script item skipped with warning only`);
   }
+  const typedKotText = escPosToText(formatKOT(typedKotOrder, fullOrder.items, 'Main Kitchen', 42, false, 'full', 'en-US', { timeZone: 'Asia/Kolkata' }, [], false, 'en'));
+  warn(typedKotText.includes('Type: Dine in'), 'kot-document/order-type: localized order type rendered when present');
 
   // ------------------------------------------------------------------
-  // 5. Receipt/KOT language routing (#443): fa/es tenants get localized
+  // 5. Receipt/KOT language routing (#443): fa/es/fr tenants get localized
   //    labels end-to-end through the resolved policy; the KOT kitchen
   //    policy resolves independently of the receipt language.
   // ------------------------------------------------------------------
   section('Localized receipt labels end-to-end');
-  for (const language of ['fa', 'es'] as const) {
+  for (const language of ['fa', 'es', 'fr'] as const) {
     for (const template of ['classic', 'compact'] as const) {
       const label = `${template}/${language}`;
       const warnings: Warnings = [];
@@ -547,6 +716,11 @@ function run(): void {
         formatReceipt(order, bill, business, template, 42, false, false, 'full', warnings, true, language),
       );
       const totalLabel = printLabel(language, 'print.grandTotal');
+      if (language === 'fr') {
+        warn(text.length === 0, `${label}: unsupported accented financial labels refuse before transport`);
+        warn(warnings.some((warning) => warning.kind === 'financial'), `${label}: refusal identifies the accented financial label`);
+        continue;
+      }
       warn(text.includes(totalLabel), `${label}: grand-total label localized (${totalLabel})`);
       const subtotalLabel = printLabel(language, 'pos.subtotal');
       warn(text.includes(subtotalLabel), `${label}: subtotal label localized (${subtotalLabel})`);
@@ -568,7 +742,7 @@ function run(): void {
     );
     warn(receiptLangs[0] === 'fa' && receiptLangs[1] === 'es', 'receipt policy resolves primary + additional');
     // A fixed-en KOT ticket stays English even for a fa store (#443).
-    const kotTextEn = escPosToText(formatKOT(kotOrder, order.items, 'Main Kitchen', 42, false, 'full', 'en-US', undefined, [], false, fixedEn));
+    const kotTextEn = escPosToText(formatKOT(kotOrder, fullOrder.items, 'Main Kitchen', 42, false, 'full', 'en-US', undefined, [], false, fixedEn));
     warn(kotTextEn.includes('Time:'), 'fixed-en KOT ticket renders English time label');
   }
 

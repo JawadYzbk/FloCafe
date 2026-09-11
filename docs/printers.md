@@ -2,7 +2,7 @@
 
 FloCafe prints receipts and kitchen order tickets from the desktop app. Configure printers in **Settings → Printers**, then use **Test Print** before service.
 
-> Contributors: for the print pipeline architecture (shared kernel, PrintDocument model, renderer/transport map, language policy, testing guide) see [printing-architecture.md](printing-architecture.md).
+> Contributors: for the print pipeline architecture (shared kernel, PrintDocument model, renderer/transport map, language policy, testing guide) see [printing-architecture.md](printing-architecture.md). For the physical hardware validation matrix and testing procedures across platforms, see [printer-hardware-testing-protocol.md](printer-hardware-testing-protocol.md).
 
 ## Connection types
 
@@ -14,21 +14,25 @@ FloCafe prints receipts and kitchen order tickets from the desktop app. Configur
 
 Set the paper width to match the printer: 58 mm or 80 mm. The first configured printer becomes the default; choose another default in Settings when a different printer should receive ordinary receipts. If no hardware printer is configured, FloCafe automatically falls back to system print when printing bills.
 
+Enable **Open cash drawer on checkout** on a receipt printer only when a till is connected to that printer's drawer-kick port. When enabled, FloCafe appends the standard ESC/POS drawer pulse to printed receipt jobs for that printer.
+
 ## Arabic and Persian text
 
-In **Settings → Printers**, enable **Printer supports Arabic/Persian shaping** only for a thermal printer whose firmware performs Arabic/Persian contextual shaping and bidirectional ordering. With this setting enabled, receipt, tax-bill, and kitchen-ticket lines containing Arabic or Persian text are sent to the printer for it to shape; the setting is off by default for generic ESC/POS hardware. On the shared document-driven ESC/POS paths, guarded renderer-managed text that the printer cannot render is skipped instead of being sent as garbled bytes, and FloCafe displays a warning after printing. The migrated WebUSB receipt path follows this contract for `safePrinterText`-managed text, but `buildClassicReceiptBytes` writes the masked customer phone directly with `enc.text`, so that field may emit unsupported text without a warning. Legacy WebUSB KOT and print-test tax-bill encoders have their own warning behavior; see [printing-architecture.md](printing-architecture.md) for the scope. On those shared paths, lines that also contain another unsupported script remain skipped.
+In **Settings → Printers**, enable **Printer supports Arabic/Persian shaping** only for a thermal printer whose firmware performs Arabic/Persian contextual shaping and bidirectional ordering. With this setting enabled, receipt, tax-bill, and kitchen-ticket lines containing Arabic or Persian text are sent to the printer for it to shape; the setting is off by default for generic ESC/POS hardware. A separately validated printer profile may also enable the capability-gated raster path, which uses the isolated Chromium renderer and bundled local fonts for unsupported core receipt/KOT content. On document-driven and signed country-pack ESC/POS receipt paths, guarded unsupported non-financial text is skipped with a warning, while an unsupported item or financial row refuses the receipt before transport with an explicit operator warning. See [printing-architecture.md](printing-architecture.md) for the exact warning contract, direct-write exceptions, and legacy WebUSB encoder behavior.
 
 ## Receipt and kitchen-ticket languages
 
-On policy-aware paths, receipt labels (invoice title, bill number, date, totals, payment methods) and kitchen-ticket labels are resolved from the tenant's language configuration at print time:
+On policy-aware paths, receipt labels (invoice title, bill number, date, totals, payment methods) and kitchen-ticket labels are resolved from the tenant's language configuration. During authenticated POS bootstrap, FloCafe loads the bundles selected by the receipt and kitchen-ticket policies before releasing the dashboard, so the first print does not depend on visiting Settings. If a bundle cannot load, the app surfaces an actionable error and the print warning reports any English fallback explicitly. The detailed language, fallback, and warning contracts live in [printing-architecture.md](printing-architecture.md).
 
-- **Receipts** on the document-driven thermal path follow the tenant **language** setting combined with the stored `bill_language_policy` (`inherit` follows the store language; `fixed` pins one configured language; an optional second `additional` language is carried on the document for future bilingual layouts). `es` tenants receive catalog-resolved labels where the selected printer profile can represent the text; default ESC/POS paths skip non-ASCII Spanish labels such as `Factura N.º`, `Dirección`, `¡Gracias!`, and `Ítem` with explicit unsupported-character warnings. `fa` tenants receive Persian labels when the selected thermal printer profile enables Arabic/Persian shaping; without shaping support, Persian-script lines are skipped with warnings as described above. Browser receipt printing uses the active UI language rather than a fixed receipt policy; see [printing-architecture.md](printing-architecture.md#4-language-behavior).
-- **Kitchen tickets** in the backend document path and browser HTML path resolve their label language independently through the stored `kot_language_policy`. A fixed kitchen language (for example English) keeps tickets in that language even when the storefront runs in another language. The legacy WebUSB thermal KOT encoder retains its historical English labels.
+- **Receipts** on the document-driven thermal and browser paths follow the tenant **language** setting combined with the stored `bill_language_policy`.
+- **Kitchen tickets** resolve their label language independently through the stored `kot_language_policy` across backend, browser, and WebUSB paths.
+- **Tax bills** on the legacy WebUSB print-test path use the resolved print language for labels.
+- See [printing-architecture.md §4](printing-architecture.md#4-language-behavior) for policy resolution and [§6](printing-architecture.md#6-printer-capability-model--warning-semantics) for transport fallbacks, KOT metadata visibility, raw dates, and financial-row refusal.
 - For policy-aware paths, invalid or missing policy values always fall back to the store language; printing never fails because of a malformed policy.
 
-On the shared document-driven paths, lines the printer cannot render under the script rules above are skipped with an explicit warning — content is never silently dropped. The document carries direction annotations for directional text values; the annotation-aware browser HTML renderer uses them for embedded values such as phones and order numbers ([`frontend/src/lib/printer/web-print.ts`](../frontend/src/lib/printer/web-print.ts)). Current ESC/POS renderers do not consume `DirectionalText.direction` or implement bidi/LTR-island handling ([`main/printers/thermal.ts`](../main/printers/thermal.ts)), so direction-aware ESC/POS output remains unsupported/future. The language-policy resolution rules, canonical label catalog flow, bilingual layout strategies, and legacy exceptions are specified in [printing-architecture.md](printing-architecture.md).
+For shared document-driven behavior, including non-financial warnings, financial-row refusal, direction handling, language policy, and legacy exceptions, see [printing-architecture.md](printing-architecture.md). Native ESC/POS renderers do not consume `DirectionalText.direction` or implement bidi/LTR-island handling ([`main/printers/thermal.ts`](../main/printers/thermal.ts)); host-managed direction-aware raw output is available through the separately validated, capability-gated raster path.
 
-For the full study of non-Latin script support on thermal printers — including the recommended raster fallback architecture, community hardware-test checklist, and open decisions — see [printing-nonlatin-capabilities.md](printing-nonlatin-capabilities.md).
+For the full study of non-Latin script support on thermal printers — including the Phase 9 raster boundary, community hardware-test checklist, and remaining open decisions — see [printing-nonlatin-capabilities.md](printing-nonlatin-capabilities.md).
 
 ## Kitchen printing
 
@@ -42,6 +46,15 @@ KOT printing can be disabled for the business. When it is disabled, neither auto
 
 1. Use **Settings → Printers → Test Print** to verify printer connectivity before live service.
 2. Ensure FloCafe's local API and network printers are confined to your private business network.
+
+### Adding a printer manually by name
+
+FloCafe dispatches USB/OS-queue print jobs by sending the printer's exact name to the OS (`lp -d <name>` on macOS/Linux, `OpenPrinterW` on Windows) — there is no fuzzy matching. If a printer isn't found by **Settings → Printers → Detect**, use **Add Manually**, but the name must match the OS print queue identifier exactly, not just what appears to be the printer's name on your desktop:
+
+- Prefer picking the name from the autocomplete list under the name field (sourced from the same detection FloCafe uses) over typing it by hand.
+- On macOS/Linux, the CUPS queue name can differ from the display name shown in System Settings (for example, spaces are sometimes replaced with underscores). Check the exact queue name with `lpstat -p` in a terminal.
+- On Windows, check **Settings → Printers & scanners** for the exact printer name, including any suffix like `(Copy 1)`.
+- If you rename or reinstall the printer at the OS level later, its queue identifier can change — re-add or edit the printer in FloCafe with the new name.
 
 ### Network printers
 
@@ -70,7 +83,7 @@ FloCafe does not manage standalone Bluetooth RFCOMM transport or discovery. To u
 
 ### WebUSB printers
 
-WebUSB printers are paired through the POS toolbar in a supported browser. The saved printer entry retains formatting preferences, but browser permissions control physical device access.
+WebUSB printers are paired through the POS toolbar's **Connect** button, in the desktop app or in a supported browser. The saved printer entry retains formatting preferences, but browser (or, in the desktop app, Electron) permissions control physical device access. If more than one matching USB device is connected at once, the desktop app connects to the first one it finds — using a single USB thermal printer per terminal is the supported configuration. The connection is re-established automatically on the next app start once granted; if the printer isn't detected after a fresh install or a permissions reset, click **Connect** again to re-grant access.
 
 ### Diagnostic logs
 
@@ -94,6 +107,7 @@ Signed country tax packs can ship compliance receipt templates that render throu
 | `header` | object | no | Optional author strings: `businessNameTransform` (`uppercase`), `taxTitleWhenTaxPresent`, `titleWhenTaxAbsent` |
 | `fields.taxRegistrationNumberLabel` | string | no | Author label for the tax registration line |
 | `totals.grandTotalLabel` | string | no | Author label for the bold grand-total row |
+| `totals.chargeRows` | array of `serviceCharge`, `deliveryCharge`, `packagingCharge` | no | Explicitly opts into persisted nonzero charge rows; output remains in service, delivery, packaging order and zero values stay absent |
 | `totals.showSubtotal`, `totals.showDiscount` | boolean | no | Toggle subtotal/discount rows (default on) |
 | `totals.showTaxRegistrationNumber` | string | no | `when_tax_present_or_enabled` or default visibility rule |
 | `footer.defaultMessage` | string | no | Author footer message used when no configured footer note applies |
@@ -118,7 +132,7 @@ Packs may ship a payload-root `labels` map to override built-in fallback labels 
 }
 ```
 
-Supported semantic ids (stable public identifiers — never internal i18n keys): `invoice`, `taxInvoice`, `subtotal`, `discount`, `tax`, `total`, `taxIncluded`, `footerThanks`. Once shipped, an id never changes meaning.
+Supported semantic ids (stable public identifiers — never internal i18n keys): `invoice`, `taxInvoice`, `subtotal`, `discount`, `tax`, `total`, `serviceCharge`, `deliveryCharge`, `packagingCharge`, `taxIncluded`, `footerThanks`. Once shipped, an id never changes meaning.
 
 Resolution order for each label: the pack's structural author string (for example `totals.grandTotalLabel`) wins first, then the matching `labels` entry, then the built-in default localized through the canonical print-labels catalog using the receipt language. English defaults are byte-identical to the pre-#445 hardcoded strings.
 

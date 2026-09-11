@@ -1,34 +1,19 @@
-/**
- * web-print.ts
- *
- * Thermal-width bill printing using the browser's native print dialog —
- * the fallback path for merchants without an ESC/POS hardware printer.
- * Generates HTML that can be printed silently or shown to user.
- *
- * Since #444 (epic #438) the HTML is rendered from the shared,
- * renderer-independent PrintDocument: raw bill fields are normalized once in
- * `print-document.ts`, and this renderer only walks document blocks.
- * Labels arrive resolved inside the document / via the injected catalog
- * resolver; bidi isolation (`dir`, LTR islands) is driven by the kernel
- * DirectionSpec annotations instead of ad-hoc language checks.
- *
- * Browser receipts are full HTML, not raw ESC/POS bytes, so they never apply
- * the ASCII currency fallback or `ریال → IRR` downgrade used by the thermal
- * encoders. They follow the tenant's locale preferences (currency display,
- * digit mode, calendar) and the resolved receipt language policy, and render RTL with
- * isolated LTR islands for Persian (fa).
- */
+/** Thermal-width bill printing using browser print dialog for merchants without hardware printers. */
 
 import type { Bill, Tenant } from '@/lib/types';
 import toast from 'react-hot-toast';
+import type { PrintWarning } from './warnings';
 import {
   getCountryByCode,
+  getCurrencyFractionDigits,
+  getCurrencySymbol,
   formatCurrencyForTenant,
   formatNumberForTenant,
   formatDateForTenant,
   convertBaseToTender,
   type SecondaryCurrency,
 } from '@/lib/countries';
+import { columnsForReceiptPaperSize } from '@print/width';
 import { parseDbTimestamp } from '@/lib/utils';
 import { loadLocaleMessages } from '@/lib/i18n/loader';
 import {
@@ -37,7 +22,7 @@ import {
   printLabelResolver,
   resolveBillPrintLanguages,
 } from './print-document';
-import { RECEIPT_BRANDING_NAME, RECEIPT_BRANDING_URL } from './branding';
+import { RECEIPT_BRANDING_NAME } from './branding';
 import { LANGUAGES, type Language } from '@/lib/i18n/languages';
 import {
   getBlock,
@@ -71,12 +56,7 @@ export function escapeHtml(value: unknown): string {
     .replace(/'/g, '&#39;');
 }
 
-/**
- * Render one kernel-annotated value. Confident LTR islands (phones, invoice
- * numbers, tax IDs — per the direction kernel) are wrapped in a bidi-isolated
- * LTR span when the document base direction is RTL; everything else renders
- * inline in the base direction.
- */
+/** Render one kernel-annotated value with bidi-isolated LTR span when RTL. */
 function directionalValue(value: DirectionalText | null, base: TextDirection): string {
   if (!value) return '';
   if (value.direction === 'ltr' && base === 'rtl') {
@@ -98,7 +78,7 @@ export interface WebPrintOptions {
   showCustomerName?: boolean;
   showCustomerPhone?: boolean;
   showTableNumber?: boolean;
-  /** Ignored for browser receipts: HTML always renders Unicode currency symbols. */
+  /** Ignored for browser receipts: HTML uses locale currency formatting and code fallback. */
   useUnicode?: boolean;
   /** Show a large "REPRINT" banner so a reprinted bill can't be mistaken for the original. */
   isReprint?: boolean;
@@ -116,35 +96,28 @@ export interface WebPrintOptions {
   secondaryCurrencies?: SecondaryCurrency[];
 }
 
-/**
- * Tax-id label printed on the receipt. Country-profile labels are acronyms or
- * proper nouns (GSTIN, CUIT, …) and stay as-is; Iran's "Economic Code" is
- * localized so a Persian receipt doesn't show an English phrase.
- */
+/** Resolve tax-id label printed on receipt (special case for Iranian Economic Code). */
 function resolveTaxIdLabel(country: string | undefined, lang: Language): string {
   if (country?.toUpperCase() === 'IR') return printLabelResolver('receipt.economicCode', lang);
   return getCountryByCode(country ?? 'IN')?.taxIdLabel || 'Tax ID';
 }
 
-/**
- * Ensure the requested receipt language messages are loaded in memory (#377).
- */
-export async function ensureReceiptMessagesLoaded(lang: Language): Promise<void> {
-  await loadLocaleMessages(lang).catch(() => { });
+/** Ensure the requested receipt language messages are loaded in memory. */
+export async function ensureReceiptMessagesLoaded(lang: Language): Promise<Language[]> {
+  try {
+    await loadLocaleMessages(lang);
+    return [];
+  } catch {
+    return [lang];
+  }
 }
 
-/**
- * Generate HTML for A4/A5 printing and open print dialog.
- *
- * NOTE: The popup window is opened synchronously within the initiating user gesture
- * to preserve browser user activation (preventing popup blocker suppression), and
- * HTML is written into the window once requested language messages are ready.
- */
+/** Generate HTML for A4/A5 printing and open print dialog. */
 export async function printWebBill(
   bill: Bill,
   tenant: ReceiptTenant,
   opts: WebPrintOptions = {}
-): Promise<void> {
+): Promise<PrintWarning[]> {
   const languages = resolvePrintLanguages(opts);
 
   // 1. Open popup window synchronously to maintain transient user activation
@@ -154,10 +127,14 @@ export async function printWebBill(
     throw new Error('Popup window was blocked by browser');
   }
 
-  // 2. Ensure every language selected by the canonical print policy is
-  //    available before the synchronous document build. The document uses
-  //    the primary language for this single-language HTML surface.
-  await ensurePrintLanguagesLoaded(languages);
+  // Ensure print languages are loaded before synchronous document build.
+  const failedLanguages = await ensurePrintLanguagesLoaded(languages);
+  const warnings: PrintWarning[] = failedLanguages.map((language) => ({
+    field: 'receipt language',
+    text: language,
+    message: `Receipt language "${language}" could not be loaded, so English labels were used. Check the locale bundle and retry.`,
+    kind: 'locale' as const,
+  }));
   const html = generateBillHtml(bill, tenant, { ...opts, languages });
 
   // 3. Write HTML and trigger print
@@ -230,21 +207,11 @@ export async function printWebBill(
       toast.error('Failed to open print dialog');
       settle(err instanceof Error ? err : new Error(String(err)));
     }
-  });
+  }).then(() => warnings);
 }
 
-// ---------------------------------------------------------------------------
 // Document → HTML rendering
-// ---------------------------------------------------------------------------
-
-/**
- * Generate HTML string for the bill (without opening print dialog).
- * Useful for preview or PDF generation.
- *
- * Renders exclusively from the shared PrintDocument (+ context): raw bill
- * fields are normalized once in `print-document.ts`, and every label comes
- * resolved out of the document blocks or the injected catalog resolver.
- */
+/** Generate HTML string for bill (for preview or PDF generation). */
 export function generateBillHtml(
   bill: Bill,
   tenant: ReceiptTenant,
@@ -272,7 +239,7 @@ export function generateBillHtml(
   const lang = languages[0] as Language;
 
   const document = buildFrontendBillDocument(bill, tenant, {
-    columns: paperSize === 'thermal80' ? 48 : 42,
+    columns: columnsForReceiptPaperSize(paperSize === 'thermal80' ? 80 : 58),
     businessName: showBusinessName ? (businessName ?? tenant.business_name) : undefined,
     address,
     phone,
@@ -302,9 +269,7 @@ export function generateBillHtml(
   const payments = getBlock(document, 'payments') as PaymentsBlock | undefined;
   const messages = getBlock(document, 'message') as MessageBlock | undefined;
 
-  // Presentation labels come from the semantic document whenever the
-  // document owns that slot. Surface-only labels use the same injected
-  // catalog resolver as the document builder and thermal renderers.
+  // Presentation labels come from the document or fallback to shared catalog.
   const metaTableLabel = documentLabel(meta?.table?.label, 'pos.tableLabel', lang);
   const L = {
     billNumber: documentLabel(meta?.billNumberLabel, 'receipt.billNumber', lang),
@@ -312,14 +277,15 @@ export function generateBillHtml(
     table: stripLabelPlaceholder(metaTableLabel),
     customer: documentLabel(customer?.nameLabel, 'pos.customer', lang),
     customerNo: documentLabel(customer?.phoneLabel, 'print.numberShort', lang),
-    rate: printLabelResolver('receipt.rate', lang),
+    rate: itemsBlock?.header.rate.primary ?? printLabelResolver('receipt.rate', lang),
     totalTax: surfaceLabel(totals?.tax?.label, 'pos.tax', 'receipt.totalTax', lang),
     deliveryCharge: surfaceLabel(totals?.deliveryCharge?.label, 'pos.delivery', 'receipt.deliveryCharge', lang),
+    packagingCharge: documentLabel(totals?.packagingCharge?.label, 'pos.packaging', lang),
     grandTotal: surfaceLabel(totals?.grandTotal?.label, 'print.grandTotal', 'receipt.grandTotal', lang),
-    taxDetails: printLabelResolver('receipt.taxDetails', lang),
-    paymentsHeader: printLabelResolver('receipt.payments', lang),
+    taxDetails: breakdown?.heading.primary ?? printLabelResolver('receipt.taxDetails', lang),
+    paymentsHeader: payments?.heading.primary ?? printLabelResolver('receipt.payments', lang),
     thankYou: surfaceLabel(messages?.thankYou, 'print.thankYouShort', 'receipt.thankYou', lang),
-    taxIncluded: printLabelResolver('receipt.taxIncluded', lang),
+    taxIncluded: messages?.taxIncluded.primary ?? printLabelResolver('receipt.taxIncluded', lang),
     printBill: printLabelResolver('receipt.printBill', lang),
   };
 
@@ -353,6 +319,7 @@ export function generateBillHtml(
 <body>
   <div class="bill-container">
     ${messages?.reprintBanner ? `<div class="reprint-banner">${escapeHtml(messages.reprintBanner.primary)}</div>` : ''}
+    ${messages?.onlineOrderBanner ? `<div class="online-order-banner">${escapeHtml(messages.onlineOrderBanner.label.primary)}${messages.onlineOrderBanner.platform.text ? `<div class="online-order-detail">${escapeHtml(messages.onlineOrderBanner.platform.text)}</div>` : ''}${messages.onlineOrderBanner.externalOrderId.text ? `<div class="online-order-detail">#${escapeHtml(messages.onlineOrderBanner.externalOrderId.text)}</div>` : ''}</div>` : ''}
     <!-- Header -->
     <div class="header">
       ${header?.name ? `<h1>${escapeHtml(header.name.text)}</h1>` : ''}
@@ -417,13 +384,17 @@ export function generateBillHtml(
     <!-- Totals -->
     <table class="totals-table">
       ${totals ? `
+      ${totals.pointsRedeemed ? `<tr><td>${escapeHtml(totals.pointsRedeemed.label.primary)}</td><td class="text-end num">-${escapeHtml(totals.pointsRedeemed.points)} pts</td></tr>` : ''}
       <tr><td>${escapeHtml(totals.subtotal.label.primary)}</td><td class="text-end num">${fmtAmount(totals.subtotal.amount)}</td></tr>
       ${totals.discount ? `<tr><td>${escapeHtml(totals.discount.label.primary)}</td><td class="text-end num">-${fmtAmount(totals.discount.amount)}</td></tr>` : ''}
       ${totals.tax ? `<tr><td>${escapeHtml(L.totalTax)}</td><td class="text-end num">${fmtAmount(totals.tax.amount)}</td></tr>` : ''}
       ${totals.serviceCharge ? `<tr><td>${escapeHtml(totals.serviceCharge.label.primary)}</td><td class="text-end num">${fmtAmount(totals.serviceCharge.amount)}</td></tr>` : ''}
       ${totals.deliveryCharge ? `<tr><td>${escapeHtml(L.deliveryCharge)}</td><td class="text-end num">${fmtAmount(totals.deliveryCharge.amount)}</td></tr>` : ''}
+      ${totals.packagingCharge ? `<tr><td>${escapeHtml(L.packagingCharge)}</td><td class="text-end num">${fmtAmount(totals.packagingCharge.amount)}</td></tr>` : ''}
       <tr class="total-row"><td><strong>${escapeHtml(L.grandTotal)}</strong></td><td class="text-end num"><strong>${fmtAmount(totals.grandTotal.amount)}</strong></td></tr>
       ${secondaryCurrencies.map((c) => `<tr class="total-secondary"><td></td><td class="text-end num">${escapeHtml(fmtQuantity(convertBaseToTender(totals.grandTotal.amount, c).rounded))} ${escapeHtml(c.symbol || c.code)}</td></tr>`).join('')}
+      ${totals.pointsEarned ? `<tr><td>${escapeHtml(totals.pointsEarned.label.primary)}</td><td class="text-end num">${escapeHtml(totals.pointsEarned.points)} pts</td></tr>` : ''}
+      ${totals.pointsBalance ? `<tr><td>${escapeHtml(totals.pointsBalance.label.primary)}</td><td class="text-end num">${escapeHtml(totals.pointsBalance.points)} pts</td></tr>` : ''}
       ` : ''}
     </table>
 
@@ -445,7 +416,7 @@ export function generateBillHtml(
     <div class="footer">
       ${messages?.footerNote ? `<p>${escapeHtml(messages.footerNote.text)}</p>` : `<p>${escapeHtml(L.thankYou)}</p>`}
       ${hasTax ? `<p>${escapeHtml(L.taxIncluded)}</p>` : ''}
-      <p class="powered-by">${escapeHtml(RECEIPT_BRANDING_NAME)}<br>${escapeHtml(RECEIPT_BRANDING_URL)}</p>
+      <p class="powered-by">${escapeHtml(RECEIPT_BRANDING_NAME)}</p>
     </div>
   </div>
 
@@ -457,10 +428,7 @@ export function generateBillHtml(
   `;
 }
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
-
 /** Resolve the receipt language list through the shared policy bridge. */
 function resolvePrintLanguages(opts: Pick<WebPrintOptions, 'language' | 'languages'>): ResolvedPrintLanguages {
   return opts.languages ?? resolveBillPrintLanguages(opts.language);
@@ -475,11 +443,7 @@ function documentLabel(
   return label?.primary ?? printLabelResolver(conceptId, lang);
 }
 
-/**
- * Keep the browser's established wording while honoring a semantic label
- * override from an applied merchant document. The default browser concept is
- * still resolved by the shared catalog - it is not a second translation table.
- */
+/** Retain browser wording while honoring semantic label override from merchant document. */
 function surfaceLabel(
   semanticLabel: { primary: string } | null | undefined,
   semanticConceptId: string,
@@ -510,6 +474,8 @@ function getPaperStyles(size: PaperSize): string {
     body { font-family: -apple-system, 'Segoe UI', Tahoma, 'Noto Naskh Arabic', 'Helvetica Neue', Arial, sans-serif; font-size: 12px; line-height: 1.4; color: #333; }
     .bill-container { max-width: 100%; margin: 0 auto; }
     .reprint-banner { text-align: center; font-size: 22px; font-weight: bold; letter-spacing: 2px; color: #c00; border: 3px solid #c00; padding: 6px; margin-bottom: 15px; }
+    .online-order-banner { text-align: center; font-size: 18px; font-weight: bold; letter-spacing: 1px; border: 2px solid #333; padding: 6px; margin-bottom: 15px; }
+    .online-order-banner .online-order-detail { font-size: 13px; font-weight: normal; letter-spacing: normal; margin-top: 2px; }
     .header { text-align: center; margin-bottom: 20px; padding-bottom: 10px; border-bottom: 1px solid #ccc; }
     .header h1 { font-size: 24px; margin-bottom: 5px; }
     .bill-details { margin-bottom: 15px; }
@@ -550,14 +516,13 @@ function getPaperStyles(size: PaperSize): string {
   }
 }
 
-/**
- * Format an amount following the tenant's currency display (Iran rial/toman),
- * digit mode, and `trimDecimals` preference. Browser output is always Unicode.
- */
+/** Format amount per tenant currency display, digit mode, and trimDecimals prefs. */
 function formatAmount(value: number, tenant: ReceiptTenant, trimDecimals = false): string {
   const numeric = Number.isFinite(Number(value)) ? Number(value) : 0;
   const prefs = { currencyDisplay: tenant.currency_display, digits: tenant.number_digits };
-  const hasDecimals = Math.round(numeric * 100) % 100 !== 0;
+  const fractionDigits = getCurrencyFractionDigits(tenant.currency ?? 'INR');
+  const factor = 10 ** fractionDigits;
+  const hasDecimals = fractionDigits > 0 && Math.round(numeric * factor) % factor !== 0;
   const isToman =
     (tenant.currency === 'IRR' || (!tenant.currency && tenant.country === 'IR')) &&
     (tenant.currency_display === 'toman' || tenant.currency_display === 'toman_short');
@@ -566,11 +531,12 @@ function formatAmount(value: number, tenant: ReceiptTenant, trimDecimals = false
   if (trimDecimals && !hasDecimals && !isToman) {
     const locale = getCountryByCode(tenant.country ?? 'IN')?.locale ?? 'en-US';
     const numberingSystem = tenant.number_digits === 'latin' ? 'latn' : undefined;
+    const currency = tenant.currency || 'INR';
     try {
       return new Intl.NumberFormat(locale, {
         style: 'currency',
-        currency: tenant.currency || 'INR',
-        currencyDisplay: 'narrowSymbol',
+        currency,
+        currencyDisplay: getCurrencySymbol(currency, locale) === currency ? 'code' : 'narrowSymbol',
         ...(numberingSystem ? { numberingSystem } : {}),
         minimumFractionDigits: 0,
         maximumFractionDigits: 0,

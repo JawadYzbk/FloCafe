@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { getDatabase, now, generateShortId, getSettingValue } from '../db';
 import { requireRole, isBlockedSsrfTarget } from '../middleware/security';
+import { ROLE_ACCESS } from '../../shared/role-permissions';
 import { getHttpRequestSignal } from '../shutdown';
 import { getActiveCountryPack, hasConfiguredTaxCategories } from '../services/tax';
 import * as crypto from 'crypto';
@@ -11,10 +12,7 @@ import { asyncHandler } from '../middleware/async-handler';
 
 const MAX_FETCH_BYTES = 10 * 1024 * 1024;
 
-/**
- * Resolves a hostname and rejects it if any resolved address is a
- * loopback/private/link-local/metadata/reserved IP (vuln-0003 SSRF guard).
- */
+/** Resolves hostname and rejects loopback/private/metadata/reserved IPs (SSRF guard). */
 async function resolvePublicHostname(hostname: string, signal: AbortSignal): Promise<string> {
   const directAddress = hostname.replace(/^\[|\]$/g, '');
   if (net.isIP(directAddress)) {
@@ -117,9 +115,7 @@ function fetchPinnedHttps(
       signal,
       lookup: ((_hostname, options, callback) => {
         const family = net.isIP(resolvedAddress);
-        // Node 20+ may ask custom lookups for all candidate addresses while it
-        // chooses an address family. We intentionally permit only the single
-        // IP that passed the SSRF check, so return it in the requested shape.
+        // Restrict lookup strictly to the verified SSRF-safe address.
         if (options.all) {
           callback(null, [{ address: resolvedAddress, family }]);
           return;
@@ -153,15 +149,7 @@ function fetchPinnedHttps(
   });
 }
 
-/**
- * Validate that an image_url value is a valid Base64 data URI or null.
- * Enforces: type check, data:image/ prefix, supported formats (webp/png/jpeg),
- * and max length of 50,000 characters (~36.6 KB decoded).
- *
- * Called at write time — the GET /:id/image endpoint trusts this validation
- * and does NOT re-encode to verify (re-encode rejects valid images with
- * minor encoding variations like trailing newlines).
- */
+/** Validates image data URI format (webp/png/jpeg) and length limit. */
 function validateImageUrl(imageUrl: any): { valid: boolean; error?: string } {
   if (imageUrl === null || imageUrl === undefined) {
     return { valid: true }; // null means "clear the image"
@@ -182,13 +170,7 @@ function validateImageUrl(imageUrl: any): { valid: boolean; error?: string } {
   return { valid: true };
 }
 
-/**
- * Load category and addon groups for a batch of products.
- * Returns a Map<productId, { category, addon_groups }> for O(1) lookup.
- *
- * Uses batch queries instead of N+1 — loads all categories and addon groups
- * in 3 queries regardless of product count.
- */
+/** Batch loads category and addon group relations for a list of products. */
 function loadProductRelationsBatch(db: any, products: any[]) {
   if (products.length === 0) return new Map();
 
@@ -269,6 +251,7 @@ function loadProductRelationsBatch(db: any, products: any[]) {
 }
 
 const VALID_TAX_BEHAVIORS = ['country_default', 'inclusive', 'exclusive', 'exempt'];
+const VALID_SALE_UNITS = ['each', 'kg', 'g', 'lb'] as const;
 
 const router = Router();
 
@@ -311,6 +294,7 @@ function serializeProduct(product: any): any {
     ...product,
     is_active: toBoolean(product.is_active),
     track_inventory: toBoolean(product.track_inventory),
+    allow_fractional_quantity: toBoolean(product.allow_fractional_quantity),
     has_image: toBoolean(product.has_image),
     category: serializeCategory(product.category),
     addon_groups: Array.isArray(product.addon_groups) ? product.addon_groups.map(serializeAddonGroup) : product.addon_groups,
@@ -335,6 +319,35 @@ function validateProductNumericFields(values: Record<string, unknown>, requirePr
     if (typeof value !== 'number' || !Number.isFinite(value) || value < minimum || value > maximum) {
       return `${field} must be a finite number between ${minimum} and ${maximum === Number.POSITIVE_INFINITY ? 'the maximum supported value' : maximum}`;
     }
+  }
+  return null;
+}
+
+function normalizeSaleUnit(value: unknown): typeof VALID_SALE_UNITS[number] {
+  return VALID_SALE_UNITS.includes(value as any) ? value as typeof VALID_SALE_UNITS[number] : 'each';
+}
+
+function validateWeightedProductFields(
+  values: Record<string, unknown>,
+  current?: { sale_unit?: string; allow_fractional_quantity?: boolean | number },
+): string | null {
+  if (values.sale_unit !== undefined && !VALID_SALE_UNITS.includes(values.sale_unit as any)) {
+    return `sale_unit must be one of: ${VALID_SALE_UNITS.join(', ')}`;
+  }
+  if (values.allow_fractional_quantity !== undefined && typeof values.allow_fractional_quantity !== 'boolean') {
+    return 'allow_fractional_quantity must be a boolean';
+  }
+  if (values.weight_precision !== undefined) {
+    if (!Number.isSafeInteger(values.weight_precision) || (values.weight_precision as number) < 0 || (values.weight_precision as number) > 4) {
+      return 'weight_precision must be an integer between 0 and 4';
+    }
+  }
+  const effectiveSaleUnit = values.sale_unit !== undefined ? values.sale_unit : current?.sale_unit ?? 'each';
+  const effectiveAllowFractional = values.allow_fractional_quantity !== undefined
+    ? values.allow_fractional_quantity
+    : Number(current?.allow_fractional_quantity) === 1;
+  if (effectiveSaleUnit === 'each' && effectiveAllowFractional === true) {
+    return 'allow_fractional_quantity requires a weighted sale_unit';
   }
   return null;
 }
@@ -423,13 +436,12 @@ function validateAddonGroupIds(db: any, rawIds: unknown): { ids?: string[]; erro
   return { ids: uniqueIds };
 }
 
-// ── GET / — bulk product list ───────────────────────────────────────────
-// Uses explicit column list to avoid loading Base64 blobs into Node.js memory.
-// Computes has_image flag in SQL so the frontend knows which products have images.
+// Bulk product list; computes has_image in SQL to avoid loading Base64 blobs into memory.
 router.get('/', (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     let query = `SELECT p.id, p.category_id, p.name, p.description, p.price, p.cost, p.sku, p.barcode,
+      p.sale_unit, p.allow_fractional_quantity, p.weight_precision,
       p.is_active, p.sort_order, p.track_inventory, p.stock_quantity, p.low_stock_threshold,
       p.tax_type, p.tax_rate, p.tax_category_id, p.tax_behavior, p.cb_percent, p.tags, p.deleted_at, p.created_at, p.updated_at,
       CASE WHEN p.image_url IS NULL OR p.image_url = '' THEN 0 ELSE 1 END AS has_image
@@ -487,9 +499,8 @@ router.get('/', (req: Request, res: Response) => {
   }
 });
 
-// ── GET /:id — single product with relations ───────────────────────────
+// GET /:id/image — serves decoded image data URI.
 router.get('/:id/image', asyncHandler(async (req: Request, res: Response) => {
-  // Image endpoint — must be defined BEFORE /:id to avoid route conflict
   try {
     const db = getDatabase();
     const row = db.prepare(
@@ -502,20 +513,14 @@ router.get('/:id/image', asyncHandler(async (req: Request, res: Response) => {
 
     const imageUrl = row.image_url as string;
 
-    // Legacy external image URLs are not redirected. This endpoint is public
-    // for <img> tags, so redirecting database values would create an open
-    // redirect. Re-upload legacy images as validated Base64 data URIs.
+    // Reject non-data URIs to prevent open redirects on public image route.
     if (!imageUrl.startsWith('data:')) {
       return res.status(404).json({ error: 'No image' });
     }
 
-    // Parse the data URI: "data:image/webp;base64,AAAA..."
-    // Only allow formats that validateImageUrl accepts (webp/png/jpeg/jpg)
-    // to prevent SVG or other dangerous content types from being served
+    // Parse data URI and restrict to permitted image mime types.
     const match = imageUrl.match(/^data:(image\/(webp|png|jpeg|jpg));base64,(.+)$/);
     if (!match) {
-      // Not a server error — it's invalid stored data. Return 404 so the
-      // frontend falls back to the initials tile without creating noisy 500 logs.
       return res.status(404).json({ error: 'No image' });
     }
 
@@ -568,11 +573,8 @@ router.get('/:id', (req: Request, res: Response) => {
   }
 });
 
-// ── POST /fetch-url — CORS proxy for external image URLs ────────────────
-// When a user pastes an https:// URL, the backend fetches the image and
-// returns it as a Base64 data URI. The frontend then runs it through the
-// same crop → compress pipeline as a local upload.
-router.post('/fetch-url', requireRole('owner', 'manager'), asyncHandler(async (req: Request, res: Response) => {
+// Fetches external https image URL and returns Base64 data URI.
+router.post('/fetch-url', requireRole(...ROLE_ACCESS.ownerManager), asyncHandler(async (req: Request, res: Response) => {
   try {
     const { url } = req.body;
 
@@ -585,9 +587,7 @@ router.post('/fetch-url', requireRole('owner', 'manager'), asyncHandler(async (r
       return res.status(400).json({ error: 'Only HTTPS URLs are supported' });
     }
 
-    // Follow redirects manually (capped) so each hop's hostname/IP is
-    // re-validated — fetch()'s automatic redirect handling would otherwise
-    // let an allowed URL 302 into an internal address (vuln-0003).
+    // Follow redirects manually to re-validate host and IP on each hop.
     const MAX_REDIRECTS = 5;
     let currentUrl = url;
     // Named to avoid colliding with Express's Response type imported above.
@@ -701,10 +701,11 @@ router.post('/fetch-url', requireRole('owner', 'manager'), asyncHandler(async (r
   }
 }));
 
-router.post('/', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.post('/', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const {
       category_id, name, sku, barcode, description, price, cost_price,
+      sale_unit, allow_fractional_quantity, weight_precision,
       tax_category_id, tax_behavior, track_inventory, stock_quantity,
       low_stock_threshold, is_active, image_url, sort_order, cb_percent, tags, addon_group_ids
     } = req.body;
@@ -716,6 +717,8 @@ router.post('/', requireRole('owner', 'manager'), (req: Request, res: Response) 
     }
     const numericError = validateProductNumericFields(req.body, true);
     if (numericError) return res.status(400).json({ error: numericError });
+    const weightedFieldError = validateWeightedProductFields(req.body);
+    if (weightedFieldError) return res.status(400).json({ error: weightedFieldError });
 
     if (cb_percent !== undefined && cb_percent !== null) {
       if (typeof cb_percent !== 'number' || !Number.isFinite(cb_percent) || cb_percent < 0 || cb_percent > 100) {
@@ -766,11 +769,13 @@ router.post('/', requireRole('owner', 'manager'), (req: Request, res: Response) 
     const insertProduct = db.transaction(() => {
       db.prepare(`
         INSERT INTO products (id, category_id, name, sku, barcode, description, price, cost,
+          sale_unit, allow_fractional_quantity, weight_precision,
           tax_type, tax_rate, tax_category_id, tax_behavior, track_inventory, stock_quantity, low_stock_threshold,
           is_active, image_url, sort_order, cb_percent, tags, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         id, normalizeNullableString(category_id), productName, normalizeNullableString(sku), normalizedBarcode, normalizeNullableString(description), price, cost_price || 0,
+        normalizeSaleUnit(sale_unit), allow_fractional_quantity ? 1 : 0, weight_precision ?? 3,
         'none', 0, normalizeNullableString(tax_category_id), tax_behavior || 'country_default',
         track_inventory ? 1 : 0, stock_quantity || 0, low_stock_threshold || 0,
         is_active !== false ? 1 : 0, normalizeNullableString(image_url),
@@ -795,16 +800,20 @@ router.post('/', requireRole('owner', 'manager'), (req: Request, res: Response) 
   }
 });
 
-router.put('/:id', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.put('/:id', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
-    const product = db.prepare('SELECT * FROM products WHERE id = ? AND deleted_at IS NULL').get(req.params.id);
+    const product = db.prepare('SELECT * FROM products WHERE id = ? AND deleted_at IS NULL').get(req.params.id) as {
+      sale_unit?: string;
+      allow_fractional_quantity?: number;
+    } | undefined;
     if (!product) {
       return res.status(404).json({ error: 'Product not found' });
     }
 
     const {
       category_id, name, sku, barcode, description, price, cost_price,
+      sale_unit, allow_fractional_quantity, weight_precision,
       tax_category_id, tax_behavior, track_inventory, stock_quantity,
       low_stock_threshold, is_active, image_url, sort_order, cb_percent, tags, addon_group_ids
     } = req.body;
@@ -817,6 +826,8 @@ router.put('/:id', requireRole('owner', 'manager'), (req: Request, res: Response
 
     const numericError = validateProductNumericFields(req.body, false);
     if (numericError) return res.status(400).json({ error: numericError });
+    const weightedFieldError = validateWeightedProductFields(req.body, product);
+    if (weightedFieldError) return res.status(400).json({ error: weightedFieldError });
 
     if (tax_behavior !== undefined && tax_behavior !== null && !VALID_TAX_BEHAVIORS.includes(tax_behavior)) {
       return res.status(400).json({ error: `tax_behavior must be one of: ${VALID_TAX_BEHAVIORS.join(', ')}` });
@@ -866,6 +877,9 @@ router.put('/:id', requireRole('owner', 'manager'), (req: Request, res: Response
     const hasDescription = hasOwn(req.body, 'description');
     const hasCostPrice = hasOwn(req.body, 'cost_price');
     const hasTags = hasOwn(req.body, 'tags');
+    const hasSaleUnit = hasOwn(req.body, 'sale_unit');
+    const hasAllowFractionalQuantity = hasOwn(req.body, 'allow_fractional_quantity');
+    const hasWeightPrecision = hasOwn(req.body, 'weight_precision');
 
     const addonGroupValidation = validateAddonGroupIds(db, addon_group_ids);
     if (addonGroupValidation.error) {
@@ -881,6 +895,9 @@ router.put('/:id', requireRole('owner', 'manager'), (req: Request, res: Response
           name = CASE WHEN @has_name = 1 THEN @name ELSE name END,
           sku = CASE WHEN @has_sku = 1 THEN @sku ELSE sku END,
           barcode = CASE WHEN @has_barcode = 1 THEN @barcode ELSE barcode END,
+          sale_unit = CASE WHEN @has_sale_unit = 1 THEN @sale_unit ELSE sale_unit END,
+          allow_fractional_quantity = CASE WHEN @has_allow_fractional_quantity = 1 THEN @allow_fractional_quantity ELSE allow_fractional_quantity END,
+          weight_precision = CASE WHEN @has_weight_precision = 1 THEN @weight_precision ELSE weight_precision END,
           description = CASE WHEN @has_description = 1 THEN @description ELSE description END,
           price = COALESCE(@price, price),
           cost = CASE WHEN @has_cost = 1 THEN @cost ELSE cost END,
@@ -907,6 +924,12 @@ router.put('/:id', requireRole('owner', 'manager'), (req: Request, res: Response
         sku: normalizeNullableString(sku),
         has_barcode: hasBarcode ? 1 : 0,
         barcode: normalizedBarcode,
+        has_sale_unit: hasSaleUnit ? 1 : 0,
+        sale_unit: normalizeSaleUnit(sale_unit),
+        has_allow_fractional_quantity: hasAllowFractionalQuantity ? 1 : 0,
+        allow_fractional_quantity: allow_fractional_quantity ? 1 : 0,
+        has_weight_precision: hasWeightPrecision ? 1 : 0,
+        weight_precision: weight_precision ?? null,
         has_description: hasDescription ? 1 : 0,
         description: normalizeNullableString(description),
         price: price ?? null,
@@ -950,7 +973,7 @@ router.put('/:id', requireRole('owner', 'manager'), (req: Request, res: Response
   }
 });
 
-router.delete('/:id', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.delete('/:id', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const product = db.prepare('SELECT * FROM products WHERE id = ? AND deleted_at IS NULL').get(req.params.id);
@@ -966,7 +989,7 @@ router.delete('/:id', requireRole('owner', 'manager'), (req: Request, res: Respo
   }
 });
 
-router.post('/:id/stock', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.post('/:id/stock', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const { action, quantity } = req.body;
 
@@ -1009,15 +1032,8 @@ router.post('/:id/stock', requireRole('owner', 'manager'), (req: Request, res: R
   }
 });
 
-// Every product created before the tri-state loyalty rates carries
-// cb_percent = 0, which now reads as "earns nothing" — so an owner who sets a
-// global rate on an upgraded install sees nothing happen. Migration 42
-// deliberately does not rewrite those rows: "never configured" and
-// "deliberately excluded" are indistinguishable in the old data, and guessing
-// would silently start paying out on products a merchant had excluded. These
-// two routes are the explicit, counted alternative — the owner sees how many
-// products are affected, then chooses.
-router.get('/loyalty/global-rate-candidates', requireRole('owner', 'manager'), (_req: Request, res: Response) => {
+// Exposes zero-rate products so the merchant can review and opt into global loyalty.
+router.get('/loyalty/global-rate-candidates', requireRole(...ROLE_ACCESS.ownerManager), (_req: Request, res: Response) => {
   try {
     const row = getDatabase().prepare(
       'SELECT COUNT(*) AS count FROM products WHERE cb_percent = 0 AND deleted_at IS NULL'
@@ -1029,7 +1045,7 @@ router.get('/loyalty/global-rate-candidates', requireRole('owner', 'manager'), (
   }
 });
 
-router.post('/loyalty/apply-global-rate', requireRole('owner', 'manager'), (_req: Request, res: Response) => {
+router.post('/loyalty/apply-global-rate', requireRole(...ROLE_ACCESS.ownerManager), (_req: Request, res: Response) => {
   try {
     const result = getDatabase().prepare(
       'UPDATE products SET cb_percent = NULL, updated_at = ? WHERE cb_percent = 0 AND deleted_at IS NULL'

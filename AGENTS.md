@@ -1,6 +1,6 @@
 # FloCafe agent guide
 
-FloCafe is an open-source, offline-first Electron desktop POS. `main/` contains the Electron main process, Express API (`:3001`), standalone KDS server (`:3002`), SQLite database, printing, and background services. `frontend/` is a statically exported Next.js 16 and React 19 application. `tests/` contains backend, integration, and release test suites.
+FloCafe is an open-source, offline-first Electron desktop POS. `main/` contains the Electron main process, Express API (`:3001`), standalone KDS server (`:3002`), server app (`:3003`), SQLite database, printing, and background services. `frontend/` is a statically exported Next.js 16 and React 19 application. `tests/` contains backend, integration, and release test suites.
 
 ## Progressive disclosure
 
@@ -8,9 +8,10 @@ Before starting non-trivial work:
 
 1. **Understand task scope:** Read the task and any linked issue/PR, then identify scope and acceptance criteria.
 2. **Consult documentation index:** Check [docs/README.md](docs/README.md) to locate relevant `CURRENT` or `ACTIVE DESIGN` documents.
-3. **Inspect current code:** Verify active runtime paths and existing patterns.
-4. **Identify tests:** Locate existing test coverage in `tests/`.
-5. **Plan and execute:** Keep changes focused on the approved task.
+3. **Check business decisions:** If the task touches authorization, access control, defaults, or other product-behavior rules, check [docs/business-decisions.md](docs/business-decisions.md) — it's a verifiable log of deliberate product decisions that a plausible-looking implementation can otherwise easily contradict. If a task seems to require deviating from an entry there, stop and confirm with the user rather than assuming the decision is stale.
+4. **Inspect current code:** Verify active runtime paths and existing patterns.
+5. **Identify tests:** Locate existing test coverage in `tests/`.
+6. **Plan and execute:** Keep changes focused on the approved task.
 
 For minor typos or isolated one-line edits, formal planning is not required.
 
@@ -19,6 +20,7 @@ For minor typos or isolated one-line edits, formal planning is not required.
 - **Current runtime behavior:** Current code and automated tests define what FloCafe does today.
 - **Intended change:** The approved task description, issue, or PR defines what the specific change must achieve.
 - **Project invariants:** This document (`AGENTS.md`) and documentation marked `CURRENT` define project-wide boundaries.
+- **Business decisions:** [docs/business-decisions.md](docs/business-decisions.md) is the fuller, growing log of specific product decisions (of which the numbered invariants above are only the small, load-bearing subset). Check it before changing authorization, access control, or other established behavior.
 - **Active design:** Documents marked `ACTIVE DESIGN` or `FORWARD-LOOKING` in `docs/` describe target architecture and may be ahead of current code.
 - **Historical records:** Docs marked `HISTORICAL` provide context only.
 
@@ -41,8 +43,18 @@ docs/           Documentation, design specifications, and audits (see docs/READM
 3. **Architecture boundaries:** UI language, tenant regional settings, and tax/compliance behavior are separate, decoupled domains.
 4. **Business timestamps:** Persisted timestamps follow FloCafe's canonical storage conventions; configured store timezone applies to business-local presentation, day/shift boundaries, and reporting intervals.
 5. **Backend authority:** Security-critical, payment, and tax calculations remain backend-authoritative.
-6. **Reuse before adding:** Reuse existing helpers, utilities, and dependencies before introducing new packages.
-7. **Scope discipline:** Implement only the approved task. Do not make opportunistic refactors across unrelated files.
+6. **Orders are never ownership-gated:** FloCafe is an open system for order visibility — any staff role with order access can see and act on any order, regardless of who created it. Authorization is restricted by role (page/feature access) and by specific action (e.g. KDS stage transitions are chef/manager/owner-only, narrowed further by station/category assignment), never by comparing `order.user_id`/item creator against the current user. Accountability comes from audit attribution (every write is recorded against the authenticated actor), not from hiding orders between staff. Do not add or reintroduce a `role === 'server' && order.user_id !== user.userId`-style check anywhere in the backend; see `docs/business-decisions.md` and `docs/roles-and-permissions.md`.
+7. **Reuse before adding:** Reuse existing helpers, utilities, and dependencies before introducing new packages.
+8. **Scope discipline:** Implement only the approved task. Do not make opportunistic refactors across unrelated files.
+
+## Lessons from past mistakes
+
+FloCafe currently has fewer than 100 active installs, almost all of them testers rather than production merchants. The guidance below is calibrated to that scale — revisit it if that changes.
+
+- **Match migration/compatibility effort to actual usage, not worst-case fidelity.** Preserving one upgraded store's *exact* prior behavior (PR #640: carrying a per-printer cash-drawer-pulse flag's unconditional, every-payment-method behavior across a settings redesign, including UPI and custom methods) grew into a sentinel value, a union type, and load-vs-save race tracking spanning both the backend and the settings page — and still needed three follow-up fixes for edge cases that mechanism itself introduced, before it was reverted in favor of a plain default. For a product this size, a simple, slightly-narrowed default that's reconfigurable in the UI beats a stateful mechanism whose only job is protecting a handful of testers from a minor, one-time behavior change.
+- **After a second automated-review finding on code you just patched, stop and reconsider the design before patching again.** Each fix in that same episode closed one finding and opened another (parse failure on the sentinel → a load-vs-save race guarding against it → that guard dropping a genuine user edit). The second recurrence on the same few lines is the signal to ask "is this mechanism worth its complexity," not to patch a third time.
+- **Do not enable PR auto-merge unless the user clearly asks for it.** Treating "on success will merge to main" as authorization for `gh pr merge --auto` skipped a human review checkpoint the phrasing didn't unambiguously grant. Default to leaving merge timing to the user; ask if a merge instruction is ambiguous rather than assuming the more automated reading.
+- **Batch fixes into fewer pushes when working through automated review feedback — do not push once per finding.** CodeRabbit's review quota is capped per hour (its own review comment reports the remaining count), and each push — even a one-line fix — costs a full review cycle from both CodeRabbit and Greptile. On PR #640, reacting to findings one push at a time burned far more of that shared quota than reading everything outstanding from both reviewers, fixing it all, verifying once, and pushing together would have.
 
 ## Working conventions & safety rules
 
@@ -52,6 +64,8 @@ docs/           Documentation, design specifications, and audits (see docs/READM
 - **Legacy code check:** Before modifying legacy-looking files, verify they are part of the active build, import, or packaging path (search imports, routes, and `package.json`).
 - **Discovered issues:** If you encounter an adjacent bug or potential improvement during a task, note it in your report rather than expanding implementation scope.
 - **No unapproved mutations:** Do not create, edit, close, label, or assign GitHub issues or pull requests unless the task specifically instructs issue maintenance. Do not commit, tag, or push without instruction.
+- **Changelog & commit governance:** Use Conventional Commits (`feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `ci:`). Release notes and `CHANGELOG.md` are automated via `git-cliff` (`npm run changelog`) and CI; do not manually draft or invent ad-hoc changelog formats.
+- **Code comments:** Code should be self-explanatory; write comments only when strictly necessary to explain non-obvious intent or rationale. Keep comments concise (1-2 lines maximum), and avoid historical tags (PR/issue numbers, phases) or redundant descriptions of what the code is doing.
 - **Dependencies:** Evaluate built-in Node/Electron/browser APIs and existing project packages before proposing new dependencies.
 
 ## Commands
@@ -60,7 +74,7 @@ FloCafe requires **Node.js 22 or later**.
 
 ```sh
 npm run dev              # Full Electron app (cleans ports, builds frontend & backend)
-node dev-server.js       # Backend only (Express API on :3001, KDS on :3002)
+node dev-server.js       # Backend only (Express API on :3001, KDS on :3002, Server App on :3003)
 npm run dev:frontend     # Frontend browser development server
 npm run lint             # Lint backend (main/) and frontend (frontend/)
 npm run build            # Compile TypeScript backend to dist/

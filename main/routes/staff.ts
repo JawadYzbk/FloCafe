@@ -1,29 +1,25 @@
-/**
- * /api/staff  — alias for /api/users, kept for frontend compatibility.
- * All user records live in the `users` table.
- * Roles: owner | manager | cashier | server | chef
- * The chef role is used by KDS displays.
- */
+/** Staff management API (alias for /api/users). */
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'node:crypto';
 import { getDatabase, now } from '../db';
 import { requireRole, validatePassword, authRateLimit, invalidateUserAuthCache } from '../middleware/security';
+import { isValidEmail } from './auth';
+import { ROLE_ACCESS, ROLE_KEYS, OPERATIONAL_ROLES, hasRole } from '../../shared/role-permissions';
 
 const router = Router();
 
-const OPERATIONAL_ROLES = ['cashier', 'server', 'chef'];
-const VALID_ROLES = ['owner', 'manager', ...OPERATIONAL_ROLES];
+const VALID_ROLES: readonly string[] = ROLE_KEYS;
 const STAFF_SELECT_FIELDS = 'id, name, email, role, (pin_hash IS NOT NULL) AS has_pin, is_active, created_at, updated_at';
 
 function canModifyTargetStaff(requesterRole: string, targetRole: string): boolean {
   if (requesterRole === 'owner') return true;
-  if (requesterRole === 'manager') return !['owner', 'manager'].includes(targetRole);
+  if (requesterRole === 'manager') return !hasRole(targetRole, ROLE_ACCESS.ownerManager);
   return false;
 }
 
 function isOperationalRole(role: string): boolean {
-  return OPERATIONAL_ROLES.includes(role);
+  return hasRole(role, OPERATIONAL_ROLES);
 }
 
 function hasNonEmptyPin(pin: unknown): boolean {
@@ -34,9 +30,13 @@ function isValidPin(pin: unknown): boolean {
   return /^\d{4,6}$/.test(String(pin));
 }
 
+function normalizeStaffEmail(email: unknown): string {
+  return String(email || '').trim().toLowerCase();
+}
+
 // ── List ──────────────────────────────────────────────────────────────────────
 
-router.get('/', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.get('/', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     let query = `SELECT ${STAFF_SELECT_FIELDS} FROM users WHERE 1=1`;
@@ -68,7 +68,7 @@ router.get('/', requireRole('owner', 'manager'), (req: Request, res: Response) =
 
 // ── Get one ───────────────────────────────────────────────────────────────────
 
-router.get('/:id', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.get('/:id', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const member = db.prepare(
@@ -94,12 +94,16 @@ router.get('/:id', requireRole('owner', 'manager'), (req: Request, res: Response
 
 // ── Create ────────────────────────────────────────────────────────────────────
 
-router.post('/', requireRole('owner', 'manager'), authRateLimit(), (req: Request, res: Response) => {
+router.post('/', requireRole(...ROLE_ACCESS.ownerManager), authRateLimit(), (req: Request, res: Response) => {
   try {
     const { name, email, password, role, pin } = req.body;
+    const normalizedEmail = normalizeStaffEmail(email);
 
-    if (!name || !password || !role) {
-      return res.status(400).json({ error: 'name, password, and role are required' });
+    if (!name || !normalizedEmail || !password || !role) {
+      return res.status(400).json({ error: 'name, email, password, and role are required' });
+    }
+    if (!isValidEmail(normalizedEmail)) {
+      return res.status(400).json({ error: 'Enter a valid email address' });
     }
     if (!validatePassword(password)) {
       return res.status(400).json({ error: 'Password must be at least 8 characters long and contain at least one uppercase letter, one lowercase letter, and one number.' });
@@ -111,7 +115,7 @@ router.post('/', requireRole('owner', 'manager'), authRateLimit(), (req: Request
 
     const requesterRole = (req as any).user.role;
     if (requesterRole === 'manager' && !isOperationalRole(role)) {
-      return res.status(403).json({ error: 'Managers can only create operational staff accounts (cashier, server, chef)' });
+      return res.status(403).json({ error: `Managers can only create operational staff accounts (${OPERATIONAL_ROLES.join(', ')})` });
     }
 
     if (isOperationalRole(role) && hasNonEmptyPin(pin)) {
@@ -123,14 +127,12 @@ router.post('/', requireRole('owner', 'manager'), authRateLimit(), (req: Request
 
     const db = getDatabase();
 
-    if (email) {
-      const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
-      if (existing) {
-        return res.status(400).json({ error: 'Email already in use' });
-      }
+    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(normalizedEmail);
+    if (existing) {
+      return res.status(400).json({ error: 'Email already in use' });
     }
 
-    const id = uuidv4();
+    const id = randomUUID();
     const hashedPassword = bcrypt.hashSync(password, 10);
 
     const hashedPin = hasNonEmptyPin(pin) ? bcrypt.hashSync(String(pin), 10) : null;
@@ -138,7 +140,7 @@ router.post('/', requireRole('owner', 'manager'), authRateLimit(), (req: Request
     db.prepare(`
       INSERT INTO users (id, name, email, password, role, pin_hash, is_active, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
-    `).run(id, name, email || null, hashedPassword, role, hashedPin, now(), now());
+    `).run(id, name, normalizedEmail, hashedPassword, role, hashedPin, now(), now());
 
     const member = db.prepare(
       `SELECT ${STAFF_SELECT_FIELDS} FROM users WHERE id = ?`
@@ -153,9 +155,11 @@ router.post('/', requireRole('owner', 'manager'), authRateLimit(), (req: Request
 
 // ── Update ────────────────────────────────────────────────────────────────────
 
-router.put('/:id', requireRole('owner', 'manager'), authRateLimit(), (req: Request, res: Response) => {
+router.put('/:id', requireRole(...ROLE_ACCESS.ownerManager), authRateLimit(), (req: Request, res: Response) => {
   try {
     const { name, email, password, role, pin, is_active } = req.body;
+    const emailProvided = email !== undefined;
+    const normalizedEmail = emailProvided ? normalizeStaffEmail(email) : undefined;
     const db = getDatabase();
 
     if (is_active !== undefined) {
@@ -189,8 +193,14 @@ router.put('/:id', requireRole('owner', 'manager'), authRateLimit(), (req: Reque
       return res.status(400).json({ error: 'PIN must be between 4 and 6 numeric digits' });
     }
 
-    if (email && email !== member.email) {
-      const existing = db.prepare('SELECT id FROM users WHERE email = ? AND id != ?').get(email, req.params.id);
+    if (emailProvided && !normalizedEmail) {
+      return res.status(400).json({ error: 'email is required' });
+    }
+    if (normalizedEmail && !isValidEmail(normalizedEmail)) {
+      return res.status(400).json({ error: 'Enter a valid email address' });
+    }
+    if (normalizedEmail && normalizedEmail !== member.email) {
+      const existing = db.prepare('SELECT id FROM users WHERE email = ? AND id != ?').get(normalizedEmail, req.params.id);
       if (existing) {
         return res.status(400).json({ error: 'Email already in use' });
       }
@@ -200,17 +210,27 @@ router.put('/:id', requireRole('owner', 'manager'), authRateLimit(), (req: Reque
       return res.status(400).json({ error: 'Password must be at least 8 characters long and contain at least one uppercase letter, one lowercase letter, and one number.' });
     }
 
-    const hashedPassword = password ? bcrypt.hashSync(password, 10) : member.password;
+    const passwordChanged = Boolean(password && (!member.password || !bcrypt.compareSync(password, member.password)));
+    const hashedPassword = passwordChanged
+      ? bcrypt.hashSync(password, 10)
+      : member.password;
+
+    const pinChanged = isOperationalRole(targetRole)
+      ? Boolean(member.pin_hash)
+      : pin !== undefined && (
+          hasNonEmptyPin(pin)
+            ? (!member.pin_hash || !bcrypt.compareSync(String(pin), member.pin_hash))
+            : Boolean(member.pin_hash)
+        );
+
     const hashedPin = isOperationalRole(targetRole)
       ? null
       : pin !== undefined
-        ? (hasNonEmptyPin(pin) ? bcrypt.hashSync(String(pin), 10) : null)
+        ? (hasNonEmptyPin(pin) ? (pinChanged ? bcrypt.hashSync(String(pin), 10) : member.pin_hash) : null)
         : member.pin_hash;
 
-    // Revoke this user's outstanding sessions only when a credential actually
-    // changed (not on a bare name/email/role edit) — matches auth.ts's
-    // password/change and recover-password (#173).
-    const credentialsChanged = hashedPassword !== member.password || hashedPin !== member.pin_hash;
+    // Revoke outstanding sessions only when credentials actually change.
+    const credentialsChanged = passwordChanged || pinChanged;
     const tokensValidAfter = credentialsChanged ? now() : member.tokens_valid_after;
 
     const demotesActiveOwner = member.role === 'owner' && member.is_active === 1 && targetRole !== 'owner';
@@ -229,7 +249,7 @@ router.put('/:id', requireRole('owner', 'manager'), authRateLimit(), (req: Reque
           OR (SELECT COUNT(*) FROM users WHERE role = 'owner' AND is_active = 1) > 1
         )
     `).run(
-      name || null, email || null, hashedPassword,
+      name || null, normalizedEmail || null, hashedPassword,
       role || null, hashedPin, tokensValidAfter,
       now(), req.params.id, demotesActiveOwner ? 1 : 0,
     );
@@ -249,12 +269,8 @@ router.put('/:id', requireRole('owner', 'manager'), authRateLimit(), (req: Reque
   }
 });
 
-// ── Activate / Deactivate ─────────────────────────────────────────────────────
-// Staff are never hard-deleted — orders.user_id and print_logs.user_id reference
-// them, and losing the row would orphan historical order/print records.
-// Deactivating is the only removal path.
-
-router.post('/:id/deactivate', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+// Staff are deactivated rather than hard-deleted to preserve order and print log references.
+router.post('/:id/deactivate', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const member = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id) as any;
@@ -285,7 +301,7 @@ router.post('/:id/deactivate', requireRole('owner', 'manager'), (req: Request, r
   }
 });
 
-router.post('/:id/reactivate', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.post('/:id/reactivate', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const member = db.prepare('SELECT * FROM users WHERE id = ?').get(req.params.id) as any;

@@ -108,7 +108,7 @@ async function main() {
     assertEqual(detailRes.status, 200, 'manager can view active pack details');
     assert(detailRes.data.categories.length > 0, 'categories are available for reference');
     assert(detailRes.data.rules.length > 0, 'rules are available for reference');
-    assertEqual(detailRes.data.active_version.validation.checks.length, 25, 'all 25 activation checks are reported');
+    assertEqual(detailRes.data.active_version.validation.checks.length, 26, 'all 26 activation checks are reported');
     assertEqual(detailRes.data.active_version.validation.valid, true,
       'an exact legacy unsigned artifact remains trusted after upgrade');
     for (const packId of ['test-legacy-th-pack', 'local-generic']) {
@@ -116,8 +116,8 @@ async function main() {
       assertEqual(packDetail.status, 200, `${packId} details are readable`);
       assertEqual(
         packDetail.data.active_version.validation.checks.length,
-        25,
-        `${packId} reports all 25 activation checks`,
+        26,
+        `${packId} reports all 26 activation checks`,
       );
       const failedCheckIds = packDetail.data.active_version.validation.checks
         .filter((check: any) => !check.passed)
@@ -282,6 +282,27 @@ async function main() {
       'service charge snapshot identifies its charge kind',
     );
 
+    const serviceOrder = await api(baseUrl, '/api/orders', {
+      method: 'POST',
+      body: {
+        type: 'takeaway',
+        service_charge: 20,
+        items: [{ product_id: 'override-product', quantity: 1 }],
+      },
+      headers: owner.authHeader,
+    });
+    assertEqual(serviceOrder.status, 201, 'explicit service charge persists on order creation');
+    assertEqual(serviceOrder.data.order.service_charge, 20, 'order returns the persisted service charge');
+    assertEqual(serviceOrder.data.order.total, 121, 'order total includes service charge once');
+    const serviceBill = await api(baseUrl, '/api/bills/generate', {
+      method: 'POST',
+      body: { order_id: serviceOrder.data.order.id },
+      headers: owner.authHeader,
+    });
+    assertEqual(serviceBill.status, 201, 'service charge bill is generated');
+    assertEqual(serviceBill.data.bill.service_charge, 20, 'bill copies the persisted service charge');
+    assertEqual(serviceBill.data.bill.total, 121, 'bill total includes service charge once');
+
     const chargeOrder = await api(baseUrl, '/api/orders', {
       method: 'POST',
       body: {
@@ -385,6 +406,163 @@ async function main() {
     assertEqual(chargeBillDiscount.data.bill.tax_amount, 2, 'bill discount leaves charge tax unscaled');
     assertEqual(chargeBillDiscount.data.bill.total, 137, 'bill discount scales items but not charges');
 
+    console.log('\n5a. Explicit service-charge amounts persist through billing and splits');
+    const malformedServiceCharge = await api(baseUrl, '/api/orders', {
+      method: 'POST',
+      body: {
+        type: 'takeaway',
+        service_charge: 'not-a-number',
+        items: [{ product_id: 'override-product', quantity: 1 }],
+      },
+      headers: owner.authHeader,
+    });
+    assertEqual(malformedServiceCharge.status, 400, 'malformed service charge is rejected');
+    const overflowServiceCharge = await api(baseUrl, '/api/orders', {
+      method: 'POST',
+      body: {
+        type: 'takeaway',
+        service_charge: '1e1000',
+        items: [{ product_id: 'override-product', quantity: 1 }],
+      },
+      headers: owner.authHeader,
+    });
+    assertEqual(overflowServiceCharge.status, 400, 'overflow service charge is rejected');
+    const negativeServiceCharge = await api(baseUrl, '/api/orders', {
+      method: 'POST',
+      body: {
+        type: 'takeaway',
+        service_charge: -1,
+        items: [{ product_id: 'override-product', quantity: 1 }],
+      },
+      headers: owner.authHeader,
+    });
+    assertEqual(negativeServiceCharge.status, 400, 'negative service charge is rejected');
+
+    const zeroServiceCharge = await api(baseUrl, '/api/orders', {
+      method: 'POST',
+      body: {
+        type: 'takeaway',
+        items: [{ product_id: 'override-product', quantity: 1 }],
+      },
+      headers: owner.authHeader,
+    });
+    assertEqual(zeroServiceCharge.status, 201, 'missing service charge keeps the default path');
+    assertEqual(zeroServiceCharge.data.order.service_charge, 0, 'missing service charge persists as zero');
+
+    const persistedServiceOrder = await api(baseUrl, '/api/orders', {
+      method: 'POST',
+      body: {
+        type: 'takeaway',
+        service_charge: 20,
+        items: [{ product_id: 'override-product', quantity: 1 }],
+      },
+      headers: owner.authHeader,
+    });
+    assertEqual(persistedServiceOrder.status, 201, 'explicit service charge order is created');
+    const serviceOrderId = persistedServiceOrder.data.order.id;
+    assertEqual(persistedServiceOrder.data.order.service_charge, 20, 'order returns the server-validated service charge');
+    const serviceOrderRead = await api(baseUrl, `/api/orders/${serviceOrderId}`, { headers: owner.authHeader });
+    assertEqual(serviceOrderRead.data.order.service_charge, 20, 'order read API returns the persisted service charge');
+    assertEqual(persistedServiceOrder.data.order.tax_amount, 1, 'configured service charge is taxed once');
+    assertEqual(persistedServiceOrder.data.order.total, 121, 'service charge is included in payable total once');
+    const serviceSnapshots = typeof persistedServiceOrder.data.order.tax_snapshot === 'string'
+      ? JSON.parse(persistedServiceOrder.data.order.tax_snapshot)
+      : persistedServiceOrder.data.order.tax_snapshot;
+    assertEqual(serviceSnapshots.length, 1, 'service charge contributes one tax snapshot');
+    assertEqual(serviceSnapshots[0].chargeKind, 'service_charge', 'service tax snapshot identifies its source');
+    const persistedServiceBill = await api(baseUrl, '/api/bills/generate', {
+      method: 'POST',
+      body: { order_id: serviceOrderId },
+      headers: owner.authHeader,
+    });
+    assertEqual(persistedServiceBill.status, 201, 'service bill is generated');
+    assertEqual(persistedServiceBill.data.bill.service_charge, 20, 'bill persists the order service charge');
+    const serviceBillRead = await api(baseUrl, `/api/bills/${persistedServiceBill.data.bill.id}`, { headers: owner.authHeader });
+    assertEqual(serviceBillRead.data.bill.service_charge, 20, 'bill read API returns the persisted service charge');
+    assertEqual(persistedServiceBill.data.bill.total, 121, 'bill total matches the order total');
+    const regeneratedServiceBill = await api(baseUrl, '/api/bills/generate', {
+      method: 'POST',
+      body: { order_id: serviceOrderId },
+      headers: owner.authHeader,
+    });
+    assertEqual(regeneratedServiceBill.status, 200, 'regenerating a service bill is idempotent');
+    assertEqual(regeneratedServiceBill.data.bill.service_charge, 20, 'regeneration does not drop the service charge');
+    assertEqual(regeneratedServiceBill.data.bill.total, 121, 'regeneration does not duplicate the service charge');
+
+    const recomputeServiceOrder = await api(baseUrl, '/api/orders', {
+      method: 'POST',
+      body: { type: 'takeaway', service_charge: 20, items: [{ product_id: 'override-product', quantity: 1 }] },
+      headers: owner.authHeader,
+    });
+    const recomputeOrderDiscount = await api(baseUrl, `/api/orders/${recomputeServiceOrder.data.order.id}/discount`, {
+      method: 'PATCH',
+      body: { discount_type: 'percentage', discount_value: 50 },
+      headers: owner.authHeader,
+    });
+    assertEqual(recomputeOrderDiscount.data.order.service_charge, 20, 'order discount retains the service amount');
+    assertEqual(recomputeOrderDiscount.data.order.tax_amount, 1, 'order discount retains service tax once');
+    assertEqual(recomputeOrderDiscount.data.order.total, 71, 'order discount includes the service amount once');
+    const recomputeServiceBill = await api(baseUrl, '/api/bills/generate', {
+      method: 'POST',
+      body: { order_id: recomputeServiceOrder.data.order.id },
+      headers: owner.authHeader,
+    });
+    const recomputeBillDiscount = await api(baseUrl, `/api/bills/${recomputeServiceBill.data.bill.id}/applyDiscount`, {
+      method: 'POST',
+      body: { type: 'percentage', value: 50 },
+      headers: owner.authHeader,
+    });
+    assertEqual(recomputeBillDiscount.data.bill.service_charge, 20, 'bill discount retains the service amount');
+    assertEqual(recomputeBillDiscount.data.bill.tax_amount, 1, 'bill discount retains service tax once');
+    assertEqual(recomputeBillDiscount.data.bill.total, 71, 'bill discount includes the service amount once');
+
+    const paidServiceBill = await api(baseUrl, `/api/bills/${persistedServiceBill.data.bill.id}/payments`, {
+      method: 'POST',
+      body: { payments: [{ method: 'cash', amount: 121 }] },
+      headers: owner.authHeader,
+    });
+    assertEqual(paidServiceBill.status, 200, 'service bill can be paid at its authoritative total');
+    assertEqual(paidServiceBill.data.bill.payment_status, 'paid', 'service bill becomes immutable after payment');
+    db.prepare('UPDATE orders SET service_charge = 99, total = 200 WHERE id = ?').run(serviceOrderId);
+    const regeneratePaidServiceBill = await api(baseUrl, '/api/bills/generate', {
+      method: 'POST',
+      body: { order_id: serviceOrderId },
+      headers: owner.authHeader,
+    });
+    assertEqual(regeneratePaidServiceBill.data.bill.service_charge, 20, 'paid bill service charge is not silently rewritten');
+    assertEqual(regeneratePaidServiceBill.data.bill.total, 121, 'paid bill total remains immutable');
+
+    db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('split_checks_enabled', 'true', datetime('now'))").run();
+    const splitServiceOrder = await api(baseUrl, '/api/orders', {
+      method: 'POST',
+      body: {
+        type: 'dine_in',
+        service_charge: 20,
+        items: [{ product_id: 'override-product', quantity: 2 }],
+      },
+      headers: owner.authHeader,
+    });
+    const splitServiceBill = await api(baseUrl, '/api/bills/generate', {
+      method: 'POST',
+      body: { order_id: splitServiceOrder.data.order.id },
+      headers: owner.authHeader,
+    });
+    const splitResponse = await api(baseUrl, `/api/bills/${splitServiceBill.data.bill.id}/split-check`, {
+      method: 'POST',
+      body: {
+        checks: [
+          { label: 'Guest 1', items: [{ order_item_id: splitServiceOrder.data.order.items[0].id, quantity: 1 }] },
+          { label: 'Guest 2', items: [{ order_item_id: splitServiceOrder.data.order.items[0].id, quantity: 1 }] },
+        ],
+      },
+      headers: owner.authHeader,
+    });
+    assertEqual(splitResponse.status, 201, 'service charge order can be split');
+    assertEqual(splitResponse.data.bills[0].service_charge, 10, 'split allocates service charge to first check');
+    assertEqual(splitResponse.data.bills[1].service_charge, 10, 'split allocates service charge to second check');
+    assertEqual(splitResponse.data.bills[0].total, 110.5, 'split total includes allocated service tax once');
+    assertEqual(splitResponse.data.bills[1].total, 110.5, 'split totals reconcile to the source bill');
+
     for (const overrideIdToRemove of chargeOverrideIds) {
       const resetCharge = await api(baseUrl, `/api/tax-packs/overrides/${overrideIdToRemove}`, {
         method: 'DELETE',
@@ -484,7 +662,7 @@ async function main() {
       publicKey,
     });
     assertEqual(installed.version, '1.1.0', 'verified downloaded version is installed');
-    assertEqual(installed.validation.checks.length, 25, 'download uses the existing 25-check validation');
+    assertEqual(installed.validation.checks.length, 26, 'download uses the existing 26-check validation');
     assertEqual(installed.validation.valid, true, 'signed download passes all activation validation');
 
     const storedVersion = db.prepare(
@@ -574,6 +752,7 @@ async function main() {
           showDiscount: 'when_non_zero',
           showTaxRegistrationNumber: 'when_tax_present_or_enabled',
           grandTotalLabel: 'GRAND TOTAL',
+          chargeRows: ['packagingCharge', 'serviceCharge', 'deliveryCharge'],
         },
         footer: {
           useConfiguredFooterNote: true,
@@ -694,8 +873,11 @@ async function main() {
         subtotal: 200,
         discount_amount: 0,
         tax_amount: 10,
-        total: 210,
-        payment_details: [{ method: 'cash', amount: 210 }],
+        service_charge: 20,
+        delivery_charge: 30,
+        packaging_charge: 5,
+        total: 265,
+        payment_details: [{ method: 'cash', amount: 265 }],
       },
       {
         name: 'Flo Test Cafe',
@@ -715,7 +897,44 @@ async function main() {
     assert(pluginReceipt.includes('ITEM'), 'installed GST plugin template renders the plugin item-table layout');
     assert(pluginReceipt.includes('GSTIN: 27ABCDE1234F1Z5'), 'installed GST plugin template renders GSTIN');
     assert(pluginReceipt.includes('CGST @2.5%'), 'installed GST plugin template renders tax components');
+    const pluginRows = pluginReceipt.split(/\r?\n/);
+    const serviceChargeRow = pluginRows.find((row) => row.includes('Service Charge'));
+    const deliveryChargeRow = pluginRows.find((row) => row.includes('Delivery'));
+    const packagingChargeRow = pluginRows.find((row) => row.includes('Packaging'));
+    assert(serviceChargeRow != null && serviceChargeRow.includes('₹20.00'), 'declared plugin service charge row renders its persisted amount');
+    assert(deliveryChargeRow != null && deliveryChargeRow.includes('₹30.00'), 'declared plugin delivery charge row renders its persisted amount');
+    assert(packagingChargeRow != null && packagingChargeRow.includes('₹5.00'), 'declared plugin packaging charge row renders its persisted amount');
+    assert(
+      pluginReceipt.indexOf('Service Charge') < pluginReceipt.indexOf('Delivery')
+        && pluginReceipt.indexOf('Delivery') < pluginReceipt.indexOf('Packaging')
+        && pluginReceipt.indexOf('Packaging') < pluginReceipt.indexOf('GRAND TOTAL'),
+      'declared plugin charge rows keep service, delivery, packaging, total order',
+    );
     assert(pluginReceipt.includes('GRAND TOTAL'), 'installed GST plugin template renders plugin grand total label');
+
+    const zeroPluginReceipt = escPosToText(formatReceipt(
+      {
+        order_number: 'ORD-GST-ZERO-CHARGES',
+        created_at: '2026-08-01T10:30:00.000Z',
+        items: [{ product_name: 'Masala Chai', quantity: 1, total: 100 }],
+      },
+      {
+        bill_number: 'BILL-GST-ZERO-CHARGES',
+        subtotal: 100,
+        discount_amount: 0,
+        tax_amount: 0,
+        service_charge: 0,
+        delivery_charge: 0,
+        packaging_charge: 0,
+        total: 100,
+      },
+      { name: 'Flo Test Cafe', country: 'IN', currency_symbol: '₹', show_tax_breakdown: false },
+      'in.gst.tax-invoice.v1',
+      48,
+      true,
+    ));
+    assert(!zeroPluginReceipt.includes('Service Charge') && !zeroPluginReceipt.includes('Delivery') && !zeroPluginReceipt.includes('Packaging'),
+      'declared plugin charge rows omit zero-valued charges');
 
     const widthProfileWarnings: any[] = [];
     const exactWidthReceipt = escPosToText(formatReceipt(
@@ -735,6 +954,32 @@ async function main() {
     ));
     assert(exactWidthReceipt.includes('TAX INVOICE'), 'plugin renderer supports an exact 42-column profile');
     assertEqual(widthProfileWarnings.length, 0, 'exact plugin width profile does not warn');
+
+    const configuredTaxWarnings: any[] = [];
+    formatReceipt(
+      {
+        order_number: 'ORD-GST-CONFIGURED-TAX',
+        created_at: '2026-08-01T10:30:00.000Z',
+        items: [{
+          product_name: 'Tax Tea',
+          quantity: 1,
+          total: 100,
+          tax_breakdown: [{ title: 'НДС', rate: null, amount: 5 }],
+        }],
+      },
+      { bill_number: 'BILL-GST-CONFIGURED-TAX', subtotal: 95, tax_amount: 5, total: 100 },
+      { name: 'Flo Test Cafe', country: 'IN', currency_symbol: '₹', show_tax_breakdown: true },
+      'in.gst.tax-invoice.v1',
+      42,
+      false,
+      false,
+      'full',
+      configuredTaxWarnings,
+    );
+    assert(
+      configuredTaxWarnings.some((warning) => warning.kind === 'financial'),
+      'configured plugin tax summary rows are refused as financial content',
+    );
 
     const smallerWidthReceipt = escPosToText(formatReceipt(
       {
@@ -937,6 +1182,14 @@ async function main() {
     const labelsTotalReceipt = renderLabeled('in.gst.labels-total.v1');
     assert(labelsTotalReceipt.includes('SUMA TOTAL'), 'labels.total overrides the grand total when no structural label exists');
 
+    const fallbackWithCharges = renderLabeled('in.gst.label-fallback.v1', {
+      service_charge: 20,
+      delivery_charge: 30,
+      packaging_charge: 5,
+      total: 155,
+    });
+    assert(!fallbackWithCharges.includes('Service Charge') && !fallbackWithCharges.includes('Delivery') && !fallbackWithCharges.includes('Packaging'),
+      'plugin templates without charge-row support retain their legacy output');
     const fallbackEnReceipt = renderLabeled('in.gst.label-fallback.v1', {}, 'en');
     assert(fallbackEnReceipt.includes('INVOICE'), 'EN fallback title matches the pre-#445 hardcoded default');
     assert(fallbackEnReceipt.includes('Subtotal'), 'EN fallback subtotal matches the pre-#445 hardcoded default');
@@ -1402,6 +1655,120 @@ async function main() {
       'resolveTaxIdFormat never enforces a pattern while the taxes_enabled toggle is off',
     );
     db.prepare("UPDATE settings SET value = 'true' WHERE key = 'taxes_enabled'").run();
+
+    console.log('\n10. Community-sourced packs require a no-liability disclaimer before activation');
+    assertEqual(
+      validationChecklist({
+        ...(db.prepare('SELECT * FROM country_pack_versions LIMIT 1').get() as any),
+        pack_json: JSON.stringify({ ...flatRatePackData, publisher: 'local', sourceType: 'community' }),
+      }).checks.find((check: any) => check.id === 26)?.passed,
+      false,
+      'check 26 rejects a local/manual pack that declares a community sourceType',
+    );
+
+    // Installed-but-not-yet-active, matching the real download path's DB
+    // state (see installCatalogEntry), without needing a real Ed25519
+    // signature — the HTTP activate/ensure-country routes always validate
+    // against the real TRUSTED_TAX_PACK_SIGNING_PUBLIC_KEY (unlike
+    // installCatalogEntry, which tests can call directly with a throwaway
+    // key), so this reuses the same LEGACY_TRUSTED_PACK_DIGESTS fallback
+    // check 6 already grants testIndiaPack/testThailandPack above.
+    function installCommunityPackVersion(pack: any) {
+      const packJson = JSON.stringify(pack);
+      const digest = taxPackSha256(packJson);
+      LEGACY_TRUSTED_PACK_DIGESTS[pack.id] = digest;
+      const versionId = `${pack.id}@${pack.version}`;
+      const installedAt = new Date().toISOString();
+      db.prepare(`
+        INSERT INTO country_packs (
+          id, publisher, country, jurisdiction, active_version_id, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, NULL, 'installed', ?, ?)
+        ON CONFLICT(id) DO NOTHING
+      `).run(pack.id, pack.publisher, pack.country, pack.jurisdiction, installedAt, installedAt);
+      db.prepare(`
+        INSERT INTO country_pack_versions (
+          id, pack_id, version, schema_version, manifest_json, pack_json, digest, signature,
+          effective_from, effective_to, min_flo_version, published_at, status, created_at
+        ) VALUES (?, ?, ?, ?, '{}', ?, ?, NULL, ?, ?, ?, ?, 'installed', ?)
+      `).run(
+        versionId, pack.id, pack.version, pack.schemaVersion, packJson, digest,
+        pack.effectiveFrom, pack.effectiveTo || null, pack.minFloVersion, pack.publishedAt, installedAt,
+      );
+      return { packId: pack.id, versionId };
+    }
+
+    const communityPack = {
+      ...flatRatePackData,
+      id: 'test-community-pack',
+      country: 'XX',
+      currency: 'XXX',
+      publisher: 'Community Contributor',
+      version: '0.0.1',
+      sourceType: 'community',
+    };
+    const communityInstalled = installCommunityPackVersion(communityPack);
+    assertEqual(
+      validationChecklist(db.prepare('SELECT * FROM country_pack_versions WHERE id = ?').get(communityInstalled.versionId)).valid,
+      true,
+      'community pack passes activation validation once trusted',
+    );
+
+    const gatedActivate = await api(
+      baseUrl,
+      `/api/tax-packs/${encodeURIComponent(communityInstalled.packId)}/versions/${encodeURIComponent(communityInstalled.versionId)}/activate`,
+      { method: 'POST', headers: owner.authHeader },
+    );
+    assertEqual(gatedActivate.status, 200, 'activation attempt without acknowledgment does not error');
+    assertEqual(gatedActivate.data.changed, false, 'activation is refused without disclaimer acknowledgment');
+    assertEqual(gatedActivate.data.requires_disclaimer, true, 'response flags that the disclaimer is required');
+    assertEqual(gatedActivate.data.source_type, 'community', 'response identifies the pack as community-sourced');
+    const stillInstalled = db.prepare('SELECT status, active_version_id, disclaimer_acknowledged_at FROM country_packs WHERE id = ?')
+      .get(communityInstalled.packId) as any;
+    assertEqual(stillInstalled.status, 'installed', 'pack remains installed, not active, when the disclaimer is unacknowledged');
+    assertEqual(stillInstalled.active_version_id, null, 'no version is activated when the disclaimer is unacknowledged');
+    assertEqual(stillInstalled.disclaimer_acknowledged_at, null, 'no acknowledgment is recorded when activation is refused');
+
+    const ensureCountryGated = await api(baseUrl, '/api/tax-packs/ensure-country', {
+      method: 'POST',
+      body: { country: 'XX' },
+      headers: owner.authHeader,
+    });
+    assertEqual(ensureCountryGated.status, 200, 'ensure-country without acknowledgment does not error');
+    assertEqual(ensureCountryGated.data.enabled, false, 'ensure-country does not enable taxes without acknowledgment');
+    assertEqual(ensureCountryGated.data.requires_disclaimer, true, 'ensure-country flags that the disclaimer is required');
+
+    const acknowledgedActivate = await api(
+      baseUrl,
+      `/api/tax-packs/${encodeURIComponent(communityInstalled.packId)}/versions/${encodeURIComponent(communityInstalled.versionId)}/activate`,
+      { method: 'POST', body: { acknowledge_community_disclaimer: true }, headers: owner.authHeader },
+    );
+    assertEqual(acknowledgedActivate.status, 200, 'activation succeeds once the disclaimer is acknowledged');
+    assertEqual(acknowledgedActivate.data.changed, true, 'the pack version is activated');
+    const acknowledgedRow = db.prepare('SELECT status, active_version_id, disclaimer_acknowledged_at, disclaimer_acknowledged_by FROM country_packs WHERE id = ?')
+      .get(communityInstalled.packId) as any;
+    assertEqual(acknowledgedRow.status, 'active', 'pack is active after acknowledgment');
+    assertEqual(acknowledgedRow.active_version_id, communityInstalled.versionId, 'the acknowledged version is active');
+    assert(!!acknowledgedRow.disclaimer_acknowledged_at, 'acknowledgment timestamp is recorded');
+    assertEqual(acknowledgedRow.disclaimer_acknowledged_by, owner.userId, 'acknowledging user is recorded');
+
+    const communityAudit = db.prepare(`
+      SELECT details_json FROM tax_config_audit
+      WHERE action = 'activate_pack' AND pack_id = ? ORDER BY id DESC LIMIT 1
+    `).get(communityInstalled.packId) as any;
+    const communityAuditDetails = JSON.parse(communityAudit.details_json);
+    assertEqual(communityAuditDetails.disclaimerAcknowledged, true, 'audit record notes the disclaimer was acknowledged');
+    assertEqual(communityAuditDetails.sourceType, 'community', 'audit record notes the community source type');
+
+    const communityPackV2 = { ...communityPack, version: '0.0.2', publishedAt: '2026-08-01' };
+    const communityInstalledV2 = installCommunityPackVersion(communityPackV2);
+    const reactivateWithoutFlag = await api(
+      baseUrl,
+      `/api/tax-packs/${encodeURIComponent(communityInstalledV2.packId)}/versions/${encodeURIComponent(communityInstalledV2.versionId)}/activate`,
+      { method: 'POST', headers: owner.authHeader },
+    );
+    assertEqual(reactivateWithoutFlag.status, 200, 'activating a newer version of an already-acknowledged pack succeeds');
+    assertEqual(reactivateWithoutFlag.data.changed, true, 'the newer version is activated without re-prompting');
+    assert(!reactivateWithoutFlag.data.requires_disclaimer, 'an already-acknowledged pack id does not require the disclaimer again');
   } finally {
     server.close();
     closeDatabase();

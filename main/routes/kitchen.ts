@@ -1,17 +1,15 @@
 import { Router, Request, Response } from 'express';
 import { getDatabase, getKdsStationCategoryIds, getKdsStationRoutingScope, getUserKdsStationIds, hasUserKdsStationAssignments, isKdsStationItemAllowed, parseItemJson, attachEffectiveAddons, isVoidedItemKdsVisible, projectKdsItem, projectKdsOrder } from '../db';
 import { requireRole, requireKdsEnabled } from '../middleware/security';
+import { ROLE_ACCESS, hasRole } from '../../shared/role-permissions';
 import { parseCategoryIds } from './auth';
 
 const router = Router();
 
-router.use(requireRole('chef', 'manager', 'owner'));
+router.use(requireRole(...ROLE_ACCESS.kitchen));
 router.use(requireKdsEnabled);
 
-// Active kitchen orders — the old `OR EXISTS` form forced the planner to
-// SCAN orders and run a correlated subquery per row. The UNION form lets
-// each branch hit an index: status-in check uses `idx_orders_status`, and
-// the live-items branch uses `idx_order_items_order`. #208
+// Query active kitchen orders using indexed UNION query across order and item statuses.
 const ACTIVE_KITCHEN_ORDER_IDS_SQL = `
   SELECT id FROM orders WHERE status IN ('pending','preparing','ready','served')
   UNION
@@ -29,7 +27,7 @@ router.get('/orders', (req: Request, res: Response) => {
       ? db.prepare('SELECT role, category_ids FROM users WHERE id = ? AND is_active = 1').get(userId) as { role: string; category_ids: string | null } | undefined
       : undefined;
     if (!currentUser) return res.status(403).json({ error: 'User account is not active' });
-    const categoryIds = currentUser.role === 'manager' || currentUser.role === 'owner'
+    const categoryIds = hasRole(currentUser.role, ROLE_ACCESS.ownerManager)
       ? []
       : parseCategoryIds(currentUser.category_ids);
     const stationIds = getUserKdsStationIds(db, userId);
@@ -52,8 +50,8 @@ router.get('/orders', (req: Request, res: Response) => {
 
     const stationFilter = stationIds.length > 0
       ? ` AND (EXISTS (SELECT 1 FROM tables assigned_table WHERE assigned_table.id = o.table_id AND assigned_table.kitchen_station_id IN (${stationIds.map(() => '?').join(',')}))
-          ${stationRoutingCategoryIds.length > 0 ? `OR EXISTS (SELECT 1 FROM order_items routed_oi JOIN products routed_p ON routed_p.id = routed_oi.product_id WHERE routed_oi.order_id = o.id AND o.table_id IS NULL AND routed_p.category_id IN (${stationRoutingCategoryIds.map(() => '?').join(',')}))` : ''}
-          ${stationScope.hasUnrestrictedStation ? 'OR o.table_id IS NULL' : ''})`
+          ${stationRoutingCategoryIds.length > 0 ? `OR EXISTS (SELECT 1 FROM order_items routed_oi JOIN products routed_p ON routed_p.id = routed_oi.product_id WHERE routed_oi.order_id = o.id AND t.kitchen_station_id IS NULL AND routed_p.category_id IN (${stationRoutingCategoryIds.map(() => '?').join(',')}))` : ''}
+          ${stationScope.hasUnrestrictedStation ? 'OR t.kitchen_station_id IS NULL' : ''})`
       : '';
     const orders = db.prepare(`
       SELECT o.*, t.kitchen_station_id
@@ -97,7 +95,7 @@ router.get('/orders', (req: Request, res: Response) => {
     // Resolve addons for every visible item in one batched call.
     const allVisibleItems = rawItems.filter(
       (i) => i.status !== 'void_adjustment'
-        && !['completed', 'cancelled'].includes(i.status)
+        && !['completed', 'cancelled', 'refunded'].includes(i.status)
         && (i.status !== 'voided' || isVoidedItemKdsVisible(i.voided_at))
         && (!allowedProductIds || allowedProductIds.has(String(i.product_id)))
         && isKdsStationItemAllowed(stationIds, stationRoutingCategoryIds, ordersById.get(i.order_id)?.kitchen_station_id, i.category_id, ordersById.get(i.order_id)?.kitchen_station_id ? stationScope.categoryIdsByStation[String(ordersById.get(i.order_id)?.kitchen_station_id)] : undefined, stationScope.hasUnrestrictedStation)
@@ -109,7 +107,7 @@ router.get('/orders', (req: Request, res: Response) => {
       const orderRawItems = itemsByOrder[order.id] || [];
       const visibleItems = orderRawItems
         .filter((i) => i.status !== 'void_adjustment'
-          && !['completed', 'cancelled'].includes(i.status)
+          && !['completed', 'cancelled', 'refunded'].includes(i.status)
           && (i.status !== 'voided' || isVoidedItemKdsVisible(i.voided_at))
           && (!allowedProductIds || allowedProductIds.has(String(i.product_id)))
           && isKdsStationItemAllowed(stationIds, stationRoutingCategoryIds, order.kitchen_station_id, i.category_id, order.kitchen_station_id ? stationScope.categoryIdsByStation[String(order.kitchen_station_id)] : undefined, stationScope.hasUnrestrictedStation))

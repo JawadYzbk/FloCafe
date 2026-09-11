@@ -263,8 +263,38 @@ async function runTests() {
     }
   }
 
-  // ── Test 9: prepareReceipt honors the arabicShaping request override (#437) ──
-  console.log('\nTest 9: prepareReceipt arabicShaping override (#437)');
+  // ── Test 9: GET /api/bills/:id returns hydrated loyalty fields ──────────
+  console.log('\nTest 9: GET /api/bills/:id returns hydrated loyalty fields');
+  {
+    db.prepare('INSERT INTO tables (id, number) VALUES (?, ?)').run('table-print-api-bill', 'B-12');
+    db.prepare('UPDATE orders SET table_id = ? WHERE order_number = ?').run('table-print-api-bill', 'ORD-PRINT-API-0001');
+    const customerId = 'customer-print-api-loyalty';
+    db.exec(`INSERT OR REPLACE INTO customers (id, name, phone) VALUES ('${customerId}', 'Loyalty Customer', '+91 9876543210')`);
+    db.prepare('UPDATE bills SET customer_id = ? WHERE id = ?').run(customerId, testBillId?.id);
+    db.prepare(`DELETE FROM loyalty_ledger WHERE customer_id = ?`).run(customerId);
+    db.prepare(`INSERT INTO loyalty_ledger (customer_id, bill_id, type, amount, description) VALUES (?, ?, 'credit', ?, ?)`)
+      .run(customerId, testBillId?.id, 14, 'API test earned points');
+    db.prepare(`INSERT INTO loyalty_ledger (customer_id, bill_id, type, amount, description) VALUES (?, ?, 'debit', ?, ?)`)
+      .run(customerId, testBillId?.id, 5, 'API test redeemed points');
+    db.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES ('loyalty_enabled', 'true')`).run();
+
+    if (!testBillId) {
+      assert(false, 'skipped: no test bill found');
+    } else {
+      const res = await request(app)
+        .get(`/api/bills/${testBillId.id}`)
+        .set('Authorization', authHeader);
+
+      assert(res.status === 200, `GET bill returns 200 (got ${res.status})`);
+      assert(res.body.bill.points_earned === 14, 'GET bill returns earned loyalty points');
+      assert(res.body.bill.points_redeemed === 5, 'GET bill returns redeemed loyalty points');
+      assert(res.body.bill.points_balance === 9, 'GET bill returns current loyalty balance');
+      assert(res.body.bill.order.table.name === 'B-12', 'GET bill returns the order table name');
+    }
+  }
+
+  // ── Test 10: prepareReceipt honors the arabicShaping request override (#437) ──
+  console.log('\nTest 10: prepareReceipt arabicShaping override (#437)');
   {
     const { prepareReceipt } = require('../main/printers/thermal');
 
@@ -287,8 +317,8 @@ async function runTests() {
     };
     const iranBiz = { name: 'کافه فلو', currency_symbol: 'IRR', country: 'IR' };
 
-    // No override and no profile capability: Persian lines are skipped with a
-    // precise warning while ASCII lines keep printing.
+    // No override and no profile capability: the paid Persian row refuses the
+    // receipt before transport.
     const withoutOverride = prepareReceipt(persianOrder, persianBill, iranBiz, 'compact', true);
     const withoutText = withoutOverride.data.toString('utf8');
     assert(!withoutText.includes('چای زعفرانی'), 'without override, Persian item line is skipped');
@@ -296,7 +326,11 @@ async function runTests() {
       withoutOverride.warnings.some((w: any) => /Persian\/Arabic/.test(w.message)),
       'without override, skipped Persian line reports Arabic-shaping warning'
     );
-    assert(withoutText.includes('Espresso'), 'without override, English item line still prints');
+    assert(withoutOverride.data.length === 0, 'without override, unsupported financial receipt is refused');
+    assert(
+      withoutOverride.warnings.some((w: any) => w.kind === 'financial'),
+      'without override, refusal reports a financial warning'
+    );
 
     // Explicit request-body override (renderer global setting): Persian prints.
     const withOverride = prepareReceipt(persianOrder, persianBill, iranBiz, 'compact', true, false, true);

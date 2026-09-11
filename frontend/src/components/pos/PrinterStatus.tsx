@@ -1,17 +1,7 @@
 'use client';
 
-/**
- * PrinterStatus — toolbar button that shows printer connection state and
- * exposes connect / disconnect actions.
- *
- * Place it in the POS page header or sidebar header alongside other toolbar
- * icons.  Example:
- *
- *   <PrinterStatus currency={currency} />
- *
- * The `navigator.usb.requestDevice` picker is only opened on an explicit user
- * click, satisfying the browser's "transient user activation" requirement.
- */
+/** PrinterStatus: toolbar button showing connection state and exposing
+ * connect/disconnect actions with user-activation device picker. */
 
 import {
   Printer,
@@ -32,7 +22,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import { usePrinterStore, usePrinterStatusSync } from '@/hooks/usePrinter';
+import { usePrinterStore } from '@/hooks/usePrinter';
 import type { PrinterStatus } from '@/lib/printer/PrinterService';
 import toast from 'react-hot-toast';
 import { useTranslations, type AppConfig } from 'use-intl';
@@ -67,8 +57,7 @@ const STATUS_CONFIG: Record<
 };
 
 export default function PrinterStatus() {
-  usePrinterStatusSync();
-
+  // Printer status and hardware configuration are synced at the dashboard layout level.
   const {
     status, deviceInfo, lastError,
     connect, disconnect, clearError,

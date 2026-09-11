@@ -8,14 +8,19 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { CreditCard, Trash2, RotateCcw, Clock, MessageCircle, Printer, XCircle, Lock, Percent, Banknote, Search, Plus, ChevronDown, ChevronRight, UserPlus, User, ShoppingBag, Send, Loader2, Ban, Download } from 'lucide-react';
 import toast from 'react-hot-toast';
 import PaymentModal from '@/components/pos/PaymentModal';
+import CreateCustomerModal from '@/components/pos/CreateCustomerModal';
+import AddonModal from '@/components/pos/AddonModal';
 import { shareBillViaWhatsApp, sendBillViaFlo } from '@/lib/whatsapp-share';
 import { useConfirm } from '@/hooks/use-confirm';
-import type { OrderItem, Table, Product, Customer } from '@/lib/types';
+import type { OrderItem, Table, Product, Customer, Addon } from '@/lib/types';
 import type { Order, Bill } from '@/lib/types';
 import { getCurrencySymbol, getCountryByCode } from '@/lib/countries';
+import { useCurrencyUnitAdapter } from '@/hooks/useCurrencyUnitAdapter';
+import { getDiscountInputStep, normalizeFixedDiscountValue } from '@/lib/currency-input';
 import { parseDbTimestamp } from '@/lib/utils';
 import { usePrinterStore } from '@/hooks/usePrinter';
 import { showPrintWarningsToast } from '@/lib/printer/warnings-toast';
+import { formatReceiptErrorToast, extractPrinterErrorMessage } from '@/lib/printer/warnings';
 import { useFormatCurrency } from '@/hooks/useFormatCurrency';
 import { useHeldOrdersStore } from '@/store/held-orders';
 import { useRouter } from 'next/navigation';
@@ -42,32 +47,33 @@ import {
   type AppendAttemptStorage,
 } from '@/lib/append-attempt';
 import { preferChildScopedBill } from '@/lib/printer/tax-components';
+import { ROLE_ACCESS, hasRole } from '@shared/role-permissions';
 
 type OrdersKey = keyof AppConfig['Messages']['orders'];
 
 const itemStatusConfig: Record<OrderItem['status'], { dot: string; color: string; labelKey: OrdersKey }> = {
-  pending: { dot: 'bg-yellow-400', color: 'text-yellow-700', labelKey: 'itemStatusWaiting' },
-  preparing: { dot: 'bg-blue-500', color: 'text-blue-700', labelKey: 'itemStatusPreparing' },
-  ready: { dot: 'bg-green-500', color: 'text-green-700', labelKey: 'itemStatusReady' },
-  served: { dot: 'bg-purple-500', color: 'text-purple-700', labelKey: 'itemStatusServed' },
-  cancelled: { dot: 'bg-red-400', color: 'text-red-500', labelKey: 'itemStatusCancelled' },
-  voided: { dot: 'bg-red-500', color: 'text-red-600 line-through', labelKey: 'itemStatusVoided' },
-  void_adjustment: { dot: 'bg-red-300', color: 'text-red-500 italic', labelKey: 'itemStatusVoidAdjustment' },
+  pending: { dot: 'bg-yellow-400', color: 'text-yellow-700 dark:text-yellow-300', labelKey: 'itemStatusWaiting' },
+  preparing: { dot: 'bg-blue-500 dark:bg-blue-400', color: 'text-blue-700 dark:text-blue-300', labelKey: 'itemStatusPreparing' },
+  ready: { dot: 'bg-green-500 dark:bg-green-400', color: 'text-green-700 dark:text-green-300', labelKey: 'itemStatusReady' },
+  served: { dot: 'bg-purple-500 dark:bg-purple-400', color: 'text-purple-700 dark:text-purple-300', labelKey: 'itemStatusServed' },
+  cancelled: { dot: 'bg-red-400', color: 'text-red-500 dark:text-red-400', labelKey: 'itemStatusCancelled' },
+  voided: { dot: 'bg-red-500 dark:bg-red-400', color: 'text-red-600 dark:text-red-400 line-through', labelKey: 'itemStatusVoided' },
+  void_adjustment: { dot: 'bg-red-300 dark:bg-red-400', color: 'text-red-500 dark:text-red-400 italic', labelKey: 'itemStatusVoidAdjustment' },
 };
 
 const orderStatusBadge: Record<Order['status'], { bg: string; text: string; labelKey: OrdersKey }> = {
-  pending: { bg: 'bg-yellow-100', text: 'text-yellow-700', labelKey: 'pending' },
-  preparing: { bg: 'bg-blue-100', text: 'text-blue-700', labelKey: 'preparing' },
-  ready: { bg: 'bg-green-100', text: 'text-green-700', labelKey: 'ready' },
-  served: { bg: 'bg-purple-100', text: 'text-purple-700', labelKey: 'served' },
-  completed: { bg: 'bg-gray-100', text: 'text-gray-600', labelKey: 'completed' },
-  cancelled: { bg: 'bg-red-100', text: 'text-red-700', labelKey: 'cancelled' },
+  pending: { bg: 'bg-yellow-100 dark:bg-yellow-950/40', text: 'text-yellow-700 dark:text-yellow-300', labelKey: 'pending' },
+  preparing: { bg: 'bg-blue-100 dark:bg-blue-950/40', text: 'text-blue-700 dark:text-blue-300', labelKey: 'preparing' },
+  ready: { bg: 'bg-green-100 dark:bg-green-950/40', text: 'text-green-700 dark:text-green-300', labelKey: 'ready' },
+  served: { bg: 'bg-purple-100 dark:bg-purple-950/40', text: 'text-purple-700 dark:text-purple-300', labelKey: 'served' },
+  completed: { bg: 'bg-muted', text: 'text-muted-foreground', labelKey: 'completed' },
+  cancelled: { bg: 'bg-red-100 dark:bg-red-950/40', text: 'text-red-700 dark:text-red-300', labelKey: 'cancelled' },
 };
 
 const paymentStatusBadge: Record<'paid' | 'partial' | 'unpaid', { bg: string; text: string; labelKey: OrdersKey }> = {
-  paid: { bg: 'bg-green-100', text: 'text-green-700', labelKey: 'paid' },
-  partial: { bg: 'bg-amber-100', text: 'text-amber-700', labelKey: 'partiallyPaid' },
-  unpaid: { bg: 'bg-red-100', text: 'text-red-700', labelKey: 'unpaidBadge' },
+  paid: { bg: 'bg-green-100 dark:bg-green-950/40', text: 'text-green-700 dark:text-green-300', labelKey: 'paid' },
+  partial: { bg: 'bg-amber-100 dark:bg-amber-950/40', text: 'text-amber-700 dark:text-amber-300', labelKey: 'partiallyPaid' },
+  unpaid: { bg: 'bg-red-100 dark:bg-red-950/40', text: 'text-red-700 dark:text-red-300', labelKey: 'unpaidBadge' },
 };
 
 // Typed leaf-key order-type map.
@@ -124,6 +130,7 @@ export default function OrdersPage() {
   const cartStore = useCartStore();
   const { setTablesRequired, autoPrintBill, printerUseUnicode, printerArabicShaping } = usePosSettingsStore();
   const tOrders = useTranslations('orders');
+  const tPos = useTranslations('pos');
   const tCommon = useTranslations('common');
   const tNav = useTranslations('nav');
   const tWhatsappSend = useTranslations('whatsapp.send');
@@ -188,8 +195,9 @@ export default function OrdersPage() {
   // Add Item modal states
   const [products, setProducts] = useState<Product[]>([]);
   const [productSearch, setProductSearch] = useState('');
-  const [selectedItems, setSelectedItems] = useState<{ product_id: string; product_name: string; quantity: number; special_instructions: string }[]>([]);
+  const [selectedItems, setSelectedItems] = useState<{ key: string; product_id: string; product_name: string; quantity: number; special_instructions: string; addons: Addon[] }[]>([]);
   const [addingItems, setAddingItems] = useState(false);
+  const [addonPickerProduct, setAddonPickerProduct] = useState<Product | null>(null);
   const addItemsAttemptRef = useRef<AppendAttempt | null>(null);
   const appendAttemptStorageRef = useRef<AppendAttemptStorage | null>(null);
   const appendRecoveryStartedUsersRef = useRef<Set<string>>(new Set());
@@ -221,11 +229,17 @@ export default function OrdersPage() {
   const [linkCustomerSearch, setLinkCustomerSearch] = useState('');
   const [linkCustomerResults, setLinkCustomerResults] = useState<Customer[]>([]);
   const [linkingCustomer, setLinkingCustomer] = useState(false);
+  const [createCustomerOrderId, setCreateCustomerOrderId] = useState<number | null>(null);
+  const [createCustomerSearch, setCreateCustomerSearch] = useState('');
   const linkSearchRef = useRef<ReturnType<typeof setTimeout>>(undefined);
 
   const currency = getCurrencySymbol(currentTenant?.currency || 'INR', getCountryByCode(currentTenant?.country ?? 'IN')?.locale);
+  const unitAdapter = useCurrencyUnitAdapter();
+  const normalizedDiscountValue = discountModal?.type === 'amount'
+    ? normalizeFixedDiscountValue(discountModal.value, unitAdapter.maxDecimals)
+    : discountModal?.value ?? 0;
   const fmt = useFormatCurrency();
-  const isOwnerOrManager = currentTenant?.role === 'owner' || currentTenant?.role === 'manager';
+  const isOwnerOrManager = hasRole(currentTenant?.role, ROLE_ACCESS.ownerManager);
 
   if (discountModal && !isDiscountTypeAllowed(discountMode, discountModal.type)) {
     setDiscountModal({
@@ -468,12 +482,7 @@ export default function OrdersPage() {
     }
   };
 
-  // A prepaid order is marked 'completed' the moment its bill is fully paid,
-  // which can happen before the kitchen has prepared anything (payment and
-  // kitchen fulfillment are independent and can finish in either order) — so
-  // a completed order still counts as "active" if the kitchen hasn't served
-  // all of its items yet. Only applies when this business uses KDS; without
-  // it item status is never updated, so it can't be used as a signal.
+  // Completed prepaid orders remain active while unserved kitchen items exist (when KDS enabled).
   const isOrderActive = (order: Order) => {
     if (order.status === 'cancelled') return false;
     if (order.status === 'completed') {
@@ -485,9 +494,7 @@ export default function OrdersPage() {
   const filteredOrders = orders.filter((order) => {
     // Tab filter
     if (tabFilter === 'active' && !isOrderActive(order)) return false;
-    // An order without a bill has not been paid yet. Bills are deliberately
-    // generated only when checkout starts, so filtering on bill existence
-    // hid otherwise payable orders from the Unpaid tab.
+    // Filter unpaid orders using resolved payment status since bills are generated at checkout.
     if (tabFilter === 'unpaid' && !['unpaid', 'partial'].includes(paymentStatusOf(order) || '')) return false;
 
     // Search by order number
@@ -551,9 +558,12 @@ export default function OrdersPage() {
           { isReprint: false }
         );
         showPrintWarningsToast(printWarnings);
-        await api.post(`/bills/${bill.id}/print`, { print_type: 'receipt' });
-      } catch {
-        toast.error(tOrders('receiptPrintFailedHint'));
+        try {
+          await api.post(`/bills/${bill.id}/print`, { print_type: 'receipt' });
+        } catch { /* best-effort history tracking */ }
+      } catch (err) {
+        const msg = extractPrinterErrorMessage(err);
+        toast.error(formatReceiptErrorToast(msg, tOrders('receiptPrintFailedHint')));
       }
     }
   };
@@ -584,12 +594,15 @@ export default function OrdersPage() {
         },
         { isReprint }
       );
-      await api.post(`/bills/${billId}/print`, { print_type: isReprint ? 'reprint' : 'receipt' });
       toast.success(isReprint ? tOrders('printReceiptReprint') : tOrders('printReceipt'));
       showPrintWarningsToast(printWarnings);
-      fetchPrintHistory(billId);
-    } catch {
-      toast.error(tOrders('printReceiptFailed'));
+      try {
+        await api.post(`/bills/${billId}/print`, { print_type: isReprint ? 'reprint' : 'receipt' });
+        fetchPrintHistory(billId);
+      } catch { /* best-effort history tracking */ }
+    } catch (err) {
+      const detail = extractPrinterErrorMessage(err);
+      toast.error(formatReceiptErrorToast(detail, tOrders('printReceiptFailed')));
     } finally {
       setPrintingBillId(null);
       setConfirmPrintBillId(null);
@@ -670,7 +683,7 @@ export default function OrdersPage() {
     }
   };
 
-  const handleWhatsAppShare = (order: Order) => {
+  const handleWhatsAppShare = async (order: Order) => {
     if (!order.bill) {
       toast.error(tOrders('billNotFound'));
       return;
@@ -681,8 +694,8 @@ export default function OrdersPage() {
     }
 
     try {
-      shareBillViaWhatsApp(
-        order.bill,
+      const opened = await shareBillViaWhatsApp(
+        { ...order.bill, order },
         { phone: order.customer.phone, country_code: order.customer.country_code },
         {
           business_name: currentTenant?.business_name || tCommon('businessNameFallback'),
@@ -692,6 +705,7 @@ export default function OrdersPage() {
         { pointsEarned: order.bill.points_earned ?? 0 },
         locale,
       );
+      if (!opened) toast.error(tOrders('whatsappFailed'));
     } catch {
       toast.error(tOrders('whatsappFailed'));
     }
@@ -709,7 +723,7 @@ export default function OrdersPage() {
     setSendingWaOrderId(order.id);
     try {
       await sendBillViaFlo(
-        order.bill,
+        { ...order.bill, order },
         order.customer.phone,
         {
           business_name: currentTenant?.business_name || tCommon('businessNameFallback'),
@@ -728,12 +742,17 @@ export default function OrdersPage() {
   const handleApplyDiscount = async () => {
     if (!discountModal) return;
 
+    if (discountModal.type === 'amount' && discountModal.value > 0 && normalizedDiscountValue <= 0) {
+      toast.error(tOrders('discountFailed'));
+      return;
+    }
+
     // Check if PIN is required
-    if (discountRequiresApproval && discountModal.value > 0 && !discountPin) {
+    if (discountRequiresApproval && normalizedDiscountValue > 0 && !discountPin) {
       toast.error(tOrders('managerPinRequired'));
       return;
     }
-    if (discountModal.value > 0 && !isDiscountTypeAllowed(discountMode, discountModal.type)) {
+    if (normalizedDiscountValue > 0 && !isDiscountTypeAllowed(discountMode, discountModal.type)) {
       toast.error(tOrders('discountFailed'));
       return;
     }
@@ -741,9 +760,9 @@ export default function OrdersPage() {
     try {
       await api.patch(`/orders/${discountModal.order.id}/discount`, {
         discount_type: discountModal.type,
-        discount_value: discountModal.value,
+        discount_value: normalizedDiscountValue,
         discount_reason: discountModal.reason || undefined,
-        override_pin: discountRequiresApproval && discountModal.value > 0 ? discountPin : undefined,
+        override_pin: discountRequiresApproval && normalizedDiscountValue > 0 ? discountPin : undefined,
       });
       toast.success(tOrders('discountApplied'));
       fetchOrders();
@@ -788,26 +807,50 @@ export default function OrdersPage() {
   }, [addItemsOrder, tOrders]);
 
   const handleAddItemToSelection = (product: Product) => {
+    if ((product.addon_groups || []).length > 0) {
+      setAddonPickerProduct(product);
+      return;
+    }
     setSelectedItems(prev => {
-      const existing = prev.find(i => i.product_id === product.id);
+      const existing = prev.find(i => i.product_id === product.id && i.addons.length === 0);
       if (existing) {
-        return prev.map(i => i.product_id === product.id ? { ...i, quantity: i.quantity + 1 } : i);
+        return prev.map(i => i === existing ? { ...i, quantity: i.quantity + 1 } : i);
       }
-      return [...prev, { product_id: product.id, product_name: product.name, quantity: 1, special_instructions: '' }];
+      const key = typeof globalThis.crypto?.randomUUID === 'function'
+        ? globalThis.crypto.randomUUID()
+        : `item-${prev.length}-${Math.random().toString(36).slice(2)}`;
+      return [...prev, { key, product_id: product.id, product_name: product.name, quantity: 1, special_instructions: '', addons: [] }];
     });
   };
 
-  const handleRemoveFromSelection = (productId: string) => {
-    setSelectedItems(prev => prev.filter(i => i.product_id !== productId));
+  const handleAddonPickerAdd = (product: Product, quantity: number, addons: Addon[], instructions: string) => {
+    setSelectedItems(prev => {
+      const key = typeof globalThis.crypto?.randomUUID === 'function'
+        ? globalThis.crypto.randomUUID()
+        : `item-${prev.length}-${Math.random().toString(36).slice(2)}`;
+      return [...prev, {
+        key,
+        product_id: product.id,
+        product_name: product.name,
+        quantity,
+        special_instructions: instructions,
+        addons,
+      }];
+    });
+    setAddonPickerProduct(null);
   };
 
-  const handleUpdateSelectionQty = (productId: string, quantity: number) => {
+  const handleRemoveFromSelection = (key: string) => {
+    setSelectedItems(prev => prev.filter(i => i.key !== key));
+  };
+
+  const handleUpdateSelectionQty = (key: string, quantity: number) => {
     if (quantity < 1) return;
-    setSelectedItems(prev => prev.map(i => i.product_id === productId ? { ...i, quantity } : i));
+    setSelectedItems(prev => prev.map(i => i.key === key ? { ...i, quantity } : i));
   };
 
-  const handleUpdateSelectionNotes = (productId: string, notes: string) => {
-    setSelectedItems(prev => prev.map(i => i.product_id === productId ? { ...i, special_instructions: notes } : i));
+  const handleUpdateSelectionNotes = (key: string, notes: string) => {
+    setSelectedItems(prev => prev.map(i => i.key === key ? { ...i, special_instructions: notes } : i));
   };
 
   const handleSubmitAddItems = async () => {
@@ -818,6 +861,9 @@ export default function OrdersPage() {
         product_id: i.product_id,
         quantity: i.quantity,
         special_instructions: i.special_instructions || undefined,
+        addons: i.addons.length > 0
+          ? i.addons.map((a) => ({ id: a.id, name: a.name, price: a.price, quantity: a.quantity || 1 }))
+          : undefined,
       }));
       const fingerprint = buildAppendItemsFingerprint(addItemsOrder.id, items);
       const storage = getAppendAttemptStorage();
@@ -886,7 +932,7 @@ export default function OrdersPage() {
     <div className="flex flex-col h-[calc(100vh-4rem)]">
       {/* Header */}
       <div className="flex items-center justify-between mb-4">
-        <h1 className="text-2xl font-bold text-gray-900">{tNav('orders')}</h1>
+        <h1 className="text-2xl font-bold text-foreground">{tNav('orders')}</h1>
         <div className="flex gap-2">
           {(['all', 'active', 'unpaid', 'held'] as FilterType[]).map((f) => (
             <button
@@ -895,7 +941,7 @@ export default function OrdersPage() {
               className={`px-4 py-1.5 rounded-lg text-sm font-medium ${
                 tabFilter === f
                   ? 'bg-brand text-white'
-                  : 'bg-white text-gray-600 border border-gray-200 hover:border-gray-400'
+                  : 'bg-card text-muted-foreground border border-border hover:border-gray-400'
               }`}
             >
               {tOrders(tabLabelKey[f])}
@@ -914,7 +960,7 @@ export default function OrdersPage() {
             placeholder={tOrders('search')}
             value={filters.search}
             onChange={(e) => setFilters(prev => ({ ...prev, search: e.target.value }))}
-            className="w-full ps-9 pe-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-brand/30 focus:border-brand bg-white"
+            className="w-full ps-9 pe-3 py-2 border border-border bg-card rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-brand/30 focus:border-brand"
           />
         </div>
 
@@ -966,27 +1012,27 @@ export default function OrdersPage() {
         ) : (
           <div className="flex-1 overflow-y-auto grid grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3 gap-4 content-start items-start auto-rows-max">
             {Object.values(heldOrdersStore.orders).map((heldOrder) => (
-              <div key={heldOrder.tableId} className="bg-white rounded-xl border border-blue-200 overflow-hidden flex flex-col shadow-sm hover:shadow-md transition-shadow">
-                 <div className="p-4 border-b border-gray-100 bg-blue-50/50 flex justify-between items-center">
+              <div key={heldOrder.tableId} className="bg-card rounded-xl border border-blue-200 overflow-hidden flex flex-col shadow-sm hover:shadow-md transition-shadow">
+                 <div className="p-4 border-b border-border bg-blue-50/50 flex justify-between items-center">
                    <div>
-                     <p className="font-bold text-gray-900">{tables.find(t => t.id === heldOrder.tableId)?.name || tCommon('tableFallback')}</p>
-                     <p className="text-xs text-gray-500">{formatTime(heldOrder.heldAt)}</p>
+                     <p className="font-bold text-foreground">{tables.find(t => t.id === heldOrder.tableId)?.name || tCommon('tableFallback')}</p>
+                     <p className="text-xs text-muted-foreground">{formatTime(heldOrder.heldAt)}</p>
                    </div>
                    <span className="bg-blue-100 text-blue-700 text-xs px-2 py-1 rounded-full font-bold tracking-wide">{tOrders('held')}</span>
                  </div>
                  <div className="p-4 flex-1">
                    {heldOrder.items.map((item, idx) => (
-                     <div key={idx} className="flex justify-between text-sm py-1 text-gray-700">
+                     <div key={idx} className="flex justify-between text-sm py-1 text-foreground">
                        <span>{item.quantity}x {item.product.name}</span>
                      </div>
                    ))}
                    {heldOrder.orderNotes && (
-                     <div className="mt-3 text-sm italic text-gray-500 bg-gray-50 p-2 rounded-lg">
+                     <div className="mt-3 text-sm italic text-muted-foreground bg-muted p-2 rounded-lg">
                        &quot;{heldOrder.orderNotes}&quot;
                      </div>
                    )}
                  </div>
-                 <div className="p-4 bg-gray-50 border-t border-gray-100 flex gap-2">
+                 <div className="p-4 bg-muted border-t border-border flex gap-2">
                     <Button onClick={async () => {
                       try {
                         const held = await heldOrdersStore.restoreOrder(heldOrder.tableId);
@@ -1047,18 +1093,18 @@ export default function OrdersPage() {
             return (
               <div
                 key={order.id}
-                className={`bg-white rounded-xl border overflow-hidden flex flex-col ${
-                  order.status === 'cancelled' ? 'border-red-200 opacity-75' : 'border-gray-100'
+                className={`bg-card rounded-xl border overflow-hidden flex flex-col ${
+                  order.status === 'cancelled' ? 'border-red-200 opacity-75' : 'border-border'
                 }`}
               >
                 {/* Top bar: order id/status on the left, payment badge + reprint on the right */}
-                <div className="flex items-center justify-between gap-2 px-4 py-3 bg-gray-50 border-b border-gray-100">
+                <div className="flex items-center justify-between gap-2 px-4 py-3 bg-muted border-b border-border">
                   <div className="flex items-center gap-2 flex-wrap min-w-0">
-                    <span className="font-bold text-gray-900">#<Ltr>{order.order_number}</Ltr></span>
+                    <span className="font-bold text-foreground">#<Ltr>{order.order_number}</Ltr></span>
                     {(() => { const badge = orderStatusBadge[order.status]; return badge ? (
                       <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${badge.bg} ${badge.text}`}>{tOrders(badge.labelKey)}</span>
                     ) : null; })()}
-                    <span className="text-sm text-gray-500 capitalize">{tOrders(ORDER_TYPE_KEYS[order.type])}</span>
+                    <span className="text-sm text-muted-foreground capitalize">{tOrders(ORDER_TYPE_KEYS[order.type])}</span>
                     {order.table && (
                       <span className="text-sm text-orange-600 font-medium">{order.table.name}</span>
                     )}
@@ -1087,7 +1133,7 @@ export default function OrdersPage() {
                       <button
                         onClick={() => setConfirmPrintBillId(order.bill!.id)}
                         disabled={printingBillId === order.bill.id}
-                        className="p-1.5 rounded-lg border border-gray-200 text-gray-600 hover:bg-gray-100 disabled:opacity-50 transition-colors"
+                        className="p-1.5 rounded-lg border border-border text-muted-foreground hover:bg-muted disabled:opacity-50 transition-colors"
                         title={(printHistory[order.bill.id]?.length ?? 0) > 0 ? tCommon('reprint') : tCommon('print')}
                       >
                         <Printer size={14} />
@@ -1098,8 +1144,8 @@ export default function OrdersPage() {
 
                 {/* Order notes */}
                 {order.special_instructions && (
-                  <div className="px-4 py-2 bg-amber-50 border-b border-amber-100">
-                    <p className="text-sm text-amber-700 font-medium break-words">
+                  <div className="px-4 py-2 bg-amber-50 dark:bg-amber-950/40 border-b border-amber-100 dark:border-amber-800/40">
+                    <p className="text-sm text-amber-700 dark:text-amber-300 font-medium break-words">
                       📝 {order.special_instructions}
                     </p>
                   </div>
@@ -1107,24 +1153,24 @@ export default function OrdersPage() {
 
                 {/* Customer info strip */}
                 {order.customer ? (
-                  <div className="px-4 py-2 bg-blue-50 border-b border-blue-100 flex items-center justify-between">
+                  <div className="px-4 py-2 bg-blue-50 dark:bg-blue-950/40 border-b border-blue-100 dark:border-blue-800/40 flex items-center justify-between">
                     <div className="flex items-center gap-2 min-w-0">
-                      <User size={14} className="text-blue-600 shrink-0" />
-                      <span className="text-sm font-medium text-blue-800 truncate">{order.customer.name}</span>
+                      <User size={14} className="text-blue-600 dark:text-blue-400 shrink-0" />
+                      <span className="text-sm font-medium text-blue-800 dark:text-blue-300 truncate">{order.customer.name}</span>
                       {order.customer.phone && (
-                        <span className="text-xs text-blue-600 shrink-0"><Ltr>{order.customer.phone}</Ltr></span>
+                        <span className="text-xs text-blue-600 dark:text-blue-400 shrink-0"><Ltr>{order.customer.phone}</Ltr></span>
                       )}
                     </div>
                     <button
                       onClick={() => handleCreateNewOrderForCustomer(order)}
-                      className="flex items-center gap-1 text-xs font-semibold text-blue-700 hover:text-blue-900 bg-blue-100 hover:bg-blue-200 px-2.5 py-1 rounded-lg transition-colors shrink-0"
+                      className="flex items-center gap-1 text-xs font-semibold text-blue-700 dark:text-blue-300 hover:text-blue-900 dark:hover:text-blue-200 bg-blue-100 dark:bg-blue-950/40 hover:bg-blue-200 dark:hover:bg-blue-900/60 px-2.5 py-1 rounded-lg transition-colors shrink-0"
                       title={tOrders('startNewOrderForCustomer')}
                     >
                       <Plus size={12} /> {tOrders('newOrder')}
                     </button>
                   </div>
                 ) : isOwnerOrManager && !['completed', 'cancelled'].includes(order.status) ? (
-                  <div className="px-4 py-2 bg-gray-50 border-b border-gray-100">
+                  <div className="px-4 py-2 bg-muted border-b border-border">
                     {linkCustomerOrderId === order.id ? (
                       <div className="flex items-center gap-2">
                         <input
@@ -1144,7 +1190,7 @@ export default function OrdersPage() {
                             setLinkCustomerSearch('');
                             setLinkCustomerResults([]);
                           }}
-                          className="text-gray-400 hover:text-gray-600"
+                          className="text-gray-400 hover:text-muted-foreground"
                         >
                           <XCircle size={16} />
                         </button>
@@ -1152,30 +1198,44 @@ export default function OrdersPage() {
                     ) : (
                       <button
                         onClick={() => setLinkCustomerOrderId(order.id)}
-                        className="flex items-center gap-1.5 text-sm text-gray-500 hover:text-blue-600 transition-colors"
+                        className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-blue-600 transition-colors"
                       >
                         <UserPlus size={14} />
                         {tOrders('linkCustomer')}
                       </button>
                     )}
-                    {linkCustomerOrderId === order.id && linkCustomerResults.length > 0 && (
+                    {linkCustomerOrderId === order.id && (
                       <div className="mt-2 space-y-1">
                         {linkCustomerResults.map((customer) => (
                           <button
                             key={customer.id}
                             onClick={() => handleLinkCustomer(order.id, String(customer.id))}
                             disabled={linkingCustomer}
-                            className="w-full flex items-center justify-between px-3 py-2 bg-white rounded-lg border border-gray-200 hover:border-blue-300 hover:bg-blue-50 transition-colors text-start disabled:opacity-50"
+                            className="w-full flex items-center justify-between px-3 py-2 bg-card rounded-lg border border-border hover:border-blue-300 hover:bg-blue-50 transition-colors text-start disabled:opacity-50"
                           >
                             <div>
-                              <span className="text-sm font-medium text-gray-900">{customer.name}</span>
+                              <span className="text-sm font-medium text-foreground">{customer.name}</span>
                               {customer.phone && (
-                                <span className="text-xs text-gray-500 ms-2"><Ltr>{customer.phone}</Ltr></span>
+                                <span className="text-xs text-muted-foreground ms-2"><Ltr>{customer.phone}</Ltr></span>
                               )}
                             </div>
                             {linkingCustomer && <span className="text-xs text-gray-400">{tOrders('linking')}</span>}
                           </button>
                         ))}
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setCreateCustomerSearch(linkCustomerSearch);
+                            setCreateCustomerOrderId(order.id);
+                          }}
+                          disabled={linkingCustomer}
+                          className="w-full flex items-center gap-1.5 px-3 py-2 text-sm text-blue-600 bg-card hover:bg-blue-50 rounded-lg border border-dashed border-blue-300 transition-colors font-medium text-start disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          <Plus size={15} />
+                          {linkCustomerSearch.trim()
+                            ? `${tPos('addCustomer')} "${linkCustomerSearch.trim()}"`
+                            : tPos('addCustomer')}
+                        </button>
                       </div>
                     )}
                   </div>
@@ -1194,13 +1254,13 @@ export default function OrdersPage() {
                               <span className={`text-sm font-medium ${config.color}`}>
                                 {item.quantity}x
                               </span>
-                              <span className="text-sm text-gray-900 truncate">{item.product_name}</span>
+                              <span className="text-sm text-foreground truncate">{item.product_name}</span>
                               {item.special_instructions && (
                                 <span className="text-xs text-red-500 italic break-words">&quot;{item.special_instructions}&quot;</span>
                               )}
                             </div>
                             <div className="flex items-center gap-2">
-                              <span className="text-sm text-gray-600">{fmt(Number(item.total))}</span>
+                              <span className="text-sm text-muted-foreground">{fmt(Number(item.total))}</span>
                               {item.status === 'pending' && isOwnerOrManager && !paid && (
                                 <button
                                   onClick={() => deleteItem(order.id, item.id)}
@@ -1236,10 +1296,10 @@ export default function OrdersPage() {
                   </div>
 
                   {/* Bill summary */}
-                  <div className="mt-3 pt-3 border-t border-dashed border-gray-200 space-y-1">
+                  <div className="mt-3 pt-3 border-t border-dashed border-border space-y-1">
                     <div className="flex justify-between text-sm">
-                      <span className="text-gray-500">{tCommon('subtotal')}</span>
-                      <span className="text-gray-700">{fmt(subtotal)}</span>
+                      <span className="text-muted-foreground">{tCommon('subtotal')}</span>
+                      <span className="text-foreground">{fmt(subtotal)}</span>
                     </div>
                     {discount > 0 && (
                       <div className="flex justify-between text-sm">
@@ -1249,16 +1309,16 @@ export default function OrdersPage() {
                     )}
                     {tax > 0 && (
                       <div className="flex justify-between text-sm">
-                        <span className="text-gray-500">{tCommon('tax')}</span>
-                        <span className="text-gray-700">{fmt(tax)}</span>
+                        <span className="text-muted-foreground">{tCommon('tax')}</span>
+                        <span className="text-foreground">{fmt(tax)}</span>
                       </div>
                     )}
-                    <div className="flex justify-between text-base font-bold pt-1 border-t border-gray-100">
-                      <span className="text-gray-900">{tCommon('total')}</span>
-                      <span className="text-gray-900">{fmt(total)}</span>
+                    <div className="flex justify-between text-base font-bold pt-1 border-t border-border">
+                      <span className="text-foreground">{tCommon('total')}</span>
+                      <span className="text-foreground">{fmt(total)}</span>
                     </div>
                     {bill && payStatus === 'partial' && (
-                      <div className="flex justify-between text-xs text-gray-500 pt-0.5">
+                      <div className="flex justify-between text-xs text-muted-foreground pt-0.5">
                         <span>{tOrders('paid')} {fmt(Number(bill.paid_amount))}</span>
                         <span>{tOrders('balance')} {fmt(Number(bill.balance))}</span>
                       </div>
@@ -1291,12 +1351,12 @@ export default function OrdersPage() {
                   )}
 
                   {order.bill && printHistory[order.bill.id]?.length > 0 && (
-                    <div className="mt-3 pt-3 border-t border-gray-100">
+                    <div className="mt-3 pt-3 border-t border-border">
                       <button
                         onClick={() => {
                           setPrintHistoryExpanded(prev => ({ ...prev, [order.bill!.id]: !prev[order.bill!.id] }));
                         }}
-                        className="flex items-center gap-1 text-sm text-gray-500 hover:text-gray-700"
+                        className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground"
                       >
                         {printHistoryExpanded[order.bill!.id] ? <ChevronDown size={14} /> : <ChevronRight size={14} className="rtl-flip" />}
                         {tOrders('printHistory')}
@@ -1305,7 +1365,7 @@ export default function OrdersPage() {
                       {printHistoryExpanded[order.bill!.id] && (
                         <div className="mt-2 ps-4 space-y-1">
                           {printHistory[order.bill!.id].map((print, index) => (
-                            <div key={print.id} className="text-xs text-gray-500">
+                            <div key={print.id} className="text-xs text-muted-foreground">
                               {index + 1}. {tOrders('printHistoryEntry', { printedType: print.print_type === 'reprint' ? tOrders('reprint') : tOrders('printed'), user: print.user_name, time: formatDateTime(print.printed_at) })}
                             </div>
                           ))}
@@ -1316,7 +1376,7 @@ export default function OrdersPage() {
                 </div>
 
                 {/* Footer with actions */}
-                <div className="px-4 py-3 border-t border-gray-100 flex flex-wrap gap-2">
+                <div className="px-4 py-3 border-t border-border flex flex-wrap gap-2">
                     {showCheckout(order) && (
                       <Button
                         onClick={() => handleCheckout(order.id)}
@@ -1392,11 +1452,11 @@ export default function OrdersPage() {
       {/* Print Confirmation Modal */}
       {confirmPrintBillId !== null && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-          <div className="bg-white rounded-xl shadow-xl p-6 w-full max-w-sm mx-4">
-            <h2 className="text-lg font-bold text-gray-900 mb-2">
+          <div className="bg-card rounded-xl shadow-xl p-6 w-full max-w-sm mx-4">
+            <h2 className="text-lg font-bold text-foreground mb-2">
               {(printHistory[confirmPrintBillId]?.length ?? 0) > 0 ? tOrders('reprintReceiptTitle') : tOrders('printReceiptTitle')}
             </h2>
-            <p className="text-sm text-gray-600 mb-6">
+            <p className="text-sm text-muted-foreground mb-6">
               {(printHistory[confirmPrintBillId]?.length ?? 0) > 0
                 ? tOrders('reprintReceiptWarning')
                 : tOrders('printReceiptConfirm')}
@@ -1442,12 +1502,12 @@ export default function OrdersPage() {
       {/* Cancel Order Modal */}
       {cancelModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-          <div className="bg-white rounded-xl shadow-xl p-6 w-full max-w-sm mx-4">
-            <h2 className="text-lg font-bold text-gray-900 mb-4">{tOrders('cancel')} #<Ltr>{cancelModal.order.order_number}</Ltr></h2>
+          <div className="bg-card rounded-xl shadow-xl p-6 w-full max-w-sm mx-4">
+            <h2 className="text-lg font-bold text-foreground mb-4">{tOrders('cancel')} #<Ltr>{cancelModal.order.order_number}</Ltr></h2>
 
             <div className="space-y-4">
               <div>
-                <label htmlFor="cancelReason" className="block text-sm font-medium text-gray-700 mb-1">
+                <label htmlFor="cancelReason" className="block text-sm font-medium text-foreground mb-1">
                   {tCommon('reasonOptional')}
                 </label>
                 <input
@@ -1469,7 +1529,7 @@ export default function OrdersPage() {
                     onChange={(e) => updateCancelModal({ freeTable: e.target.checked })}
                     className="h-4 w-4 rounded border-gray-300 text-red-600 focus:ring-red-500"
                   />
-                  <label htmlFor="freeTable" className="text-sm text-gray-700">
+                  <label htmlFor="freeTable" className="text-sm text-foreground">
                     {tOrders('freeTable', { name: cancelModal.order.table.name })}
                   </label>
                 </div>
@@ -1477,7 +1537,7 @@ export default function OrdersPage() {
 
               {(cancelModal.order.status !== 'pending' || cancelModal.order.items?.some((i) => ['preparing', 'ready', 'served', 'completed'].includes(i.status))) && (
                 <div>
-                  <label htmlFor="overridePin" className="block text-sm font-medium text-gray-700 mb-1">
+                  <label htmlFor="overridePin" className="block text-sm font-medium text-foreground mb-1">
                     {tOrders('overridePinLabel')}
                   </label>
                   <input
@@ -1516,12 +1576,12 @@ placeholder={tOrders('managerPin')}
       {/* Void In-Progress Item Modal */}
       {voidItemModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-          <div className="bg-white rounded-xl shadow-xl p-6 w-full max-w-sm mx-4">
-            <h2 className="text-lg font-bold text-gray-900 mb-1">{tOrders('voidItem')}</h2>
-            <p className="text-sm text-gray-500 mb-4">{tOrders('voidItemConfirm', { name: voidItemModal.productName })}</p>
+          <div className="bg-card rounded-xl shadow-xl p-6 w-full max-w-sm mx-4">
+            <h2 className="text-lg font-bold text-foreground mb-1">{tOrders('voidItem')}</h2>
+            <p className="text-sm text-muted-foreground mb-4">{tOrders('voidItemConfirm', { name: voidItemModal.productName })}</p>
 
             <div>
-              <label htmlFor="voidOverridePin" className="block text-sm font-medium text-gray-700 mb-1">
+              <label htmlFor="voidOverridePin" className="block text-sm font-medium text-foreground mb-1">
                 {tOrders('overridePinLabel')}
               </label>
               <input
@@ -1559,19 +1619,19 @@ placeholder={tOrders('managerPin')}
       {/* Discount Modal */}
       {discountModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-          <div className="bg-white rounded-xl shadow-xl p-6 w-full max-w-sm mx-4">
-            <h2 className="text-lg font-bold text-gray-900 mb-4">{tOrders('applyDiscountTitle', { number: discountModal.order.order_number })}</h2>
+          <div className="bg-card rounded-xl shadow-xl p-6 w-full max-w-sm mx-4">
+            <h2 className="text-lg font-bold text-foreground mb-4">{tOrders('applyDiscountTitle', { number: discountModal.order.order_number })}</h2>
 
             <div className="space-y-4">
               {/* Discount Type Toggle */}
-              <div className="flex rounded-lg overflow-hidden border border-gray-200">
+              <div className="flex rounded-lg overflow-hidden border border-border">
                 {isDiscountTypeAllowed(discountMode, 'percentage') && (
                   <button
                     onClick={() => updateDiscountModal({ type: 'percentage', value: 0 })}
                     className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-sm font-medium transition-colors ${
                       discountModal.type === 'percentage'
                         ? 'bg-purple-600 text-white'
-                        : 'bg-gray-50 text-gray-600 hover:bg-gray-100'
+                        : 'bg-muted text-muted-foreground hover:bg-muted'
                     }`}
                   >
                     <Percent size={14} />
@@ -1584,7 +1644,7 @@ placeholder={tOrders('managerPin')}
                     className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-sm font-medium transition-colors ${
                       discountModal.type === 'amount'
                         ? 'bg-purple-600 text-white'
-                        : 'bg-gray-50 text-gray-600 hover:bg-gray-100'
+                        : 'bg-muted text-muted-foreground hover:bg-muted'
                     }`}
                   >
                     <Banknote size={14} />
@@ -1595,7 +1655,7 @@ placeholder={tOrders('managerPin')}
 
               {/* Discount Value */}
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
+                <label className="block text-sm font-medium text-foreground mb-1">
                   {discountModal.type === 'percentage' ? tOrders('discountPercentageLabel') : tOrders('discountAmountLabel')}
                 </label>
                 <div className="relative">
@@ -1606,10 +1666,10 @@ placeholder={tOrders('managerPin')}
                     type="number"
                     min={0}
                     max={discountModal.type === 'percentage' ? 100 : Number(discountModal.order.total)}
-                    step={discountModal.type === 'percentage' ? 1 : 0.01}
+                    step={getDiscountInputStep(unitAdapter.maxDecimals, discountModal.type)}
                     value={discountModal.value || ''}
                     onChange={(e) => updateDiscountModal({ value: Number(e.target.value) })}
-                    placeholder={discountModal.type === 'percentage' ? '0' : '0.00'}
+                    placeholder={discountModal.type === 'percentage' ? '0' : unitAdapter.formatInput(0)}
                     className="w-full ps-8 pe-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent"
                   />
                 </div>
@@ -1617,7 +1677,7 @@ placeholder={tOrders('managerPin')}
 
               {/* Discount Reason */}
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
+                <label className="block text-sm font-medium text-foreground mb-1">
                   {tCommon('reasonOptional')}
                 </label>
                 <input
@@ -1630,14 +1690,14 @@ placeholder={tOrders('managerPin')}
               </div>
 
               {/* Preview */}
-              <div className="bg-gray-50 rounded-lg p-3 space-y-1.5">
+              <div className="bg-muted rounded-lg p-3 space-y-1.5">
                 <div className="flex justify-between text-sm">
-                  <span className="text-gray-500">{tCommon('subtotal')}</span>
-                  <span className="text-gray-900">{fmt(Number(discountModal.order.subtotal))}</span>
+                  <span className="text-muted-foreground">{tCommon('subtotal')}</span>
+                  <span className="text-foreground">{fmt(Number(discountModal.order.subtotal))}</span>
                 </div>
                 <div className="flex justify-between text-sm">
-                  <span className="text-gray-500">{tCommon('tax')}</span>
-                  <span className="text-gray-900">{fmt(Number(discountModal.order.tax_amount || 0))}</span>
+                  <span className="text-muted-foreground">{tCommon('tax')}</span>
+                  <span className="text-foreground">{fmt(Number(discountModal.order.tax_amount || 0))}</span>
                 </div>
                 <div className="flex justify-between text-sm">
                   <span className="text-purple-600">
@@ -1650,17 +1710,17 @@ placeholder={tOrders('managerPin')}
                     -{fmt(
                       discountModal.type === 'percentage'
                         ? Number(discountModal.order.subtotal) * discountModal.value / 100
-                        : Number(discountModal.value)
+                        : normalizedDiscountValue
                     )}
                   </span>
                 </div>
-                <div className="border-t border-gray-200 pt-1.5 flex justify-between text-sm font-bold">
-                  <span className="text-gray-900">{tOrders('newTotal')}</span>
-                  <span className="text-gray-900">
+                <div className="border-t border-border pt-1.5 flex justify-between text-sm font-bold">
+                  <span className="text-foreground">{tOrders('newTotal')}</span>
+                  <span className="text-foreground">
                     {fmt(
                       discountModal.type === 'percentage'
                         ? Number(discountModal.order.subtotal) * (1 - discountModal.value / 100) + Number(discountModal.order.tax_amount || 0)
-                        : Number(discountModal.order.subtotal) - Number(discountModal.value) + Number(discountModal.order.tax_amount || 0)
+                        : Number(discountModal.order.subtotal) - normalizedDiscountValue + Number(discountModal.order.tax_amount || 0)
                     )}
                   </span>
                 </div>
@@ -1669,7 +1729,7 @@ placeholder={tOrders('managerPin')}
 
             {discountRequiresApproval && discountModal.value > 0 && (
               <div className="mt-4">
-                <label className="block text-sm font-medium text-gray-700 mb-1">{tOrders('managerPinLabel')}</label>
+                <label className="block text-sm font-medium text-foreground mb-1">{tOrders('managerPinLabel')}</label>
                 <input
                   type="password"
                   value={discountPin}
@@ -1706,8 +1766,8 @@ placeholder={tOrders('managerPin')}
       {/* Add Item Modal */}
       {addItemsOrder && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-          <div className="bg-white rounded-xl shadow-xl p-6 w-full max-w-lg mx-4 max-h-[80vh] flex flex-col">
-            <h2 className="text-lg font-bold text-gray-900 mb-4">{tOrders('addItems')} #<Ltr>{addItemsOrder.order_number}</Ltr></h2>
+          <div className="bg-card rounded-xl shadow-xl p-6 w-full max-w-lg mx-4 max-h-[80vh] flex flex-col">
+            <h2 className="text-lg font-bold text-foreground mb-4">{tOrders('addItems')} #<Ltr>{addItemsOrder.order_number}</Ltr></h2>
 
             {/* Search */}
             <div className="relative mb-3">
@@ -1717,24 +1777,24 @@ placeholder={tOrders('managerPin')}
                 placeholder={tOrders('searchMenu')}
                 value={productSearch}
                 onChange={(e) => setProductSearch(e.target.value)}
-                className="w-full ps-9 pe-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent"
+                className="w-full ps-9 pe-3 py-2 border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent"
               />
             </div>
 
             {/* Product list */}
-            <div className="flex-1 overflow-y-auto border border-gray-200 rounded-lg mb-3 max-h-48">
+            <div className="flex-1 overflow-y-auto border border-border rounded-lg mb-3 max-h-48">
               {products
                 .filter(p => !productSearch || p.name.toLowerCase().includes(productSearch.toLowerCase()))
                 .map((product: Product) => (
                   <button
                     key={product.id}
                     onClick={() => handleAddItemToSelection(product)}
-                    className="w-full flex items-center justify-between px-3 py-2 hover:bg-green-50 text-start border-b border-gray-50 last:border-0 transition-colors"
+                    className="w-full flex items-center justify-between px-3 py-2 hover:bg-green-50 dark:hover:bg-green-950/40 text-start border-b border-gray-50 last:border-0 transition-colors"
                   >
                     <div>
-                      <span className="text-sm font-medium text-gray-900">{product.name}</span>
+                      <span className="text-sm font-medium text-foreground">{product.name}</span>
                       {product.price && (
-                        <span className="text-xs text-gray-500 ms-2">{fmt(Number(product.price))}</span>
+                        <span className="text-xs text-muted-foreground ms-2">{fmt(Number(product.price))}</span>
                       )}
                     </div>
                     <Plus size={14} className="text-green-500" />
@@ -1749,33 +1809,38 @@ placeholder={tOrders('managerPin')}
             {/* Selected items */}
             {selectedItems.length > 0 && (
               <div className="space-y-2 mb-3">
-                <p className="text-xs font-medium text-gray-500 uppercase">{tOrders('selectedItems')}</p>
+                <p className="text-xs font-medium text-muted-foreground uppercase">{tOrders('selectedItems')}</p>
                 {selectedItems.map(item => (
-                  <div key={item.product_id} className="flex items-center gap-2 bg-gray-50 rounded-lg p-2">
+                  <div key={item.key} className="flex items-center gap-2 bg-muted rounded-lg p-2">
                     <div className="flex-1 min-w-0">
-                      <span className="text-sm font-medium text-gray-900 truncate block">{item.product_name}</span>
+                      <span className="text-sm font-medium text-foreground truncate block">{item.product_name}</span>
+                      {item.addons.length > 0 && (
+                        <span className="text-xs text-muted-foreground truncate block">
+                          {item.addons.map((a) => a.name).join(', ')}
+                        </span>
+                      )}
                       <input
                         type="text"
                         placeholder={tOrders('notesOptional')}
                         value={item.special_instructions}
                         maxLength={100}
-                        onChange={(e) => handleUpdateSelectionNotes(item.product_id, e.target.value.slice(0, 100))}
-                        className="w-full text-xs text-gray-500 bg-transparent border-0 p-0 focus:outline-none placeholder:text-gray-300"
+                        onChange={(e) => handleUpdateSelectionNotes(item.key, e.target.value.slice(0, 100))}
+                        className="w-full text-xs text-muted-foreground bg-transparent border-0 p-0 focus:outline-none placeholder:text-gray-300"
                       />
                     </div>
                     <div className="flex items-center gap-1">
                       <button
-                        onClick={() => handleUpdateSelectionQty(item.product_id, item.quantity - 1)}
-                        className="w-6 h-6 rounded bg-gray-200 text-gray-600 text-xs hover:bg-gray-300"
+                        onClick={() => handleUpdateSelectionQty(item.key, item.quantity - 1)}
+                        className="w-6 h-6 rounded bg-gray-200 text-muted-foreground text-xs hover:bg-gray-300"
                       >-</button>
                       <span className="w-6 text-center text-sm font-medium">{item.quantity}</span>
                       <button
-                        onClick={() => handleUpdateSelectionQty(item.product_id, item.quantity + 1)}
-                        className="w-6 h-6 rounded bg-gray-200 text-gray-600 text-xs hover:bg-gray-300"
+                        onClick={() => handleUpdateSelectionQty(item.key, item.quantity + 1)}
+                        className="w-6 h-6 rounded bg-gray-200 text-muted-foreground text-xs hover:bg-gray-300"
                       >+</button>
                     </div>
                     <button
-                      onClick={() => handleRemoveFromSelection(item.product_id)}
+                      onClick={() => handleRemoveFromSelection(item.key)}
                       className="p-1 rounded hover:bg-red-50 text-red-400 hover:text-red-600"
                     >
                       <Trash2 size={14} />
@@ -1786,7 +1851,7 @@ placeholder={tOrders('managerPin')}
             )}
 
             {/* Actions */}
-            <div className="flex justify-end gap-2 pt-2 border-t border-gray-100">
+            <div className="flex justify-end gap-2 pt-2 border-t border-border">
               <Button
                 variant="outline"
                 size="sm"
@@ -1806,6 +1871,29 @@ placeholder={tOrders('managerPin')}
             </div>
           </div>
         </div>
+      )}
+      {addonPickerProduct && (
+        <AddonModal
+          product={addonPickerProduct}
+          currency={currency}
+          onAdd={handleAddonPickerAdd}
+          onClose={() => setAddonPickerProduct(null)}
+        />
+      )}
+      {createCustomerOrderId !== null && (
+        <CreateCustomerModal
+          initialSearch={createCustomerSearch}
+          onClose={() => {
+            setCreateCustomerOrderId(null);
+            setCreateCustomerSearch('');
+          }}
+          onCreated={async (newCustomer) => {
+            const orderId = createCustomerOrderId;
+            setCreateCustomerOrderId(null);
+            setCreateCustomerSearch('');
+            await handleLinkCustomer(orderId, String(newCustomer.id));
+          }}
+        />
       )}
       {ConfirmDialog}
     </div>

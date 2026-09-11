@@ -3,7 +3,8 @@ import { randomUUID, createHash, type KeyLike } from 'crypto';
 import Decimal from 'decimal.js';
 import { getDatabase, getSettingValue, now, upsertSettings, withTxn } from '../db';
 import { requireRole } from '../middleware/security';
-import { TaxEngine } from '../services/tax-engine';
+import { ROLE_ACCESS } from '../../shared/role-permissions';
+import { applyPayableRounding, TaxEngine } from '../services/tax-engine';
 import { resolveTaxIdFormat } from '../services/tax';
 import type { CountryPack, PluginPrintTemplate, TaxBehavior, TaxCategory, TaxRule } from '../tax-packs/types';
 import { BUNDLED_COUNTRY_PACKS } from '../tax-packs/bundled';
@@ -17,21 +18,11 @@ import {
 import { TRUSTED_TAX_PACK_SIGNING_PUBLIC_KEY } from '../tax-packs/trusted-signing-key';
 import { asyncHandler } from '../middleware/async-handler';
 import { getHttpRequestSignal } from '../shutdown';
+import { getCurrencyFractionDigits } from '../countries';
 
 const router = Router();
 const BUNDLED_PACKS_BY_ID = new Map(BUNDLED_COUNTRY_PACKS.map((pack) => [pack.id, pack]));
-// India and Thailand were bundled unsigned before country packs moved to the
-// signed release catalog. Existing customer databases still contain those
-// exact artifacts. Rather than keep the original tax-rate content in the
-// repo just to re-check it byte-for-byte, we keep only the SHA-256 digest of
-// that exact historical JSON (sha256(JSON.stringify(pack))) — enough to keep
-// validating those specific already-installed rows as trusted, without the
-// underlying tax content living in source. Exported so tests can inject a
-// synthetic id/digest pair instead of depending on real pack content.
-// 'official-in'/'official-th' are the pre-rename ids used before commit
-// 3a75876 renamed them to 'official-india'/'official-thailand'; stores that
-// installed taxes before that rename still carry the old id in their DB and
-// must keep validating too.
+// SHA-256 digests of historical unbundled/renamed India and Thailand packs.
 export const LEGACY_TRUSTED_PACK_DIGESTS: Record<string, string> = {
   'official-india': '873e8212625d5eefc4192bf99bcebece107cd2384ce8a1c6ecd44a7095082f2d',
   'official-thailand': '25f4082e56372599e90cad6222a493c426f7846552e00ccf486a71e7aa90d656',
@@ -51,6 +42,8 @@ interface PackRow {
   jurisdiction: string;
   active_version_id: string | null;
   status: string;
+  disclaimer_acknowledged_at: string | null;
+  disclaimer_acknowledged_by: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -81,11 +74,36 @@ function actorUserId(req: Request): string | null {
   return (req as any).user?.userId || (req as any).user?.id || null;
 }
 
-function activateInstalledPack(pack: PackRow, version: VersionRow, actorId: string | null): void {
+interface ActivateOptions {
+  acknowledgeCommunityDisclaimer?: boolean;
+}
+
+// Thrown when community tax pack requires disclaimer acknowledgment before activation.
+class DisclaimerRequiredError extends Error {
+  statusCode = 428;
+  requiresDisclaimer = true as const;
+  sourceType = 'community' as const;
+  constructor(public packId: string, public version: string) {
+    super('Community tax pack requires disclaimer acknowledgment before activation');
+  }
+}
+
+function activateInstalledPack(
+  pack: PackRow,
+  version: VersionRow,
+  actorId: string | null,
+  options: ActivateOptions = {},
+): void {
   const db = getDatabase();
   const validation = validationChecklist(version);
   if (!validation.valid) {
     throw Object.assign(new Error('Tax pack failed activation validation'), { statusCode: 400 });
+  }
+  const definition = JSON.parse(version.pack_json) as CountryPack;
+  const alreadyAcknowledged = Boolean(pack.disclaimer_acknowledged_at);
+  const isCommunityPack = definition.sourceType === 'community';
+  if (isCommunityPack && !alreadyAcknowledged && !options.acknowledgeCommunityDisclaimer) {
+    throw new DisclaimerRequiredError(pack.id, version.version);
   }
   const previousVersionId = pack.active_version_id;
   withTxn(() => {
@@ -96,6 +114,11 @@ function activateInstalledPack(pack: PackRow, version: VersionRow, actorId: stri
       db.prepare(`UPDATE tax_overrides SET pack_version_id = ?, updated_at = ? WHERE pack_version_id = ?`)
         .run(version.id, now(), previousVersionId);
     }
+    if (isCommunityPack && !alreadyAcknowledged) {
+      db.prepare(`
+        UPDATE country_packs SET disclaimer_acknowledged_at = ?, disclaimer_acknowledged_by = ? WHERE id = ?
+      `).run(now(), actorId, pack.id);
+    }
     db.prepare(`UPDATE country_packs SET active_version_id = ?, status = 'active', updated_at = ? WHERE id = ?`)
       .run(version.id, now(), pack.id);
     db.prepare(`UPDATE country_pack_versions SET status = 'active' WHERE id = ?`).run(version.id);
@@ -105,7 +128,11 @@ function activateInstalledPack(pack: PackRow, version: VersionRow, actorId: stri
       WHERE pack_id IN (SELECT id FROM country_packs WHERE country = ?)
     `).run(pack.country);
     db.prepare(`UPDATE installed_print_templates SET status = 'active' WHERE pack_version_id = ?`).run(version.id);
-    audit('activate_pack', actorId, pack.id, version.id, null, { previousVersionId, automatic: true });
+    audit('activate_pack', actorId, pack.id, version.id, null, {
+      previousVersionId,
+      automatic: true,
+      ...(isCommunityPack ? { sourceType: 'community', disclaimerAcknowledged: true } : {}),
+    });
   });
 }
 
@@ -130,13 +157,7 @@ function persistPackArtifacts(
   persistPackContent(version, definition, installedAt, printTemplates);
 }
 
-// Re-derivable content for a version row that already exists in
-// country_pack_versions: categories, rules, and bundled print templates.
-// Split out from persistPackArtifacts so reinstallPackVersion can clear and
-// re-run just this part for a version whose row is present but whose
-// dependent rows (most commonly installed_print_templates, e.g. after a
-// restored/desynced database) went missing without needing to fight the
-// (pack_id, version) UNIQUE constraint on country_pack_versions.
+// Persists re-derivable categories, rules, and print templates for an existing version row.
 function persistPackContent(
   version: VersionRow,
   definition: CountryPack,
@@ -227,6 +248,8 @@ function activePackForCountry(country: string): { pack: PackRow; version: Versio
       jurisdiction: row.jurisdiction,
       active_version_id: row.active_version_id,
       status: row.status,
+      disclaimer_acknowledged_at: row.disclaimer_acknowledged_at,
+      disclaimer_acknowledged_by: row.disclaimer_acknowledged_by,
       created_at: row.created_at,
       updated_at: row.updated_at,
     },
@@ -339,10 +362,7 @@ function containsUnsafeData(value: unknown): boolean {
   return false;
 }
 
-// Pack-agnostic activation vector: verifies self-consistency of the engine's
-// output against the PACK'S OWN declared data (never a hardcoded expected
-// rate keyed by a known pack id), so this works identically for the bundled
-// packs and for any legitimately new pack installed from the signed catalog.
+// Pack-agnostic activation vector checking engine self-consistency against declared data.
 function activationVectorPasses(pack: CountryPack): boolean {
   const primaryCategory = pack.categories[0];
   if (!primaryCategory) return false;
@@ -369,10 +389,7 @@ function activationVectorPasses(pack: CountryPack): boolean {
   const taxAmount = new Decimal(intra.taxAmount);
   const payableTotal = new Decimal(intra.payableTotal);
   if (!taxAmount.isFinite() || taxAmount.isNegative()) return false;
-  // A category that DECLARES rules but produces zero applied components is a
-  // real bug signature (e.g. a broken bidirectional category<->rule link).
-  // A category with no declared rules at all (a blank manual/local template)
-  // legitimately produces zero tax -- that is not a failure.
+  // Fail if rules are declared on the category but produce no tax components.
   if (primaryCategory.ruleIds.length > 0 && line.components.length === 0 && line.taxBehavior !== 'exempt') {
     return false;
   }
@@ -557,14 +574,7 @@ export function validationChecklist(
   const stableIds = !activePack
     || (activePack.categories.every((category) => categoryIds.includes(category.id))
       && activePack.rules.every((rule) => ruleIds.includes(rule.id)));
-  // Official packs must keep category/rule IDs stable across versions so
-  // overrides never silently orphan (spec: "removed or renamed rules require
-  // explicit resolution"). A local/manual pack is edited by re-submitting the
-  // owner's full category list each time, so renaming or deleting a category
-  // is a normal, expected edit there — the manual-config route (routes/
-  // tax-packs.ts) handles that case itself by reassigning affected products/
-  // add-ons to the new default and reporting what moved, so this check is
-  // informational only for local packs rather than a hard block.
+  // Official packs require stable IDs; local packs handle renames dynamically on save.
   add(19, stableIds || pack.publisher === 'local', 'Existing IDs remain available, so override aliases are not required');
   const activeVersion = getDatabase().prepare(
     'SELECT active_version_id FROM country_packs WHERE id = ?'
@@ -575,12 +585,7 @@ export function validationChecklist(
     WHERE pack_version_id = ?
       AND json_extract(value_json, '$.categoryId') NOT IN (${categoryIds.map(() => '?').join(',') || "''"})
   `).get(activeVersion.active_version_id, ...categoryIds) as { count: number } : { count: 0 };
-  // Same local-pack carve-out as check 19, and for the same reason: this
-  // check runs before the manual-config route's withTxn block, which is
-  // exactly what remaps every stale override to the new default category
-  // for a local pack. Leaving this a hard block here would reject the save
-  // before that remap ever gets a chance to run, making it impossible to
-  // ever rename/remove a manual category that any override still targets.
+  // Overrides must resolve against new version; manual configs remap stale overrides in-txn.
   add(20, overrideConflicts.count === 0 || pack.publisher === 'local',
     'Every current merchant override resolves against this version');
   add(21, pack.categories.every((category) => Boolean(category.label))
@@ -598,17 +603,12 @@ export function validationChecklist(
     if (registrationFormatValid) {
       try { new RegExp(pattern, 'i'); } catch { registrationFormatValid = false; }
     }
-    // A syntactically valid pattern can still be catastrophically slow: the
-    // Settings page runs this pattern against the Tax ID field on every
-    // keystroke (frontend length-bounds the tested value as a backstop, see
-    // TAX_ID_WARNING_MAX_LENGTH), so a pack that ships a classic nested-
-    // quantifier shape — (x+)+, (x*)+, (x+b+)*, etc. — must never activate.
-    // This is a known-shape heuristic, not a formal safety proof (full ReDoS
-    // detection is undecidable in general); it catches the textbook case a
-    // trusted publisher could ship by mistake.
+    // ReDoS safety check: reject nested-quantifier regex patterns like (x+)+.
     if (registrationFormatValid && /\([^()]*[+*][^()]*\)[+*]/.test(pattern)) registrationFormatValid = false;
   }
   add(25, registrationFormatValid, 'Registration-number format, if declared, is a well-formed, non-catastrophic pattern and description');
+  add(26, pack.publisher !== 'local' || !pack.sourceType || pack.sourceType === 'official',
+    'A local/manual pack never declares a community sourceType');
   return { valid: checks.every((check) => check.passed), checks };
 }
 
@@ -776,7 +776,7 @@ export async function reinstallPackVersion(
   };
 }
 
-router.get('/', requireRole('owner', 'manager'), (_req: Request, res: Response) => {
+router.get('/', requireRole(...ROLE_ACCESS.ownerManager), (_req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const storeCountry = getSettingValue('country') || 'IN';
@@ -809,7 +809,7 @@ router.get('/', requireRole('owner', 'manager'), (_req: Request, res: Response) 
   }
 });
 
-router.get('/audit', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.get('/audit', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
     const rows = getDatabase().prepare(`
@@ -830,7 +830,7 @@ router.get('/audit', requireRole('owner', 'manager'), (req: Request, res: Respon
   }
 });
 
-router.get('/catalog', requireRole('owner', 'manager'), asyncHandler(async (req: Request, res: Response) => {
+router.get('/catalog', requireRole(...ROLE_ACCESS.ownerManager), asyncHandler(async (req: Request, res: Response) => {
   try {
     const remote = await fetchRemoteTaxPackCatalog(fetch, getHttpRequestSignal(req));
     const installedRows = getDatabase().prepare(
@@ -849,7 +849,7 @@ router.get('/catalog', requireRole('owner', 'manager'), asyncHandler(async (req:
   }
 }));
 
-router.get('/updates', requireRole('owner', 'manager'), asyncHandler(async (req: Request, res: Response) => {
+router.get('/updates', requireRole(...ROLE_ACCESS.ownerManager), asyncHandler(async (req: Request, res: Response) => {
   try {
     const remote = await fetchRemoteTaxPackCatalog(fetch, getHttpRequestSignal(req));
     const installedRows = getDatabase().prepare(`
@@ -873,7 +873,7 @@ router.get('/updates', requireRole('owner', 'manager'), asyncHandler(async (req:
 
 // Merchant-facing path: resolve the selected country without exposing the
 // catalog or allowing manual selection of a different country's plugin.
-router.post('/ensure-country', requireRole('owner', 'manager'), asyncHandler(async (req: Request, res: Response) => {
+router.post('/ensure-country', requireRole(...ROLE_ACCESS.ownerManager), asyncHandler(async (req: Request, res: Response) => {
   try {
     const country = String(req.body?.country || getSettingValue('country') || '').toUpperCase();
     if (!/^[A-Z]{2}$/.test(country)) return res.status(400).json({ error: 'Invalid country' });
@@ -904,11 +904,25 @@ router.post('/ensure-country', requireRole('owner', 'manager'), asyncHandler(asy
       version = db.prepare('SELECT * FROM country_pack_versions WHERE id = ?').get(installed.versionId) as VersionRow;
     }
     if (!pack || !version) throw new Error('Installed tax pack could not be loaded');
-    activateInstalledPack(pack, version, actorUserId(req));
+    try {
+      activateInstalledPack(pack, version, actorUserId(req), {
+        acknowledgeCommunityDisclaimer: req.body?.acknowledge_community_disclaimer === true,
+      });
+    } catch (error) {
+      if (error instanceof DisclaimerRequiredError) {
+        return res.json({
+          enabled: false,
+          requires_disclaimer: true,
+          source_type: 'community',
+          country,
+          pack_id: error.packId,
+          version: error.version,
+        });
+      }
+      throw error;
+    }
     const definition = JSON.parse(version.pack_json) as CountryPack;
-    // Enabling taxes should work immediately for a normal merchant. Existing
-    // explicit assignments are preserved; only previously unclassified rows
-    // receive the official country defaults.
+    // Assigns official country defaults to unclassified products and add-ons.
     withTxn(() => {
       db.prepare(`UPDATE products SET tax_category_id = ?, updated_at = ? WHERE tax_category_id IS NULL AND deleted_at IS NULL`)
         .run(definition.defaultCategories.product, now());
@@ -929,17 +943,9 @@ router.post('/ensure-country', requireRole('owner', 'manager'), asyncHandler(asy
   }
 }));
 
-// Manual tax builder: an owner-authored local pack for countries with no
-// official plugin (or to override one). Flat only, by design — no interstate
-// or business-type conditions, no compounding. A tax category is a bucket of
-// N independently-labeled components (e.g. "Standard" -> Tax 1 2.5% + Tax 2
-// 2.5%) that all apply together whenever that category is selected; see
-// resolveTaxCategory/calculateRawLine in services/tax-engine.ts, which
-// already sums every matching rule's component with no changes needed here.
+// Generates URL-safe, unique tax identifiers for categories and rules.
 export function slugifyTaxId(label: string, used: Set<string>, fallback: string): string {
-  // Strip leading/trailing underscores with a single linear scan instead of an
-  // underscore regex like /^_+|_+$/g (or its unanchored /_+$/ form), which
-  // backtracks super-linearly on `_`-heavy input (CodeQL js/polynomial-redos).
+  // Strip leading/trailing underscores using linear scan to prevent polynomial ReDoS.
   let base = String(label || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '_');
   let start = 0;
   while (start < base.length && base[start] === '_') start += 1;
@@ -1029,18 +1035,11 @@ function buildManualPack(body: any, country: string, currency: string): CountryP
     packaging: resolveDefault('packaging charges', body?.packagingCategoryTempId),
     delivery: resolveDefault('delivery charges', body?.deliveryCategoryTempId),
     service_charge: resolveDefault('service charges', body?.serviceChargeCategoryTempId),
-    // An add-on is never its own taxable line — calculateItemTax folds its
-    // price into the parent item's subtotal before tax runs (services/tax.ts),
-    // so it is always taxed at the item's rate. `defaultCategories.addon`
-    // only exists because the pack schema requires every TaxLineKind to
-    // resolve to *some* category; mirroring the product default keeps that
-    // requirement satisfied without implying a separate add-on rate exists.
+    // Mirror product default to satisfy schema (add-ons are taxed at parent item rate).
     addon: productCategoryId,
   };
 
-  // A hidden zero-rate category always exists so unclassifiedCategoryId
-  // resolves without asking the owner to reason about a bucket that (per
-  // resolveTaxCategory in tax-engine.ts) only applies when nothing else does.
+  // Hidden zero-rate fallback for unclassified line items.
   const unclassifiedId = slugifyTaxId('unclassified', usedCategoryIds, 'unclassified');
   categories.push({ id: unclassifiedId, label: 'Unclassified', ruleIds: [] });
 
@@ -1068,7 +1067,7 @@ function buildManualPack(body: any, country: string, currency: string): CountryP
   };
 }
 
-router.post('/manual-config', requireRole('owner'), (req: Request, res: Response) => {
+router.post('/manual-config', requireRole(...ROLE_ACCESS.owner), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const country = String(getSettingValue('country') || '').toUpperCase();
@@ -1133,11 +1132,7 @@ router.post('/manual-config', requireRole('owner'), (req: Request, res: Response
       const packRow = db.prepare('SELECT * FROM country_packs WHERE id = ?').get(pack.id) as PackRow;
       activateInstalledPack(packRow, version, actorUserId(req));
 
-      // A category the owner removed or renamed in this edit can no longer be
-      // resolved by the engine (calculateRawLine throws on an unknown
-      // category), so checkout would 400 on every line still pointing at it.
-      // Reassign those rows to the new default and report the count instead
-      // of leaving products silently broken.
+      // Reassign products and add-ons pointing to removed/renamed categories to the new default.
       const categoryIds = pack.categories.map((category) => category.id);
       const placeholders = categoryIds.map(() => '?').join(',');
       const staleProducts = db.prepare(
@@ -1153,16 +1148,7 @@ router.post('/manual-config', requireRole('owner'), (req: Request, res: Response
         `UPDATE addons SET tax_category_id = ? WHERE tax_category_id IS NULL OR tax_category_id NOT IN (${placeholders})`
       ).run(pack.defaultCategories.addon, ...categoryIds);
 
-      // Merchant overrides (product/addon-specific, plus store-wide
-      // packaging/delivery/service_charge picks) are a second, independent
-      // place a removed category id can hide — activateInstalledPack() above
-      // already moved every override's pack_version_id onto this new
-      // version, but never inspected value_json.categoryId itself. Left
-      // alone, resolveTaxCategory (tax-engine.ts) still returns the deleted
-      // id for any line that hits an override, and calculateRawLine throws
-      // "resolved unknown tax category" — checkout rejects an otherwise
-      // valid line. Same policy as products/addons above: reassign to the
-      // new pack's default category for that entity type.
+      // Reassign merchant overrides referencing removed categories to the new defaults.
       const overrideDefaultByEntity: Record<OverrideEntityType, string> = {
         product: pack.defaultCategories.product,
         addon: pack.defaultCategories.addon,
@@ -1209,7 +1195,7 @@ router.post('/manual-config', requireRole('owner'), (req: Request, res: Response
   }
 });
 
-router.post('/catalog/install', requireRole('owner'), asyncHandler(async (req: Request, res: Response) => {
+router.post('/catalog/install', requireRole(...ROLE_ACCESS.owner), asyncHandler(async (req: Request, res: Response) => {
   try {
     const packId = typeof req.body.pack_id === 'string' ? req.body.pack_id : '';
     const version = typeof req.body.version === 'string' ? req.body.version : '';
@@ -1233,7 +1219,7 @@ router.post('/catalog/install', requireRole('owner'), asyncHandler(async (req: R
   }
 }));
 
-router.post('/test-calculation', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.post('/test-calculation', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const { category_id, amount, tax_behavior } = req.body;
     const amountDecimal = new Decimal(String(amount));
@@ -1244,12 +1230,14 @@ router.post('/test-calculation', requireRole('owner', 'manager'), (req: Request,
       return res.status(400).json({ error: `tax_behavior must be one of: ${TAX_BEHAVIORS.join(', ')}` });
     }
     const country = getSettingValue('country') || 'IN';
+    const currency = getSettingValue('currency') || 'INR';
     const active = activePackForCountry(country);
     if (!active.definition.categories.some((category) => category.id === category_id)) {
       return res.status(400).json({ error: 'Unknown category for the active pack' });
     }
     const calculation = TaxEngine.calculate({
       pack: active.definition,
+      currency,
       country,
       jurisdiction: active.definition.jurisdiction,
       businessType: getSettingValue('business_type') || 'restaurant',
@@ -1264,15 +1252,22 @@ router.post('/test-calculation', requireRole('owner', 'manager'), (req: Request,
         taxBehavior: tax_behavior || 'country_default',
       }],
     });
+    const payableRounding = applyPayableRounding(
+      Number(calculation.totalBeforePayableRounding),
+      active.definition,
+      currency,
+    );
     res.json({
       pack_id: active.pack.id,
       pack_version_id: active.version.id,
       pack_version: active.version.version,
       calculation: {
         ...calculation,
+        payableTotal: String(payableRounding.total),
+        payableRoundingAdjustment: String(payableRounding.adjustment),
         taxableBase: calculation.lines
           .reduce((sum, line) => sum.plus(line.taxableBase), new Decimal(0))
-          .toFixed(active.definition.taxRounding.decimalPlaces),
+          .toFixed(getCurrencyFractionDigits(currency)),
       },
     });
   } catch (error: any) {
@@ -1281,7 +1276,7 @@ router.post('/test-calculation', requireRole('owner', 'manager'), (req: Request,
   }
 });
 
-router.post('/overrides', requireRole('owner'), (req: Request, res: Response) => {
+router.post('/overrides', requireRole(...ROLE_ACCESS.owner), (req: Request, res: Response) => {
   try {
     const country = getSettingValue('country') || 'IN';
     const active = activePackForCountry(country);
@@ -1325,7 +1320,7 @@ router.post('/overrides', requireRole('owner'), (req: Request, res: Response) =>
   }
 });
 
-router.put('/overrides/:overrideId', requireRole('owner'), (req: Request, res: Response) => {
+router.put('/overrides/:overrideId', requireRole(...ROLE_ACCESS.owner), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const existing = db.prepare('SELECT * FROM tax_overrides WHERE id = ?').get(req.params.overrideId) as any;
@@ -1382,7 +1377,7 @@ router.put('/overrides/:overrideId', requireRole('owner'), (req: Request, res: R
   }
 });
 
-router.delete('/overrides/:overrideId', requireRole('owner'), (req: Request, res: Response) => {
+router.delete('/overrides/:overrideId', requireRole(...ROLE_ACCESS.owner), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const existing = db.prepare(`
@@ -1408,7 +1403,7 @@ router.delete('/overrides/:overrideId', requireRole('owner'), (req: Request, res
   }
 });
 
-router.post('/:packId/versions/:versionId/activate', requireRole('owner'), (req: Request, res: Response) => {
+router.post('/:packId/versions/:versionId/activate', requireRole(...ROLE_ACCESS.owner), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const pack = db.prepare('SELECT * FROM country_packs WHERE id = ?').get(req.params.packId) as PackRow | undefined;
@@ -1423,30 +1418,22 @@ router.post('/:packId/versions/:versionId/activate', requireRole('owner'), (req:
     if (!validation.valid) {
       return res.status(400).json({ error: 'Pack version failed activation validation', validation });
     }
-    const previousVersionId = pack.active_version_id;
-    withTxn(() => {
-      db.prepare(
-        `UPDATE country_packs SET status = 'installed', updated_at = ? WHERE country = ? AND id != ?`
-      ).run(now(), pack.country, pack.id);
-      if (previousVersionId) {
-        db.prepare(`UPDATE country_pack_versions SET status = 'installed' WHERE id = ?`).run(previousVersionId);
-        db.prepare(`
-          UPDATE tax_overrides SET pack_version_id = ?, updated_at = ?
-          WHERE pack_version_id = ?
-        `).run(version.id, now(), previousVersionId);
+    try {
+      activateInstalledPack(pack, version, actorUserId(req), {
+        acknowledgeCommunityDisclaimer: req.body?.acknowledge_community_disclaimer === true,
+      });
+    } catch (error) {
+      if (error instanceof DisclaimerRequiredError) {
+        return res.json({
+          changed: false,
+          requires_disclaimer: true,
+          source_type: 'community',
+          pack_id: error.packId,
+          version: error.version,
+        });
       }
-      db.prepare(`
-        UPDATE country_packs SET active_version_id = ?, status = 'active', updated_at = ? WHERE id = ?
-      `).run(version.id, now(), pack.id);
-      db.prepare(`UPDATE country_pack_versions SET status = 'active' WHERE id = ?`).run(version.id);
-      db.prepare(`
-        UPDATE installed_print_templates
-        SET status = 'installed'
-        WHERE pack_id IN (SELECT id FROM country_packs WHERE country = ?)
-      `).run(pack.country);
-      db.prepare(`UPDATE installed_print_templates SET status = 'active' WHERE pack_version_id = ?`).run(version.id);
-      audit('activate_pack', actorUserId(req), pack.id, version.id, null, { previousVersionId });
-    });
+      throw error;
+    }
     res.json({ changed: true, active_version_id: version.id, validation });
   } catch (error: any) {
     console.error('[Tax Packs] Activation failed:', error);
@@ -1454,13 +1441,8 @@ router.post('/:packId/versions/:versionId/activate', requireRole('owner'), (req:
   }
 });
 
-// Re-downloads an already-installed version and re-derives its categories,
-// rules, and bundled print templates in place. Repairs a pack that shows as
-// installed/active but is missing dependent rows (most visibly, its billing
-// template not appearing under Printers > Bill Template) — e.g. after a
-// database restore or an interrupted prior install — without needing to
-// bump the version number, which the normal install path requires.
-router.post('/:packId/versions/:versionId/reinstall', requireRole('owner'), asyncHandler(async (req: Request, res: Response) => {
+// Re-downloads and repairs dependent rows (categories, rules, print templates) in place.
+router.post('/:packId/versions/:versionId/reinstall', requireRole(...ROLE_ACCESS.owner), asyncHandler(async (req: Request, res: Response) => {
   try {
     const requestSignal = getHttpRequestSignal(req);
     const result = await reinstallPackVersion(String(req.params.packId), String(req.params.versionId), {
@@ -1477,7 +1459,7 @@ router.post('/:packId/versions/:versionId/reinstall', requireRole('owner'), asyn
   }
 }));
 
-router.post('/:packId/rollback', requireRole('owner'), (req: Request, res: Response) => {
+router.post('/:packId/rollback', requireRole(...ROLE_ACCESS.owner), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const pack = db.prepare('SELECT * FROM country_packs WHERE id = ?').get(req.params.packId) as PackRow | undefined;
@@ -1518,7 +1500,7 @@ router.post('/:packId/rollback', requireRole('owner'), (req: Request, res: Respo
   }
 });
 
-router.get('/:packId', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+router.get('/:packId', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const pack = db.prepare('SELECT * FROM country_packs WHERE id = ?').get(req.params.packId) as PackRow | undefined;

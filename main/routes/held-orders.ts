@@ -2,8 +2,9 @@ import { Router, Request, Response } from 'express';
 import expressRateLimit from 'express-rate-limit';
 import { getDatabase, now, withTxn } from '../db';
 import { requireRole } from '../middleware/security';
+import { ROLE_ACCESS } from '../../shared/role-permissions';
 import { randomUUID } from 'crypto';
-import { validateItemNotes, validateOrderNotes } from './orders-validation';
+import { validateItemNotes, validateOrderNotes, validateProductQuantity } from './orders-validation';
 
 const router = Router();
 const heldOrderReadRateLimit = expressRateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: true, legacyHeaders: false });
@@ -42,8 +43,15 @@ function validateHeldOrderItem(item: unknown, db: any): void {
   if (!isRecord(item.product) || !isValidIdentifier(item.product.id)) {
     throw new Error('Each held-order item must have a valid product');
   }
-  if (!Number.isSafeInteger(item.quantity) || item.quantity <= 0) {
-    throw new Error('Each held-order item must have a positive integer quantity');
+  if (typeof item.quantity !== 'number' || !Number.isFinite(item.quantity) || item.quantity <= 0) {
+    throw new Error('Each held-order item must have a positive quantity');
+  }
+  if (!Number.isInteger(item.quantity)) {
+    const product = db.prepare(
+      'SELECT name, sale_unit, allow_fractional_quantity, weight_precision FROM products WHERE id = ? AND deleted_at IS NULL'
+    ).get(item.product.id) as any;
+    if (!product) throw new Error('Fractional held-order items must reference a catalog product');
+    validateProductQuantity(product, item.quantity);
   }
   if (!Array.isArray(item.addons) || item.addons.some((addon: unknown) => !isRecord(addon) || !isValidIdentifier(addon.id))) {
     throw new Error('Held-order item addons must be an array of valid addons');
@@ -111,7 +119,7 @@ function parseStoredHeldOrder(row: HeldOrderRow): Record<string, unknown> | null
   }
 }
 
-router.get('/', heldOrderReadRateLimit, requireRole('owner', 'manager', 'cashier', 'server'), (req: Request, res: Response) => {
+router.get('/', heldOrderReadRateLimit, requireRole(...ROLE_ACCESS.sales), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const rows = db.prepare('SELECT * FROM held_orders ORDER BY updated_at DESC').all() as HeldOrderRow[];
@@ -132,7 +140,7 @@ router.get('/', heldOrderReadRateLimit, requireRole('owner', 'manager', 'cashier
   }
 });
 
-router.post('/', heldOrderWriteRateLimit, requireRole('owner', 'manager', 'cashier', 'server'), (req: Request, res: Response) => {
+router.post('/', heldOrderWriteRateLimit, requireRole(...ROLE_ACCESS.sales), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     let input;
@@ -164,10 +172,7 @@ router.post('/', heldOrderWriteRateLimit, requireRole('owner', 'manager', 'cashi
       db.prepare('UPDATE tables SET status = ?, updated_at = ? WHERE id = ?').run(TABLE_STATUS_HELD, now(), tableId);
     });
 
-    // Returning the current row identity lets a client prove that its cached
-    // snapshot is still the row it is consuming. Replacing a held order gets
-    // a new identity, so an older terminal receives deleted:false instead of
-    // deleting the replacement.
+    // Return held order identity so clients can verify snapshot validity on deletion.
     res.json({ success: true, id: heldOrderId });
   } catch (error: any) {
     console.error("[API] Hold order error:", error);
@@ -175,7 +180,7 @@ router.post('/', heldOrderWriteRateLimit, requireRole('owner', 'manager', 'cashi
   }
 });
 
-router.delete('/:tableId', heldOrderWriteRateLimit, requireRole('owner', 'manager', 'cashier', 'server'), (req: Request, res: Response) => {
+router.delete('/:tableId', heldOrderWriteRateLimit, requireRole(...ROLE_ACCESS.sales), (req: Request, res: Response) => {
   try {
     const tableId = req.params.tableId;
     const expectedHeldOrderId = typeof req.query.heldOrderId === 'string' && req.query.heldOrderId.length > 0
@@ -198,9 +203,7 @@ router.delete('/:tableId', heldOrderWriteRateLimit, requireRole('owner', 'manage
       }
     });
 
-    // Deletion is intentionally idempotent. A held order may have been resumed
-    // or deleted by another terminal between the UI's last refresh and this
-    // request; that is already the desired end state, not an application error.
+    // Deletion is idempotent; concurrent resumption or deletion is treated as success.
     res.json({ success: true, deleted });
   } catch (error: any) {
     console.error("[API] Delete held order error:", error);

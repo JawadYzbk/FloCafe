@@ -1,8 +1,7 @@
 import { useTranslations, type AppConfig } from 'use-intl';
 
-// Normalise a raw tag string to its canonical key used in TAG_CONFIG.
-// Handles case, spaces, hyphens, underscores and common spelling variants so
-// that "Non-Veg", "nonveg", "NON VEG", "non_veg" all map to "non_veg".
+// Normalize raw tag strings (case, spacing, separators)
+// to canonical keys used in TAG_CONFIG.
 function normalizeTag(raw: string): string {
   const s = raw.toLowerCase().replace(/[\s\-_]+/g, '');
   if (s === 'nonveg' || s === 'nonvegetarian' || s === 'nonveg.')  return 'non_veg';
@@ -25,20 +24,20 @@ function normalizeTag(raw: string): string {
 // Tag config: known tags get colours, unknown tags get a neutral style
 const TAG_CONFIG: Record<string, { color: string; bg: string; dot: string }> = {
   // Food / dietary
-  veg:           { color: 'text-green-700',   bg: 'bg-green-100',   dot: 'bg-green-600' },
-  vegan:         { color: 'text-emerald-700', bg: 'bg-emerald-100', dot: 'bg-emerald-600' },
-  egg:           { color: 'text-yellow-700',  bg: 'bg-yellow-100',  dot: 'bg-yellow-500' },
-  non_veg:       { color: 'text-red-700',     bg: 'bg-red-100',     dot: 'bg-red-600' },
-  spicy:         { color: 'text-orange-700',  bg: 'bg-orange-100',  dot: 'bg-orange-500' },
-  contains_nuts: { color: 'text-amber-700',   bg: 'bg-amber-100',   dot: 'bg-amber-500' },
-  gluten_free:   { color: 'text-blue-700',    bg: 'bg-blue-100',    dot: 'bg-blue-500' },
-  dairy_free:    { color: 'text-sky-700',     bg: 'bg-sky-100',     dot: 'bg-sky-500' },
+  veg:           { color: 'text-green-700 dark:text-green-300',   bg: 'bg-green-100 dark:bg-green-950/40',   dot: 'bg-green-600 dark:bg-green-400' },
+  vegan:         { color: 'text-emerald-700 dark:text-emerald-300', bg: 'bg-emerald-100 dark:bg-emerald-950/40', dot: 'bg-emerald-600 dark:bg-emerald-400' },
+  egg:           { color: 'text-yellow-700 dark:text-yellow-300',  bg: 'bg-yellow-100 dark:bg-yellow-950/40',  dot: 'bg-yellow-500 dark:bg-yellow-400' },
+  non_veg:       { color: 'text-red-700 dark:text-red-300',     bg: 'bg-red-100 dark:bg-red-950/40',     dot: 'bg-red-600 dark:bg-red-400' },
+  spicy:         { color: 'text-orange-700 dark:text-orange-300',  bg: 'bg-orange-100 dark:bg-orange-950/40',  dot: 'bg-orange-500 dark:bg-orange-400' },
+  contains_nuts: { color: 'text-amber-700 dark:text-amber-300',   bg: 'bg-amber-100 dark:bg-amber-950/40',   dot: 'bg-amber-500 dark:bg-amber-400' },
+  gluten_free:   { color: 'text-blue-700 dark:text-blue-300',    bg: 'bg-blue-100 dark:bg-blue-950/40',    dot: 'bg-blue-500 dark:bg-blue-400' },
+  dairy_free:    { color: 'text-sky-700 dark:text-sky-300',     bg: 'bg-sky-100 dark:bg-sky-950/40',     dot: 'bg-sky-500 dark:bg-sky-400' },
   // Retail / salon
-  new_arrival:    { color: 'text-violet-700', bg: 'bg-violet-100',  dot: 'bg-violet-500' },
-  bestseller:     { color: 'text-pink-700',   bg: 'bg-pink-100',    dot: 'bg-pink-500' },
-  organic:        { color: 'text-lime-700',   bg: 'bg-lime-100',    dot: 'bg-lime-600' },
-  fragrance_free: { color: 'text-teal-700',   bg: 'bg-teal-100',    dot: 'bg-teal-500' },
-  limited:        { color: 'text-rose-700',   bg: 'bg-rose-100',    dot: 'bg-rose-500' },
+  new_arrival:    { color: 'text-violet-700 dark:text-violet-300', bg: 'bg-violet-100 dark:bg-violet-950/40',  dot: 'bg-violet-500 dark:bg-violet-400' },
+  bestseller:     { color: 'text-pink-700 dark:text-pink-300',   bg: 'bg-pink-100 dark:bg-pink-950/40',    dot: 'bg-pink-500 dark:bg-pink-400' },
+  organic:        { color: 'text-lime-700 dark:text-lime-300',   bg: 'bg-lime-100 dark:bg-lime-950/40',    dot: 'bg-lime-600 dark:bg-lime-400' },
+  fragrance_free: { color: 'text-teal-700 dark:text-teal-300',   bg: 'bg-teal-100 dark:bg-teal-950/40',    dot: 'bg-teal-500 dark:bg-teal-400' },
+  limited:        { color: 'text-rose-700 dark:text-rose-300',   bg: 'bg-rose-100 dark:bg-rose-950/40',    dot: 'bg-rose-500 dark:bg-rose-400' },
 };
 
 // Exhaustively typed leaf-key map for known tags (use-intl resolves leaf keys
@@ -90,14 +89,14 @@ export function tagLabel(tag: string): string {
 
 // First tag's bg colour for card background tinting
 export function firstTagBg(tags: string[] | null | undefined): string {
-  if (!tags?.length) return 'bg-gray-100';
-  return TAG_CONFIG[normalizeTag(tags[0])]?.bg ?? 'bg-gray-100';
+  if (!tags?.length) return 'bg-muted';
+  return TAG_CONFIG[normalizeTag(tags[0])]?.bg ?? 'bg-muted';
 }
 
 export default function TagBadge({ tag }: { tag: string }) {
   const t = useTranslations('pos');
   const canonical = normalizeTag(tag);
-  const cfg = TAG_CONFIG[canonical] ?? { color: 'text-gray-600', bg: 'bg-gray-100', dot: 'bg-gray-400' };
+  const cfg = TAG_CONFIG[canonical] ?? { color: 'text-muted-foreground', bg: 'bg-muted', dot: 'bg-gray-400' };
   // Known tags translate through the typed map; custom tags render their
   // formatted name directly without an unchecked runtime translation key.
   const key = (DIETARY_TAG_KEYS as Record<string, PosKey | undefined>)[canonical];

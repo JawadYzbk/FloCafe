@@ -1,13 +1,9 @@
 import { useEffect, useState } from 'react';
-import type { UpdateStatus } from '@/types/electron';
+import type { ElectronActionResult, UpdateStatus } from '@/types/electron';
 import { shouldApplyInitialUpdateStatus } from './update-status-sync';
 
-/**
- * Shared update-status state, backed by the same IPC channels the Settings
- * page and the header badge both need: current app version, the live
- * update-status stream, and the ability to trigger a manual check or restart
- * once a downloaded update is ready to install.
- */
+/** Shared update status hook backed by Electron IPC channels
+ * for version info, status stream, and restart triggers. */
 export function useUpdateStatus() {
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [appVersion, setAppVersion] = useState<string>('');
@@ -18,10 +14,10 @@ export function useUpdateStatus() {
   useEffect(() => {
     if (typeof window === 'undefined' || !window.electronAPI) return;
 
-    // Resolving app info proves we are in the Electron host; deriving
-    // isElectron here (instead of a synchronous effect setState) keeps the
-    // first render stable for SSR/static export.
+    // App info resolution confirms Electron host; keeps initial render
+    // stable for static SSR export.
     window.electronAPI.getAppInfo().then((info) => {
+      if ('error' in info) return;
       setAppVersion(info.version);
       setIsElectron(true);
     });
@@ -30,8 +26,7 @@ export function useUpdateStatus() {
       receivedLiveUpdateStatus = true;
       setUpdateStatus(status);
     });
-    // Seed from the persisted main-process state so reloads recover one-shot
-    // states (store-managed / linux-managed / dev-mode) and failures (#467).
+    // Seed from persisted main-process state so reloads recover status.
     window.electronAPI.getUpdateStatus().then((status) => {
       if (!status || !shouldApplyInitialUpdateStatus(receivedLiveUpdateStatus)) return;
       setUpdateStatus({
@@ -51,10 +46,12 @@ export function useUpdateStatus() {
     }
   };
 
-  const restartAndInstall = () => {
+  // Forwards PIN to main process restart-and-install handler and returns result.
+  const restartAndInstall = (pin?: string) => {
     if (typeof window !== 'undefined' && window.electronAPI) {
-      window.electronAPI.restartAndInstall();
+      return window.electronAPI.restartAndInstall(pin);
     }
+    return Promise.resolve({ success: false, error: 'not-available' } satisfies ElectronActionResult);
   };
 
   return { updateStatus, appVersion, isElectron, checkForUpdates, restartAndInstall };

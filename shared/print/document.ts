@@ -43,9 +43,10 @@ import type {
 // ---------------------------------------------------------------------------
 
 /**
- * Stable concept identifier from the print-label catalog (kernel C, #440).
- * Structural string on purpose: the set of valid concepts is owned by the
- * generated label tables at call sites, not by the kernel.
+ * Stable concept identifier from a print catalog (kernel C, #440).
+ * The shared catalog type is used by generated locale views, while semantic
+ * documents remain structural so legacy/browser-only concepts can cross the
+ * same boundary without a second untyped catalog.
  */
 export type LabelConceptId = string;
 
@@ -93,7 +94,7 @@ export function directionalText(text: string, base: TextDirection): DirectionalT
 // Snapshots (PrintData) — normalized authoritative values, no live rows
 // ---------------------------------------------------------------------------
 
-/** One addon line under an item row. Price is printed truth (0 = unpriced). */
+/** One add-on line; price is the extended printed amount (0 = unpriced). */
 export interface ItemAddonSnapshot {
   readonly name: string;
   readonly price: number;
@@ -117,6 +118,10 @@ export interface OrderSnapshot {
   /** Canonical stored timestamp; renderers localize for presentation. */
   readonly createdAt: string;
   readonly tableName: string;
+  /** Aggregator/web-order platform name (#284), e.g. "Swiggy". Empty when not an online order. */
+  readonly onlinePlatform: string;
+  /** The platform's own order id (#284), printed alongside the online-order banner. */
+  readonly externalOrderId: string;
   readonly items: readonly OrderItemSnapshot[];
 }
 
@@ -148,10 +153,12 @@ export interface BillSnapshot {
   readonly discountAmount: number;
   readonly taxAmount: number;
   readonly total: number;
-  /** Flat service charge, when the bill carries one (frontend bills). */
+  /** Flat service charge, when the server-persisted bill carries one. */
   readonly serviceCharge?: number;
   /** Flat delivery charge, when the bill carries one (frontend bills). */
   readonly deliveryCharge?: number;
+  /** Flat packaging charge, when the bill carries one. */
+  readonly packagingCharge?: number;
   readonly taxComponents: readonly TaxComponentSnapshot[];
   readonly payments: readonly PaymentSnapshot[];
   readonly pointsEarned: number;
@@ -222,7 +229,9 @@ export interface PrintContext {
   readonly baseDirection: TextDirection;
   /** BCP-47 locale used for date/number formatting (e.g. `en-IN`). */
   readonly locale: string;
-  /** Currency symbol as configured for the business. */
+  /** Canonical three-letter tenant currency code used for formatting. KOT rendering does not read this field. */
+  readonly currency: string;
+  /** Currency symbol as configured for the business. KOT rendering does not read this field. */
   readonly currencySymbol: string;
   /** Whether trailing `.00` decimals are trimmed on amounts. */
   readonly trimDecimals: boolean;
@@ -280,7 +289,7 @@ export interface CustomerBlock {
   readonly phoneLabel: SemanticLabel;
 }
 
-/** One addon under an item row. `price === 0` means unpriced extra. */
+/** One add-on under an item row; price is its extended printed amount. */
 export interface ItemAddonValue {
   readonly name: DirectionalText;
   readonly price: number;
@@ -305,6 +314,7 @@ export interface ItemTableRow {
 export interface ItemTableHeaderLabels {
   readonly item: SemanticLabel;
   readonly quantity: SemanticLabel;
+  readonly rate: SemanticLabel;
   readonly amount: SemanticLabel;
 }
 
@@ -325,6 +335,7 @@ export interface ItemTableBlock {
 export interface TaxBreakdownBlock {
   readonly kind: 'tax-breakdown';
   readonly direction: TextDirection;
+  readonly heading: SemanticLabel;
   readonly lines: readonly {
     readonly label: SemanticLabel;
     readonly rate: number | null;
@@ -343,10 +354,12 @@ export interface TotalsBlock {
   readonly discount: { readonly label: SemanticLabel; readonly amount: number } | null;
   /** Flat tax line, present only when no breakdown lines are emitted. */
   readonly tax: { readonly label: SemanticLabel; readonly amount: number } | null;
-  /** Flat service-charge line, present when the snapshot carries a nonzero charge. */
+  /** Flat service-charge line, present when the server snapshot carries a nonzero charge. */
   readonly serviceCharge: { readonly label: SemanticLabel; readonly amount: number } | null;
   /** Flat delivery-charge line, present when the snapshot carries a nonzero charge. */
   readonly deliveryCharge: { readonly label: SemanticLabel; readonly amount: number } | null;
+  /** Flat packaging-charge line, present when the snapshot carries a nonzero charge. */
+  readonly packagingCharge: { readonly label: SemanticLabel; readonly amount: number } | null;
   readonly grandTotal: { readonly label: SemanticLabel; readonly amount: number };
   readonly pointsRedeemed: { readonly label: SemanticLabel; readonly points: number } | null;
   readonly pointsEarned: { readonly label: SemanticLabel; readonly points: number } | null;
@@ -357,6 +370,7 @@ export interface TotalsBlock {
 export interface PaymentsBlock {
   readonly kind: 'payments';
   readonly direction: TextDirection;
+  readonly heading: SemanticLabel;
   readonly lines: readonly {
     /** Raw payment-method code (e.g. `cash`). */
     readonly method: string;
@@ -377,8 +391,15 @@ export interface MessageBlock {
   readonly kind: 'message';
   readonly direction: TextDirection;
   readonly reprintBanner: SemanticLabel | null;
+  /** Online-order banner (#284): present whenever the order carries a platform/external id. */
+  readonly onlineOrderBanner: {
+    readonly label: SemanticLabel;
+    readonly platform: DirectionalText;
+    readonly externalOrderId: DirectionalText;
+  } | null;
   readonly footerNote: DirectionalText | null;
   readonly thankYou: SemanticLabel | null;
+  readonly taxIncluded: SemanticLabel;
 }
 
 /** Ordered union of every PrintDocument v1 block kind. */
@@ -430,6 +451,13 @@ const PAYMENT_METHOD_CONCEPTS: Readonly<Record<string, LabelConceptId>> = Object
   wallet: 'pos.methodWallet',
 });
 
+const KOT_ORDER_TYPE_CONCEPTS: Readonly<Record<string, LabelConceptId>> = Object.freeze({
+  dine_in: 'pos.orderTypeDineIn',
+  delivery: 'pos.orderTypeDelivery',
+  online: 'pos.orderTypeOnline',
+  takeaway: 'pos.orderTypeTakeaway',
+});
+
 function resolveSemanticLabel(labels: LabelContext, conceptId: LabelConceptId): SemanticLabel {
   return Object.freeze({
     conceptId,
@@ -447,6 +475,12 @@ function literalLabel(primary: string): SemanticLabel {
 function paymentLabel(labels: LabelContext, method: string): SemanticLabel {
   const conceptId = PAYMENT_METHOD_CONCEPTS[method.toLowerCase()];
   return conceptId !== undefined ? resolveSemanticLabel(labels, conceptId) : literalLabel(method);
+}
+
+function kotOrderTypeValue(labels: LabelContext, value: string): string {
+  const conceptId = KOT_ORDER_TYPE_CONCEPTS[value];
+  if (conceptId === undefined) return value.replace(/_/g, ' ').trim().toUpperCase();
+  return resolveSemanticLabel(labels, conceptId).primary;
 }
 
 function optionalDirectional(text: string | undefined | null, base: TextDirection): DirectionalText | null {
@@ -537,6 +571,7 @@ export function buildBillDocument(printData: PrintData, printContext: PrintConte
     header: Object.freeze({
       item: resolveSemanticLabel(labels, 'receipt.item'),
       quantity: resolveSemanticLabel(labels, 'receipt.qty'),
+      rate: resolveSemanticLabel(labels, 'receipt.rate'),
       amount: resolveSemanticLabel(labels, 'receipt.amount'),
     }),
     noteLabel: resolveSemanticLabel(labels, 'print.note'),
@@ -558,6 +593,7 @@ export function buildBillDocument(printData: PrintData, printContext: PrintConte
   const breakdown: TaxBreakdownBlock = Object.freeze({
     kind: 'tax-breakdown',
     direction: base,
+    heading: resolveSemanticLabel(labels, 'receipt.taxDetails'),
     lines: Object.freeze((showBreakdown ? taxComponents : []).map((component) => Object.freeze({
       label: literalLabel(component.title),
       rate: component.rate,
@@ -596,6 +632,12 @@ export function buildBillDocument(printData: PrintData, printContext: PrintConte
         amount: toFiniteNumber(bill.deliveryCharge),
       })
       : null,
+    packagingCharge: toFiniteNumber(bill.packagingCharge) !== 0
+      ? Object.freeze({
+        label: resolveSemanticLabel(labels, 'pos.packaging'),
+        amount: toFiniteNumber(bill.packagingCharge),
+      })
+      : null,
     grandTotal: Object.freeze({
       label: resolveSemanticLabel(labels, 'print.grandTotal'),
       amount: bill.total,
@@ -623,6 +665,7 @@ export function buildBillDocument(printData: PrintData, printContext: PrintConte
   const payments: PaymentsBlock = Object.freeze({
     kind: 'payments',
     direction: base,
+    heading: resolveSemanticLabel(labels, 'receipt.payments'),
     lines: Object.freeze(bill.payments
       .filter((payment) => payment.method.length > 0)
       .map((payment) => Object.freeze({
@@ -634,12 +677,21 @@ export function buildBillDocument(printData: PrintData, printContext: PrintConte
       }))),
   });
 
+  const hasOnlineOrderInfo = order.onlinePlatform.length > 0 || order.externalOrderId.length > 0;
   const messages: MessageBlock = Object.freeze({
     kind: 'message',
     direction: base,
     reprintBanner: printData.isReprint ? resolveSemanticLabel(labels, 'receipt.reprint') : null,
+    onlineOrderBanner: hasOnlineOrderInfo
+      ? Object.freeze({
+        label: resolveSemanticLabel(labels, 'receipt.onlineOrder'),
+        platform: directionalText(order.onlinePlatform, base),
+        externalOrderId: directionalText(order.externalOrderId, base),
+      })
+      : null,
     footerNote: business.footerNote.length > 0 ? directionalText(business.footerNote, base) : null,
     thankYou: resolveSemanticLabel(labels, 'print.thankYouShort'),
+    taxIncluded: resolveSemanticLabel(labels, 'receipt.taxIncluded'),
   });
 
   return Object.freeze({
@@ -663,9 +715,16 @@ export function buildBillDocument(printData: PrintData, printContext: PrintConte
 // KOT document variant (kitchen order ticket) — #443
 // ---------------------------------------------------------------------------
 
-/** One addon under a KOT item row. Kitchen tickets print names only. */
+/** Whether an order item belongs on a new kitchen ticket. */
+export function isKotItemPending(status: unknown): boolean {
+  return status !== 'served' && status !== 'ready';
+}
+
+/** One add-on under a KOT item row; quantity is display-only kitchen truth. */
 export interface KotAddonSnapshot {
   readonly name: string;
+  /** Add-on unit quantity, when greater than the default of one. */
+  readonly quantity?: number;
 }
 /** One item on the kitchen ticket, as printed truth. */
 export interface KotItemSnapshot {
@@ -675,11 +734,14 @@ export interface KotItemSnapshot {
   readonly specialInstructions: string;
 }
 
-/** The order behind the ticket (order number, canonical timestamp, table). */
+/** The order behind the ticket (order number, canonical timestamp, table, type, optional customer). */
 export interface KotOrderSnapshot {
   readonly orderNumber: string;
   readonly createdAt: string;
   readonly tableName: string;
+  readonly orderType: string;
+  /** Customer display name, when the order carries one. */
+  readonly customerName?: string;
 }
 
 /**
@@ -692,34 +754,37 @@ export interface KotPrintData {
   readonly items: readonly KotItemSnapshot[];
 }
 
-/** Ticket header: banner, station, order number, table, time. */
+/** Ticket header: banner, station, order number, table, type, optional customer, time. */
 export interface KotHeaderBlock {
   readonly kind: 'kot-header';
   readonly direction: TextDirection;
   readonly banner: SemanticLabel;
   readonly stationLabel: SemanticLabel;
   readonly stationName: DirectionalText;
-  /**
-   * Order reference. The legacy renderer keeps an unaudited literal
-   * `Order:` prefix (#440/#441 note); label adoption is a later decision,
-   * so the document carries only the value here.
-   */
+  readonly orderNumberLabel: SemanticLabel;
   readonly orderNumber: DirectionalText;
   /** Table reference with its (uninterpolated) label concept. */
   readonly table: { readonly label: SemanticLabel; readonly name: DirectionalText } | null;
+  readonly orderType: { readonly label: SemanticLabel; readonly value: DirectionalText; readonly code: string } | null;
+  readonly customer: { readonly label: SemanticLabel; readonly name: DirectionalText } | null;
   readonly timeLabel: SemanticLabel;
   /** Canonical stored timestamp; presentation formatting is a renderer duty. */
   readonly timestamp: DirectionalText;
 }
 
 /** Ordered kitchen item rows with addons and preparation instructions. */
+export interface KotAddonValue extends DirectionalText {
+  /** Add-on unit quantity, when greater than the default of one. */
+  readonly quantity?: number;
+}
+
 export interface KotItemsBlock {
   readonly kind: 'kot-items';
   readonly direction: TextDirection;
   readonly rows: readonly {
     readonly quantity: number;
     readonly name: DirectionalText;
-    readonly addons: readonly DirectionalText[];
+    readonly addons: readonly KotAddonValue[];
     readonly specialInstructions: DirectionalText | null;
   }[];
 }
@@ -738,6 +803,178 @@ export interface KotDocument {
   readonly blocks: readonly KotDocumentBlock[];
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object';
+}
+
+function isDirection(value: unknown): value is TextDirection {
+  return value === 'ltr' || value === 'rtl';
+}
+
+function isDirectionSpec(value: unknown): value is DirectionSpec {
+  return isRecord(value)
+    && isDirection(value.base)
+    && isDirection(value.document)
+    && isDirection(value.block)
+    && isDirection(value.value);
+}
+
+function isLanguages(value: unknown): value is ResolvedPrintLanguages {
+  return Array.isArray(value)
+    && (value.length === 1 || value.length === 2)
+    && value.every((language) => typeof language === 'string' && language.length > 0);
+}
+
+function isSemanticLabel(value: unknown): value is SemanticLabel {
+  return isRecord(value)
+    && typeof value.primary === 'string'
+    && (value.conceptId === undefined || typeof value.conceptId === 'string')
+    && (value.secondary === undefined || typeof value.secondary === 'string');
+}
+
+function isDirectionalText(value: unknown): value is DirectionalText {
+  return isRecord(value) && typeof value.text === 'string' && isDirection(value.direction);
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function isOptionalDirectionalText(value: unknown): value is DirectionalText | null {
+  return value === null || isDirectionalText(value);
+}
+
+function isPrintDocumentBlock(value: unknown): value is PrintDocumentBlock {
+  if (!isRecord(value) || !isDirection(value.direction) || typeof value.kind !== 'string') return false;
+  switch (value.kind) {
+    case 'business-header':
+      return isOptionalDirectionalText(value.name)
+        && isOptionalDirectionalText(value.address)
+        && isOptionalDirectionalText(value.phone)
+        && isOptionalDirectionalText(value.instagramHandle)
+        && (value.taxId === null || (isRecord(value.taxId) && isSemanticLabel(value.taxId.label) && isDirectionalText(value.taxId.value)))
+        && (value.phoneLabel === null || isSemanticLabel(value.phoneLabel));
+    case 'document-meta':
+      return isSemanticLabel(value.title)
+        && isSemanticLabel(value.invoiceNumberLabel)
+        && isSemanticLabel(value.billNumberLabel)
+        && isSemanticLabel(value.dateLabel)
+        && isDirectionalText(value.invoiceNumber)
+        && isDirectionalText(value.timestamp)
+        && (value.table === null || (isRecord(value.table) && isSemanticLabel(value.table.label) && isDirectionalText(value.table.name)));
+    case 'customer':
+      return isOptionalDirectionalText(value.name)
+        && isOptionalDirectionalText(value.phone)
+        && isSemanticLabel(value.nameLabel)
+        && isSemanticLabel(value.phoneLabel);
+    case 'item-table':
+      return isRecord(value.header)
+        && isSemanticLabel(value.header.item)
+        && isSemanticLabel(value.header.quantity)
+        && isSemanticLabel(value.header.rate)
+        && isSemanticLabel(value.header.amount)
+        && isSemanticLabel(value.noteLabel)
+        && Array.isArray(value.rows)
+        && value.rows.every((row) => isRecord(row)
+          && isDirection(row.direction)
+          && isDirectionalText(row.name)
+          && isFiniteNumber(row.quantity)
+          && (row.unitPrice === undefined || isFiniteNumber(row.unitPrice))
+          && isFiniteNumber(row.amount)
+          && Array.isArray(row.addons)
+          && row.addons.every((addon) => isRecord(addon)
+            && isDirectionalText(addon.name)
+            && isFiniteNumber(addon.price)
+            && (addon.quantity === undefined || isFiniteNumber(addon.quantity)))
+          && isOptionalDirectionalText(row.specialInstructions));
+    case 'tax-breakdown':
+      return isSemanticLabel(value.heading)
+        && Array.isArray(value.lines)
+        && value.lines.every((line) => isRecord(line)
+          && isSemanticLabel(line.label)
+          && (line.rate === null || isFiniteNumber(line.rate))
+          && isFiniteNumber(line.amount));
+    case 'totals':
+      return ['subtotal', 'grandTotal'].every((key) => isRecord(value[key])
+        && isSemanticLabel(value[key].label)
+        && isFiniteNumber(value[key].amount))
+        && ['discount', 'tax', 'serviceCharge', 'deliveryCharge', 'packagingCharge'].every((key) => value[key] === null || (isRecord(value[key]) && isSemanticLabel(value[key].label) && isFiniteNumber(value[key].amount)))
+        && ['pointsRedeemed', 'pointsEarned', 'pointsBalance'].every((key) => value[key] === null || (isRecord(value[key]) && isSemanticLabel(value[key].label) && isFiniteNumber(value[key].points)));
+    case 'payments':
+      return isSemanticLabel(value.heading)
+        && Array.isArray(value.lines)
+        && value.lines.every((line) => isRecord(line)
+          && typeof line.method === 'string'
+          && isSemanticLabel(line.label)
+          && isFiniteNumber(line.amount));
+    case 'message':
+      return (value.reprintBanner === null || isSemanticLabel(value.reprintBanner))
+        && (value.onlineOrderBanner === null || (isRecord(value.onlineOrderBanner)
+          && isSemanticLabel(value.onlineOrderBanner.label)
+          && isDirectionalText(value.onlineOrderBanner.platform)
+          && isDirectionalText(value.onlineOrderBanner.externalOrderId)))
+        && isOptionalDirectionalText(value.footerNote)
+        && (value.thankYou === null || isSemanticLabel(value.thankYou))
+        && isSemanticLabel(value.taxIncluded);
+    default:
+      return false;
+  }
+}
+
+export function isPrintDocument(value: unknown): value is PrintDocument {
+  const blockKinds = new Set(['business-header', 'document-meta', 'customer', 'item-table', 'tax-breakdown', 'totals', 'payments', 'message']);
+  return isRecord(value)
+    && value.version === 1
+    && isDirectionSpec(value.direction)
+    && isLanguages(value.languages)
+    && Array.isArray(value.blocks)
+    && value.blocks.length === blockKinds.size
+    && value.blocks.every(isPrintDocumentBlock)
+    && value.blocks.every((block) => isRecord(block) && blockKinds.has(block.kind))
+    && new Set(value.blocks.map((block) => isRecord(block) ? block.kind : undefined)).size === value.blocks.length;
+}
+
+function isKotDocumentBlock(value: unknown): value is KotDocumentBlock {
+  if (!isRecord(value) || !isDirection(value.direction) || typeof value.kind !== 'string') return false;
+  if (value.kind === 'kot-header') {
+    return isSemanticLabel(value.banner)
+      && isSemanticLabel(value.stationLabel)
+      && isDirectionalText(value.stationName)
+      && isSemanticLabel(value.orderNumberLabel)
+      && isDirectionalText(value.orderNumber)
+      && (value.table === null || (isRecord(value.table) && isSemanticLabel(value.table.label) && isDirectionalText(value.table.name)))
+      && (value.orderType === null || (isRecord(value.orderType) && isSemanticLabel(value.orderType.label) && isDirectionalText(value.orderType.value) && typeof value.orderType.code === 'string'))
+      && (value.customer === null || (isRecord(value.customer) && isSemanticLabel(value.customer.label) && isDirectionalText(value.customer.name)))
+      && isSemanticLabel(value.timeLabel)
+      && isDirectionalText(value.timestamp);
+  }
+  if (value.kind !== 'kot-items' || !Array.isArray(value.rows)) return false;
+  return value.rows.every((row) => isRecord(row)
+    && isFiniteNumber(row.quantity)
+    && isDirectionalText(row.name)
+    && Array.isArray(row.addons)
+    && row.addons.every((addon) => isRecord(addon) && isDirectionalText(addon)
+      && (addon.quantity === undefined || isFiniteNumber(addon.quantity)))
+    && isOptionalDirectionalText(row.specialInstructions));
+}
+
+export function isKotDocument(value: unknown): value is KotDocument {
+  return isRecord(value)
+    && value.version === 1
+    && isDirectionSpec(value.direction)
+    && isLanguages(value.languages)
+    && value.languages.length === 1
+    && Array.isArray(value.blocks)
+    && value.blocks.length === 2
+    && isRecord(value.blocks[0])
+    && value.blocks[0].kind === 'kot-header'
+    && isRecord(value.blocks[1])
+    && value.blocks[1].kind === 'kot-items'
+    && value.blocks.filter((block) => isRecord(block) && block.kind === 'kot-header').length === 1
+    && value.blocks.filter((block) => isRecord(block) && block.kind === 'kot-items').length === 1
+    && value.blocks.every(isKotDocumentBlock);
+}
+
 /**
  * Build a KotDocument v1 from normalized kitchen-ticket data. Pure: reads
  * only its arguments and performs no IO or recomputation.
@@ -754,11 +991,25 @@ export function buildKotDocument(printData: KotPrintData, printContext: PrintCon
     banner: resolveSemanticLabel(labels, 'print.kot.banner'),
     stationLabel: resolveSemanticLabel(labels, 'print.kot.station'),
     stationName: directionalText(String(printData.stationName ?? ''), base),
+    orderNumberLabel: resolveSemanticLabel(labels, 'pos.orderNumber'),
     orderNumber: directionalText(String(printData.order?.orderNumber ?? ''), base),
     table: typeof printData.order?.tableName === 'string' && printData.order.tableName.length > 0
       ? Object.freeze({
         label: resolveSemanticLabel(labels, 'pos.tableLabel'),
         name: directionalText(printData.order.tableName, base),
+      })
+      : null,
+    orderType: typeof printData.order?.orderType === 'string' && printData.order.orderType.length > 0
+      ? Object.freeze({
+        label: resolveSemanticLabel(labels, 'print.kot.type'),
+        value: directionalText(kotOrderTypeValue(labels, printData.order.orderType), base),
+        code: printData.order.orderType,
+      })
+      : null,
+    customer: typeof printData.order?.customerName === 'string' && printData.order.customerName.length > 0
+      ? Object.freeze({
+        label: resolveSemanticLabel(labels, 'pos.customer'),
+        name: directionalText(printData.order.customerName, base),
       })
       : null,
     timeLabel: resolveSemanticLabel(labels, 'print.time'),
@@ -773,7 +1024,12 @@ export function buildKotDocument(printData: KotPrintData, printContext: PrintCon
       name: directionalText(String(item?.productName ?? ''), base),
       addons: Object.freeze((item?.addons ?? new Array<KotAddonSnapshot>())
         .filter((addon: KotAddonSnapshot) => typeof addon?.name === 'string' && addon.name.length > 0)
-        .map((addon: KotAddonSnapshot) => directionalText(String(addon.name), base))),
+        .map((addon: KotAddonSnapshot) => Object.freeze({
+          ...directionalText(String(addon.name), base),
+          ...(typeof addon.quantity === 'number' && Number.isFinite(addon.quantity) && addon.quantity > 0
+            ? { quantity: addon.quantity }
+            : {}),
+        }))),
       specialInstructions: optionalDirectional(item?.specialInstructions, base),
     }))),
   });
