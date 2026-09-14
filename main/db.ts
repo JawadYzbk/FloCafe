@@ -744,6 +744,11 @@ export function isKotPrintingEnabled(): boolean {
   return getSettingValue('kot_printing_enabled') !== 'false';
 }
 
+/** Whether the tableside "server" role may print bills/order-slips. Defaults to disabled. */
+export function isServerBillPrintingEnabled(): boolean {
+  return getSettingValue('server_app_bill_printing_enabled') === 'true';
+}
+
 export function upsertTelemetryLastPing(): void {
   upsertSetting('telemetry_last_ping_at', now());
 }
@@ -4059,6 +4064,14 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
   },
   {
     version: 83,
+    name: 'add_server_app_bill_printing_toggle',
+    up: () => {
+      // Owner opt-in for tableside servers to print bills; defaults off (print-bill stays payment-adjacent).
+      insertSettingIfMissing('server_app_bill_printing_enabled', 'false');
+    },
+  },
+  {
+    version: 84,
     name: 'add_cash_shifts',
     up: () => {
       db.exec(`
@@ -4100,7 +4113,7 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     },
   },
   {
-    version: 84,
+    version: 85,
     name: 'add_exchange_rate_history',
     up: () => {
       // Append-only log of secondary-currency exchange rates over time, so the
@@ -4123,7 +4136,7 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     },
   },
   {
-    version: 85,
+    version: 86,
     name: 'add_expenses',
     up: () => {
       // Business expenses (staff salaries + operating costs) so the owner can
@@ -4153,7 +4166,7 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     },
   },
   {
-    version: 86,
+    version: 87,
     name: 'snapshot_order_item_cost',
     up: () => {
       // Snapshot the product's cost onto each line at sale time so COGS/profit
@@ -4243,6 +4256,7 @@ export class SchemaVersionMismatchError extends Error {
 function runMigrations(): void {
   const current = getCurrentSchemaVersion();
   const target = MIGRATIONS.length > 0 ? MIGRATIONS[MIGRATIONS.length - 1].version : 0;
+  const verboseMigrationLogs = process.env.FLOCAFE_TEST_VERBOSE === '1';
 
   if (current > target) {
     // Fail startup if database schema version is newer than supported by this build.
@@ -4263,12 +4277,16 @@ function runMigrations(): void {
   for (const migration of MIGRATIONS) {
     if (migration.version <= current) continue;
 
-    console.log(`[DB] Applying migration v${migration.version}: ${migration.name}`);
+    if (verboseMigrationLogs) {
+      console.log(`[DB] Applying migration v${migration.version}: ${migration.name}`);
+    }
     db.transaction(() => {
       migration.up();
       db.pragma(`user_version = ${migration.version}`);
     })();
-    console.log(`[DB] Migration v${migration.version} complete`);
+    if (verboseMigrationLogs) {
+      console.log(`[DB] Migration v${migration.version} complete`);
+    }
   }
 }
 
@@ -4956,6 +4974,7 @@ function seedInstallDefaults(): void {
   insert('kds_enabled', 'true');
   insert('server_app_enabled', 'true');
   insert('kot_printing_enabled', 'true');
+  insert('server_app_bill_printing_enabled', 'false');
   insert('printer_trim_decimals', 'false');
   insert('bill_template', 'classic');
   insert('bill_footer_message', '');
