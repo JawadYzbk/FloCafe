@@ -12,6 +12,7 @@ import { ArrowLeft, ArrowRight, Check, Cloud, Database, KeyRound, Search, Sparkl
 import toast from 'react-hot-toast';
 import { COUNTRIES, getCountryByCode, getLocalizedCountryName, countryMatchesQuery, sortCountriesByLocalizedName, type Country } from '@/lib/countries';
 import { TimeZoneSelect } from '@/components/TimeZoneSelect';
+import { CurrencySelect } from '@/components/CurrencySelect';
 import { useLocale, useTranslations, type AppConfig } from 'use-intl';
 import { LANGUAGES, getBrowserLanguage, type Language } from '@/lib/i18n';
 
@@ -74,17 +75,23 @@ export default function SetupPage() {
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [showMasterPin, setShowMasterPin] = useState(false);
   const [showConfirmMasterPin, setShowConfirmMasterPin] = useState(false);
+  const [showApprovalPin, setShowApprovalPin] = useState(false);
+  const [showConfirmApprovalPin, setShowConfirmApprovalPin] = useState(false);
   const [profile, setProfile] = useState<SetupProfile>('express');
   const [serviceModel, setServiceModel] = useState<ServiceModel>('qsr');
   // Wizard language follows shared store to update translations immediately.
   const language = usePosSettingsStore((s) => s.language);
   const setStoreLanguage = usePosSettingsStore((s) => s.setLanguage);
-  const [browserLanguage] = useState<Language>(() => getBrowserLanguage());
-  const [country, setCountry] = useState<string>('IN');
+  const [browserLanguage, setBrowserLanguage] = useState<Language>('en');
+  // No default country: regional settings come only from what the owner
+  // selects here (docs/reference/product-invariants.md, "Regional settings come from
+  // signup, never from a fallback").
+  const [country, setCountry] = useState<string>('');
+  const [currency, setCurrency] = useState<string>('');
   const [countryQuery, setCountryQuery] = useState<string>('');
-  // The country profile timezone is only a suggested default; the owner can
-  // override it here for multi-timezone countries before completing setup.
-  const [timezone, setTimezone] = useState<string>(() => getCountryByCode('IN')?.timezone || 'Asia/Kolkata');
+  // The country profile timezone is only a suggested default, set once a
+  // country is chosen below; the owner can override it for multi-timezone countries.
+  const [timezone, setTimezone] = useState<string>('');
   const [form, setForm] = useState({
     name: '',
     email: '',
@@ -106,6 +113,9 @@ export default function SetupPage() {
   const [masterPin, setMasterPin] = useState('');
   const [masterPinConfirm, setMasterPinConfirm] = useState('');
   const masterPinValid = /^\d{4}$/.test(masterPin) && masterPin === masterPinConfirm;
+  const [ownerApprovalPin, setOwnerApprovalPin] = useState('');
+  const [ownerApprovalPinConfirm, setOwnerApprovalPinConfirm] = useState('');
+  const ownerApprovalPinValid = /^\d{4,6}$/.test(ownerApprovalPin) && ownerApprovalPin === ownerApprovalPinConfirm;
 
   const cloudEnabled = true;
   const [cloudServerUrl, setCloudServerUrl] = useState(DEFAULT_CLOUD_SERVER_URL);
@@ -119,14 +129,31 @@ export default function SetupPage() {
   };
   const passwordMeetsRequirements = form.password.length === 0 || isPasswordValid(form.password);
   const t = useTranslations('setup');
+  const tSettings = useTranslations('settings');
   const locale = useLocale();
+  const [mounted, setMounted] = useState(false);
+
+  // Country labels are generated from CLDR data, which can differ between the server
+  // and the browser even within the same locale. Keep the first paint deterministic
+  // and only switch to the locale-specific names after hydration.
+  const resolvedCountryLocale = mounted ? locale : 'en';
 
   useEffect(() => {
-    let mounted = true;
+    const frame = window.requestAnimationFrame(() => {
+      setMounted(true);
+      setBrowserLanguage(getBrowserLanguage());
+    });
+    let mountedFlag = true;
     api.get('/auth/setup/status')
       .then(({ data }) => {
-        if (!mounted) return;
+        if (!mountedFlag) return;
         setMasterPinAvailable(!!data.masterPinAvailable);
+        if (data.currencyReset) {
+          setCountry(String(data.currencyReset.country || ''));
+          setCurrency(String(data.currencyReset.currency || ''));
+          setTimezone(String(data.currencyReset.timezone || ''));
+          setProfile('empty');
+        }
         // Redirect to login if setup was already completed.
         if (!data.needsSetup) {
           toast.error(t('alreadyCompleted'));
@@ -134,11 +161,14 @@ export default function SetupPage() {
         }
       })
       .catch((err: unknown) => {
-        if (!mounted) return;
+        if (!mountedFlag) return;
         console.warn('[Setup] Failed to check setup status:', err);
         setMasterPinAvailable(false);
       });
-    return () => { mounted = false; };
+    return () => {
+      mountedFlag = false;
+      window.cancelAnimationFrame(frame);
+    };
     // One-time mount check — the toast uses the initial language selection.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -147,8 +177,8 @@ export default function SetupPage() {
   const languageOptions: Language[] = SELECTABLE_LANGUAGES.includes(browserLanguage)
     ? [browserLanguage, ...SELECTABLE_LANGUAGES.filter((l) => l !== browserLanguage)]
     : SELECTABLE_LANGUAGES;
-  const filteredCountries = sortCountriesByLocalizedName(COUNTRIES, locale)
-    .filter((c) => countryMatchesQuery(c, countryQuery, locale));
+  const filteredCountries = sortCountriesByLocalizedName(COUNTRIES, resolvedCountryLocale)
+    .filter((c) => countryMatchesQuery(c, countryQuery, resolvedCountryLocale));
 
   const completeSetup = () => {
     usePosSettingsStore.getState().setLanguage(language);
@@ -192,12 +222,22 @@ export default function SetupPage() {
 
   const handleCompleteSetup = async () => {
     if (loading) return;
+    if (!country) {
+      toast.error(t('chooseCountryRequired'));
+      setStep(1);
+      return;
+    }
     if (!validateOwner()) {
       setStep(3);
       return;
     }
     if (masterPinAvailable && !masterPinValid) {
       toast.error(t('masterPinRequired'));
+      setStep(2);
+      return;
+    }
+    if (!ownerApprovalPinValid) {
+      toast.error(t('ownerApprovalPinRequired'));
       setStep(2);
       return;
     }
@@ -225,7 +265,7 @@ export default function SetupPage() {
       const countryCode = countryProfile?.code || country;
       const countryPayload = {
         country: countryCode,
-        currency: countryProfile?.currency,
+        currency: currency || countryProfile?.currency,
         timezone,
         language,
       };
@@ -240,6 +280,8 @@ export default function SetupPage() {
         service_model: serviceModel,
         terms_accepted: termsAccepted,
         master_pin: masterPinAvailable ? masterPin : undefined,
+        owner_approval_pin: ownerApprovalPin,
+        owner_approval_pin_confirmation: ownerApprovalPinConfirm,
         cloud_sync_enabled: true,
         cloud_server_url: cloudServerUrl.trim() || DEFAULT_CLOUD_SERVER_URL,
         email_product_updates: productUpdates,
@@ -335,6 +377,9 @@ export default function SetupPage() {
                         onClick={() => {
                           const previousCountry = getCountryByCode(country);
                           setCountry(c.code);
+                          if (!currency || currency === previousCountry?.currency) {
+                            setCurrency(c.currency);
+                          }
                           // Update default timezone when switching countries unless user has manually customized it.
                           if (!previousCountry || timezone === previousCountry.timezone) {
                             setTimezone(c.timezone || timezone);
@@ -345,7 +390,9 @@ export default function SetupPage() {
                         }`}
                       >
                         <div>
-                          <div className="font-semibold">{getLocalizedCountryName(c.code, locale)}</div>
+                          <div className="font-semibold">
+                            {getLocalizedCountryName(c.code, resolvedCountryLocale)}
+                          </div>
                           <div className="text-xs text-muted-foreground">
                             {c.currency} · {c.taxIdLabel || t('noTaxId')} · {c.locale}
                           </div>
@@ -359,6 +406,24 @@ export default function SetupPage() {
                   )}
                 </div>
 
+                {selectedCountry ? (
+                  <div className="space-y-2">
+                    <Label htmlFor="setup-currency">{tSettings('currency')}</Label>
+                    <CurrencySelect
+                      id="setup-currency"
+                      value={currency}
+                      recommendedCurrency={selectedCountry.currency}
+                      locale={locale}
+                      onChange={setCurrency}
+                      recommendedLabel={tSettings('currencyRecommended')}
+                      popularLabel={tSettings('currencyPopular')}
+                      allLabel={tSettings('currencyAll')}
+                      className="h-10 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px]"
+                    />
+                    <p className="text-xs text-muted-foreground">{tSettings('currencySelectionHint')}</p>
+                  </div>
+                ) : null}
+
                 <div className="space-y-2">
                   <Label htmlFor="setup-timezone">{t('timezoneLabel')}</Label>
                   <TimeZoneSelect
@@ -370,7 +435,17 @@ export default function SetupPage() {
                   <p className="text-xs text-muted-foreground">{t('timezoneHint')}</p>
                 </div>
 
-                <Button onClick={() => setStep(2)} className="w-full" size="lg">
+                <Button
+                  onClick={() => {
+                    if (!country) {
+                      toast.error(t('chooseCountryRequired'));
+                      return;
+                    }
+                    setStep(2);
+                  }}
+                  className="w-full"
+                  size="lg"
+                >
                   {t('continue')} <ArrowRight className="w-4 h-4 ms-2 rtl-flip" />
                 </Button>
               </div>
@@ -455,9 +530,73 @@ export default function SetupPage() {
                   </div>
                 )}
 
+                <div className="space-y-3 rounded-lg border border-border px-3 py-3">
+                  <div>
+                    <h3 className="text-sm font-medium">{t('ownerApprovalPinLabel')}</h3>
+                    <p className="text-xs text-muted-foreground mt-1">{t('ownerApprovalPinDescription')}</p>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="owner-approval-pin">{t('ownerApprovalPinLabel')}</Label>
+                      <div className="relative">
+                        <Input
+                          id="owner-approval-pin"
+                          type={showApprovalPin ? "text" : "password"}
+                          inputMode="numeric"
+                          pattern="[0-9]*"
+                          minLength={4}
+                          maxLength={6}
+                          value={ownerApprovalPin}
+                          onChange={(e) => setOwnerApprovalPin(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                          placeholder="••••"
+                          className="text-center text-lg tracking-[0.5em] pe-10"
+                          required
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowApprovalPin(!showApprovalPin)}
+                          className="absolute end-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground focus:outline-none"
+                          tabIndex={-1}
+                        >
+                          {showApprovalPin ? <EyeOff size={16} /> : <Eye size={16} />}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="owner-approval-pin-confirm">{t('confirmPinLabel')}</Label>
+                      <div className="relative">
+                        <Input
+                          id="owner-approval-pin-confirm"
+                          type={showConfirmApprovalPin ? "text" : "password"}
+                          inputMode="numeric"
+                          pattern="[0-9]*"
+                          minLength={4}
+                          maxLength={6}
+                          value={ownerApprovalPinConfirm}
+                          onChange={(e) => setOwnerApprovalPinConfirm(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                          placeholder="••••"
+                          className="text-center text-lg tracking-[0.5em] pe-10"
+                          required
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowConfirmApprovalPin(!showConfirmApprovalPin)}
+                          className="absolute end-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground focus:outline-none"
+                          tabIndex={-1}
+                        >
+                          {showConfirmApprovalPin ? <EyeOff size={16} /> : <Eye size={16} />}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                  {ownerApprovalPinConfirm && ownerApprovalPin !== ownerApprovalPinConfirm && (
+                    <p className="text-xs font-medium text-red-600">{t('ownerApprovalPinMismatch')}</p>
+                  )}
+                </div>
+
                 <Button
                   onClick={() => setStep(3)}
-                  disabled={masterPinAvailable === true && !masterPinValid}
+                  disabled={(masterPinAvailable === true && !masterPinValid) || !ownerApprovalPinValid}
                   className="w-full"
                   size="lg"
                 >

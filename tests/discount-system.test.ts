@@ -133,6 +133,9 @@ const EXPECTED_DISCOUNT_SETTINGS: Record<string, string> = {
 
 function seedTestData() {
   const db = getDatabase();
+  // Regional settings come from signup, never a fallback; seed one
+  // explicitly so resolveRegionalSnapshot() resolves.
+  db.prepare(`INSERT INTO settings (key, value, updated_at) VALUES ('country', 'IN', ?) ON CONFLICT(key) DO UPDATE SET value='IN', updated_at=excluded.updated_at`).run(now());
 
   // Create a category and product for order items
   db.prepare(

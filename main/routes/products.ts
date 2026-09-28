@@ -1,9 +1,10 @@
 import { Router, Request, Response } from 'express';
 import { getDatabase, now, generateShortId, getSettingValue } from '../db';
-import { requireRole, isBlockedSsrfTarget } from '../middleware/security';
-import { ROLE_ACCESS } from '../../shared/role-permissions';
+import { isBlockedSsrfTarget } from '../middleware/security';
+import { requirePermission } from '../services/authorization';
 import { getHttpRequestSignal } from '../shutdown';
 import { getActiveCountryPack, hasConfiguredTaxCategories } from '../services/tax';
+import { adjustProductStock } from '../services/inventory';
 import * as crypto from 'crypto';
 import * as dns from 'dns';
 import * as https from 'https';
@@ -251,12 +252,18 @@ function loadProductRelationsBatch(db: any, products: any[]) {
 }
 
 const VALID_TAX_BEHAVIORS = ['country_default', 'inclusive', 'exclusive', 'exempt'];
-const VALID_SALE_UNITS = ['each', 'kg', 'g', 'lb'] as const;
+const VALID_SALE_UNITS = ['each', 'kg', 'g', 'lb', 'ml', 'cl', 'l', 'fl oz', 'oz'] as const;
 
 const router = Router();
 
 function hasOwn(body: Record<string, unknown>, field: string): boolean {
   return Object.prototype.hasOwnProperty.call(body, field);
+}
+
+function stockReason(value: unknown, fallback: string): string {
+  if (typeof value !== 'string') return fallback;
+  const reason = value.trim();
+  return reason.length > 0 && reason.length <= 500 ? reason : fallback;
 }
 
 function toBoolean(value: unknown): boolean {
@@ -352,11 +359,80 @@ function validateWeightedProductFields(
   return null;
 }
 
+function validateInventoryLinkFields(
+  db: ReturnType<typeof getDatabase>,
+  values: Record<string, unknown>,
+  productId?: string,
+): string | null {
+  const linkProvided = hasOwn(values, 'inventory_product_id');
+  const quantityProvided = hasOwn(values, 'inventory_deduction_quantity');
+  if (!linkProvided && !quantityProvided) return null;
+
+  const rawLink = values.inventory_product_id;
+  const link = rawLink === null || rawLink === undefined || rawLink === ''
+    ? null
+    : rawLink;
+  if (link !== null && typeof link !== 'string') {
+    return 'inventory_product_id must be a product id string or null';
+  }
+
+  let effectiveLink: string | null = link as string | null;
+  if (!linkProvided && productId) {
+    const current = db.prepare(
+      'SELECT inventory_product_id FROM products WHERE id = ?',
+    ).get(productId) as { inventory_product_id?: string | null } | undefined;
+    effectiveLink = current?.inventory_product_id ?? null;
+  }
+
+  if (quantityProvided) {
+    if (values.inventory_deduction_quantity === null && !effectiveLink) {
+      return null;
+    }
+    if (typeof values.inventory_deduction_quantity !== 'number'
+      || !Number.isFinite(values.inventory_deduction_quantity)
+      || values.inventory_deduction_quantity <= 0) {
+      return 'inventory_deduction_quantity must be a positive finite number';
+    }
+  } else if (!effectiveLink) {
+    return null;
+  }
+
+  if (!effectiveLink) return null;
+  if (productId && effectiveLink === productId) {
+    return 'inventory_product_id cannot reference the product itself';
+  }
+
+  const target = db.prepare(
+    'SELECT id, inventory_product_id FROM products WHERE id = ? AND deleted_at IS NULL',
+  ).get(effectiveLink) as { id: string; inventory_product_id?: string | null } | undefined;
+  if (!target) {
+    return 'inventory_product_id must reference an existing product';
+  }
+  if (target.inventory_product_id) {
+    return 'inventory_product_id target cannot itself be linked to another product';
+  }
+  if (productId && linkProvided) {
+    const incomingLink = db.prepare(
+      'SELECT id FROM products WHERE inventory_product_id = ? AND deleted_at IS NULL LIMIT 1',
+    ).get(productId) as { id: string } | undefined;
+    if (incomingLink) {
+      return 'A product that is already an inventory target cannot be linked to another product';
+    }
+  }
+  const otherLink = db.prepare(
+    'SELECT id FROM products WHERE inventory_product_id = ? AND deleted_at IS NULL AND id != ?',
+  ).get(effectiveLink, productId || '') as { id: string } | undefined;
+  if (otherLink) {
+    return 'inventory_product_id target is already linked by another product';
+  }
+  return null;
+}
+
 function validateTaxCategoryId(categoryId: unknown): string | null {
   if (categoryId === null || categoryId === undefined || categoryId === '') return null;
   if (typeof categoryId !== 'string') return 'tax_category_id must be a string or null';
 
-  const country = getSettingValue('country') || 'IN';
+  const country = getSettingValue('country') || '';
   const businessType = getSettingValue('business_type') || 'restaurant';
   const pack = getActiveCountryPack(country);
   if (!hasConfiguredTaxCategories(pack, businessType)) {
@@ -437,11 +513,12 @@ function validateAddonGroupIds(db: any, rawIds: unknown): { ids?: string[]; erro
 }
 
 // Bulk product list; computes has_image in SQL to avoid loading Base64 blobs into memory.
-router.get('/', (req: Request, res: Response) => {
+router.get('/', requirePermission('catalog.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     let query = `SELECT p.id, p.category_id, p.name, p.description, p.price, p.cost, p.sku, p.barcode,
       p.sale_unit, p.allow_fractional_quantity, p.weight_precision,
+      p.inventory_product_id, p.inventory_deduction_quantity,
       p.is_active, p.sort_order, p.track_inventory, p.stock_quantity, p.low_stock_threshold,
       p.tax_type, p.tax_rate, p.tax_category_id, p.tax_behavior, p.cb_percent, p.tags, p.deleted_at, p.created_at, p.updated_at,
       CASE WHEN p.image_url IS NULL OR p.image_url = '' THEN 0 ELSE 1 END AS has_image
@@ -554,7 +631,7 @@ router.get('/:id/image', asyncHandler(async (req: Request, res: Response) => {
   }
 }));
 
-router.get('/:id', (req: Request, res: Response) => {
+router.get('/:id', requirePermission('catalog.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const product = db.prepare('SELECT * FROM products WHERE id = ? AND deleted_at IS NULL').get(req.params.id);
@@ -574,7 +651,7 @@ router.get('/:id', (req: Request, res: Response) => {
 });
 
 // Fetches external https image URL and returns Base64 data URI.
-router.post('/fetch-url', requireRole(...ROLE_ACCESS.ownerManager), asyncHandler(async (req: Request, res: Response) => {
+router.post('/fetch-url', requirePermission('catalog.manage'), asyncHandler(async (req: Request, res: Response) => {
   try {
     const { url } = req.body;
 
@@ -701,13 +778,14 @@ router.post('/fetch-url', requireRole(...ROLE_ACCESS.ownerManager), asyncHandler
   }
 }));
 
-router.post('/', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.post('/', requirePermission('catalog.manage'), (req: Request, res: Response) => {
   try {
     const {
       category_id, name, sku, barcode, description, price, cost_price,
       sale_unit, allow_fractional_quantity, weight_precision,
+      inventory_product_id, inventory_deduction_quantity,
       tax_category_id, tax_behavior, track_inventory, stock_quantity,
-      low_stock_threshold, is_active, image_url, sort_order, cb_percent, tags, addon_group_ids
+      low_stock_threshold, is_active, image_url, sort_order, cb_percent, tags, addon_group_ids, reason
     } = req.body;
     const normalizedBarcode = normalizeBarcode(barcode);
     const productName = normalizeRequiredName(name);
@@ -741,6 +819,8 @@ router.post('/', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: R
     }
 
     const db = getDatabase();
+    const inventoryLinkError = validateInventoryLinkFields(db, req.body);
+    if (inventoryLinkError) return res.status(400).json({ error: inventoryLinkError });
     const categoryError = validateCategoryId(db, category_id);
     if (categoryError) {
       return res.status(400).json({ error: categoryError });
@@ -758,6 +838,8 @@ router.post('/', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: R
     }
 
     const id = generateShortId('products');
+    const initialStock = stock_quantity ?? 0;
+    const actorUserId = String((req as Request & { user?: { userId?: string } }).user?.userId || '');
     const addonGroupValidation = validateAddonGroupIds(db, addon_group_ids);
     if (addonGroupValidation.error) {
       return res.status(400).json({ error: addonGroupValidation.error });
@@ -770,14 +852,21 @@ router.post('/', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: R
       db.prepare(`
         INSERT INTO products (id, category_id, name, sku, barcode, description, price, cost,
           sale_unit, allow_fractional_quantity, weight_precision,
+          inventory_product_id, inventory_deduction_quantity,
           tax_type, tax_rate, tax_category_id, tax_behavior, track_inventory, stock_quantity, low_stock_threshold,
           is_active, image_url, sort_order, cb_percent, tags, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         id, normalizeNullableString(category_id), productName, normalizeNullableString(sku), normalizedBarcode, normalizeNullableString(description), price, cost_price || 0,
         normalizeSaleUnit(sale_unit), allow_fractional_quantity ? 1 : 0, weight_precision ?? 3,
+        inventory_product_id || null,
+        inventory_product_id
+          ? (typeof inventory_deduction_quantity === 'number' && Number.isFinite(inventory_deduction_quantity) && inventory_deduction_quantity > 0
+            ? inventory_deduction_quantity
+            : 1)
+          : null,
         'none', 0, normalizeNullableString(tax_category_id), tax_behavior || 'country_default',
-        track_inventory ? 1 : 0, stock_quantity || 0, low_stock_threshold || 0,
+        track_inventory ? 1 : 0, 0, low_stock_threshold || 0,
         is_active !== false ? 1 : 0, normalizeNullableString(image_url),
         sort_order || 0, cb_percent !== undefined ? cb_percent : null, JSON.stringify(tags || []),
         now(), now()
@@ -789,6 +878,18 @@ router.post('/', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: R
           insertAgp.run(agId, id);
         }
       }
+
+      if (initialStock !== 0) {
+        adjustProductStock(db, {
+          productId: id,
+          quantityDelta: initialStock,
+          movementType: 'adjustment',
+          referenceType: 'opening_balance',
+          referenceId: id,
+          reason: stockReason(reason, 'opening'),
+          actorUserId,
+        });
+      }
     });
     insertProduct();
 
@@ -796,16 +897,18 @@ router.post('/', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: R
     res.status(201).json({ product: serializeProduct(product) });
   } catch (error: any) {
     console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+    res.status(statusCode).json({ error: statusCode >= 500 ? "Internal server error" : error.message });
   }
 });
 
-router.put('/:id', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.put('/:id', requirePermission('catalog.manage'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const product = db.prepare('SELECT * FROM products WHERE id = ? AND deleted_at IS NULL').get(req.params.id) as {
       sale_unit?: string;
       allow_fractional_quantity?: number;
+      stock_quantity?: number;
     } | undefined;
     if (!product) {
       return res.status(404).json({ error: 'Product not found' });
@@ -814,6 +917,7 @@ router.put('/:id', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res:
     const {
       category_id, name, sku, barcode, description, price, cost_price,
       sale_unit, allow_fractional_quantity, weight_precision,
+      inventory_product_id, inventory_deduction_quantity,
       tax_category_id, tax_behavior, track_inventory, stock_quantity,
       low_stock_threshold, is_active, image_url, sort_order, cb_percent, tags, addon_group_ids
     } = req.body;
@@ -828,6 +932,8 @@ router.put('/:id', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res:
     if (numericError) return res.status(400).json({ error: numericError });
     const weightedFieldError = validateWeightedProductFields(req.body, product);
     if (weightedFieldError) return res.status(400).json({ error: weightedFieldError });
+    const inventoryLinkError = validateInventoryLinkFields(db, req.body, String(req.params.id));
+    if (inventoryLinkError) return res.status(400).json({ error: inventoryLinkError });
 
     if (tax_behavior !== undefined && tax_behavior !== null && !VALID_TAX_BEHAVIORS.includes(tax_behavior)) {
       return res.status(400).json({ error: `tax_behavior must be one of: ${VALID_TAX_BEHAVIORS.join(', ')}` });
@@ -880,6 +986,23 @@ router.put('/:id', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res:
     const hasSaleUnit = hasOwn(req.body, 'sale_unit');
     const hasAllowFractionalQuantity = hasOwn(req.body, 'allow_fractional_quantity');
     const hasWeightPrecision = hasOwn(req.body, 'weight_precision');
+    const hasInventoryProductId = hasOwn(req.body, 'inventory_product_id');
+    const hasInventoryDeductionQuantity = hasOwn(req.body, 'inventory_deduction_quantity');
+    const hasStockQuantity = hasOwn(req.body, 'stock_quantity') && stock_quantity !== null && stock_quantity !== undefined;
+    const stockAdjustmentReason = stockReason(req.body.reason, 'Manual product stock update');
+    const actorUserId = String((req as Request & { user?: { userId?: string } }).user?.userId || '');
+    let normalizedInventoryDeductionQuantity: number | null = null;
+    if (hasInventoryDeductionQuantity) {
+      if (inventory_deduction_quantity === null) {
+        normalizedInventoryDeductionQuantity = null;
+      } else if (typeof inventory_deduction_quantity === 'number'
+        && Number.isFinite(inventory_deduction_quantity)
+        && inventory_deduction_quantity > 0) {
+        normalizedInventoryDeductionQuantity = inventory_deduction_quantity;
+      } else {
+        normalizedInventoryDeductionQuantity = 1;
+      }
+    }
 
     const addonGroupValidation = validateAddonGroupIds(db, addon_group_ids);
     if (addonGroupValidation.error) {
@@ -898,6 +1021,8 @@ router.put('/:id', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res:
           sale_unit = CASE WHEN @has_sale_unit = 1 THEN @sale_unit ELSE sale_unit END,
           allow_fractional_quantity = CASE WHEN @has_allow_fractional_quantity = 1 THEN @allow_fractional_quantity ELSE allow_fractional_quantity END,
           weight_precision = CASE WHEN @has_weight_precision = 1 THEN @weight_precision ELSE weight_precision END,
+          inventory_product_id = CASE WHEN @has_inventory_product_id = 1 THEN @inventory_product_id ELSE inventory_product_id END,
+          inventory_deduction_quantity = CASE WHEN @has_inventory_deduction_quantity = 1 THEN @inventory_deduction_quantity ELSE inventory_deduction_quantity END,
           description = CASE WHEN @has_description = 1 THEN @description ELSE description END,
           price = COALESCE(@price, price),
           cost = CASE WHEN @has_cost = 1 THEN @cost ELSE cost END,
@@ -906,7 +1031,6 @@ router.put('/:id', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res:
           tax_category_id = CASE WHEN @has_tax_category_id = 1 THEN @tax_category_id ELSE tax_category_id END,
           tax_behavior = COALESCE(@tax_behavior, tax_behavior),
           track_inventory = COALESCE(@track_inventory, track_inventory),
-          stock_quantity = COALESCE(@stock_quantity, stock_quantity),
           low_stock_threshold = COALESCE(@low_stock_threshold, low_stock_threshold),
           is_active = COALESCE(@is_active, is_active),
           image_url = CASE WHEN @has_image_url = 1 THEN @image_url ELSE image_url END,
@@ -930,6 +1054,10 @@ router.put('/:id', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res:
         allow_fractional_quantity: allow_fractional_quantity ? 1 : 0,
         has_weight_precision: hasWeightPrecision ? 1 : 0,
         weight_precision: weight_precision ?? null,
+        has_inventory_product_id: hasInventoryProductId ? 1 : 0,
+        inventory_product_id: hasInventoryProductId ? (inventory_product_id || null) : null,
+        has_inventory_deduction_quantity: hasInventoryDeductionQuantity ? 1 : 0,
+        inventory_deduction_quantity: normalizedInventoryDeductionQuantity,
         has_description: hasDescription ? 1 : 0,
         description: normalizeNullableString(description),
         price: price ?? null,
@@ -939,7 +1067,6 @@ router.put('/:id', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res:
         tax_behavior: tax_behavior ?? null,
         has_tax_category_id: hasTaxCategoryId ? 1 : 0,
         track_inventory: track_inventory ? 1 : track_inventory === 0 || track_inventory === false ? 0 : null,
-        stock_quantity: stock_quantity ?? null,
         low_stock_threshold: low_stock_threshold ?? null,
         is_active: is_active !== undefined ? (is_active ? 1 : 0) : null,
         has_image_url: hasImageUrl ? 1 : 0,
@@ -962,6 +1089,23 @@ router.put('/:id', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res:
           }
         }
       }
+
+      if (hasStockQuantity) {
+        const currentProduct = db.prepare('SELECT stock_quantity FROM products WHERE id = ? AND deleted_at IS NULL').get(req.params.id) as { stock_quantity?: number } | undefined;
+        if (!currentProduct) throw Object.assign(new Error('Product not found'), { statusCode: 404 });
+        const stockDelta = Number(stock_quantity) - Number(currentProduct.stock_quantity ?? 0);
+        if (stockDelta !== 0) {
+          adjustProductStock(db, {
+            productId: String(req.params.id),
+            quantityDelta: stockDelta,
+            movementType: 'adjustment',
+            referenceType: 'manual_adjustment',
+            referenceId: String(req.params.id),
+            reason: stockAdjustmentReason,
+            actorUserId,
+          });
+        }
+      }
     });
     updateProduct();
 
@@ -969,16 +1113,24 @@ router.put('/:id', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res:
     res.json({ product: serializeProduct(updated) });
   } catch (error: any) {
     console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+    res.status(statusCode).json({ error: statusCode >= 500 ? "Internal server error" : error.message });
   }
 });
 
-router.delete('/:id', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.delete('/:id', requirePermission('catalog.manage'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const product = db.prepare('SELECT * FROM products WHERE id = ? AND deleted_at IS NULL').get(req.params.id);
     if (!product) {
       return res.status(404).json({ error: 'Product not found' });
+    }
+
+    const linkedBy = db.prepare(
+      'SELECT id FROM products WHERE inventory_product_id = ? AND deleted_at IS NULL LIMIT 1',
+    ).get(req.params.id);
+    if (linkedBy) {
+      return res.status(409).json({ error: 'Cannot delete a product that is the inventory target for another product. Remove the inventory link first.' });
     }
 
     db.prepare('UPDATE products SET deleted_at = ? WHERE id = ?').run(now(), req.params.id);
@@ -989,7 +1141,7 @@ router.delete('/:id', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, r
   }
 });
 
-router.post('/:id/stock', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.post('/:id/stock', requirePermission('inventory.manage'), (req: Request, res: Response) => {
   try {
     const { action, quantity } = req.body;
 
@@ -1003,6 +1155,7 @@ router.post('/:id/stock', requireRole(...ROLE_ACCESS.ownerManager), (req: Reques
     if (typeof quantity !== 'number' || !Number.isFinite(quantity) || quantity < 0) {
       return res.status(400).json({ error: 'quantity must be a non-negative number' });
     }
+    const adjustmentReason = stockReason(req.body.reason, 'Manual stock adjustment');
 
     const db = getDatabase();
     const product = db.prepare('SELECT * FROM products WHERE id = ? AND deleted_at IS NULL').get(req.params.id);
@@ -1010,30 +1163,37 @@ router.post('/:id/stock', requireRole(...ROLE_ACCESS.ownerManager), (req: Reques
       return res.status(404).json({ error: 'Product not found' });
     }
 
-    let result;
-    if (action === 'set') {
-      result = db.prepare('UPDATE products SET stock_quantity = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL')
-        .run(quantity, now(), req.params.id);
-    } else if (action === 'increase') {
-      result = db.prepare('UPDATE products SET stock_quantity = stock_quantity + ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL')
-        .run(quantity, now(), req.params.id);
-    } else {
-      result = db.prepare('UPDATE products SET stock_quantity = stock_quantity - ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL AND stock_quantity >= ?')
-        .run(quantity, now(), req.params.id, quantity);
-    }
-    if (result.changes === 0) {
-      return res.status(400).json({ error: action === 'decrease' ? 'Insufficient stock' : 'Product not found' });
-    }
-    const updated = db.prepare('SELECT * FROM products WHERE id = ?').get(req.params.id);
+    const actorUserId = String((req as Request & { user?: { userId?: string } }).user?.userId || '');
+    const updated = db.transaction(() => {
+      const current = db.prepare('SELECT stock_quantity FROM products WHERE id = ? AND deleted_at IS NULL').get(req.params.id) as { stock_quantity?: number } | undefined;
+      if (!current) throw Object.assign(new Error('Product not found'), { statusCode: 404 });
+      const currentStock = Number(current.stock_quantity ?? 0);
+      const quantityDelta = action === 'set'
+        ? quantity - currentStock
+        : action === 'increase' ? quantity : -quantity;
+      if (quantityDelta !== 0) {
+        adjustProductStock(db, {
+          productId: String(req.params.id),
+          quantityDelta,
+          movementType: 'adjustment',
+          referenceType: 'manual_adjustment',
+          referenceId: `${req.params.id}:${now()}`,
+          reason: adjustmentReason,
+          actorUserId,
+        });
+      }
+      return db.prepare('SELECT * FROM products WHERE id = ?').get(req.params.id);
+    })();
     res.json({ product: serializeProduct(updated) });
   } catch (error: any) {
     console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    const statusCode = Number.isInteger(error?.statusCode) ? error.statusCode : 500;
+    res.status(statusCode).json({ error: statusCode >= 500 ? "Internal server error" : error.message });
   }
 });
 
 // Exposes zero-rate products so the merchant can review and opt into global loyalty.
-router.get('/loyalty/global-rate-candidates', requireRole(...ROLE_ACCESS.ownerManager), (_req: Request, res: Response) => {
+router.get('/loyalty/global-rate-candidates', requirePermission('catalog.manage'), (_req: Request, res: Response) => {
   try {
     const row = getDatabase().prepare(
       'SELECT COUNT(*) AS count FROM products WHERE cb_percent = 0 AND deleted_at IS NULL'
@@ -1045,7 +1205,7 @@ router.get('/loyalty/global-rate-candidates', requireRole(...ROLE_ACCESS.ownerMa
   }
 });
 
-router.post('/loyalty/apply-global-rate', requireRole(...ROLE_ACCESS.ownerManager), (_req: Request, res: Response) => {
+router.post('/loyalty/apply-global-rate', requirePermission('catalog.manage'), (_req: Request, res: Response) => {
   try {
     const result = getDatabase().prepare(
       'UPDATE products SET cb_percent = NULL, updated_at = ? WHERE cb_percent = 0 AND deleted_at IS NULL'

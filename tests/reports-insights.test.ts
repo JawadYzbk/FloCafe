@@ -90,6 +90,9 @@ async function main() {
   if ((db.prepare(`SELECT COUNT(*) as c FROM settings WHERE key = 'timezone'`).get() as any).c === 0) {
     db.prepare(`INSERT INTO settings (key, value) VALUES ('timezone', 'Asia/Kolkata')`).run();
   }
+  // Regional settings come from signup, never a fallback; seed one
+  // explicitly so resolveRegionalSnapshot() resolves.
+  db.prepare(`INSERT INTO settings (key, value, updated_at) VALUES ('country', 'IN', ?) ON CONFLICT(key) DO UPDATE SET value='IN', updated_at=excluded.updated_at`).run(now());
 
   // ── Seed staff ────────────────────────────────────────────────────────
   const ownerId = 'owner-insights';

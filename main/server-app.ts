@@ -1,5 +1,6 @@
 import express, { Express, Request, Response, NextFunction } from 'express';
 import cors from 'cors';
+import expressRateLimit from 'express-rate-limit';
 import jwt from 'jsonwebtoken';
 import * as http from 'http';
 import * as path from 'path';
@@ -7,27 +8,21 @@ import * as fs from 'fs';
 import { randomUUID } from 'node:crypto';
 import { closeServerResources, createShutdownCancellationError, getHttpRequestSignal, installHttpShutdownTracking, trackHttpRequestWork } from './shutdown';
 import { databaseMaintenanceMiddleware, getDatabase, isServerAppEnabled } from './db';
-import { getJWTSecret } from './routes/auth';
+import { getJWTSecret } from './security/jwt-secret';
 import { authRateLimit, staticRouteRateLimit, corsOptions, isTokenRevoked, isTokenStale, rateLimit, revokeToken } from './middleware/security';
 import { getServerPort } from './server';
 import { getDefaultServerAppPort, getServerAppPort as getActiveServerAppPort, setServerAppPort } from './server-app-state';
 import { API_JSON_BODY_LIMIT } from './http-limits';
 import { buildCspHeader } from './csp';
 import { resolveContainedPath } from './lib/path-containment';
-import { ROLE_ACCESS } from '../shared/role-permissions';
-import {
-  getCountryByCode,
-  getCurrencyFractionDigits,
-  getCurrencySymbol,
-  resolveTenantCurrency,
-} from './countries';
+import { RegionalNotConfiguredError, resolveRegionalSnapshot } from './countries';
+import { effectivePermissionRevision, hasPermission, resolveEffectivePermissions } from './services/authorization';
 
 let serverApp: http.Server | null = null;
 let stopPromise: Promise<void> | null = null;
 let startReject: ((error: Error) => void) | null = null;
 let stopping = false;
 const SERVER_APP_PORT = getDefaultServerAppPort();
-const SERVER_APP_ALLOWED_ROLES = new Set(ROLE_ACCESS.serverApp);
 
 type ServerAppUser = {
   userId: string;
@@ -35,22 +30,6 @@ type ServerAppUser = {
   role: string;
   iat?: number;
 };
-
-function currencyPosition(locale: string, currency: string): 'prefix' | 'suffix' {
-  try {
-    const parts = new Intl.NumberFormat(locale, {
-      style: 'currency',
-      currency,
-      currencyDisplay: 'narrowSymbol',
-    }).formatToParts(1);
-    return parts.findIndex((part) => part.type === 'currency')
-      < parts.findIndex((part) => part.type === 'integer')
-      ? 'prefix'
-      : 'suffix';
-  } catch {
-    return 'prefix';
-  }
-}
 
 function normalizeEmail(email: unknown): string {
   return String(email || '').trim().toLowerCase();
@@ -102,8 +81,8 @@ function requireServerAppAuth(req: Request, res: Response, next: NextFunction) {
     if (!user || isTokenStale(decoded.iat, user.tokens_valid_after)) {
       return res.status(401).json({ error: 'Invalid token' });
     }
-    if (!SERVER_APP_ALLOWED_ROLES.has(user.role)) {
-      return res.status(403).json({ error: 'Access denied. Only server, manager, or owner accounts allowed.' });
+    if (!hasPermission(user.id, 'server-app.use')) {
+      return res.status(403).json({ error: 'Access denied. Only server, manager, or owner accounts allowed.', code: 'permission_denied' });
     }
 
     (req as any).user = {
@@ -202,18 +181,20 @@ export function startServerApp(): Promise<void> {
       const rows = getDatabase().prepare('SELECT key, value FROM settings').all() as { key: string; value: string }[];
       const settings: Record<string, string> = {};
       for (const row of rows) settings[row.key] = row.value;
-      const country = getCountryByCode(settings.country) || getCountryByCode('IN')!;
-      const currency = resolveTenantCurrency(settings.currency, country.code);
-      const currencySymbol = settings.currency_symbol?.trim()
-        || getCurrencySymbol(currency, country.locale)
-        || currency;
+      let snapshot;
+      try {
+        snapshot = resolveRegionalSnapshot(settings);
+      } catch (error) {
+        if (error instanceof RegionalNotConfiguredError) return res.status(409).json({ error: 'regional_not_configured' });
+        throw error;
+      }
       res.json({
         language: settings.language || null,
-        country: country.code,
-        currency,
-        currency_symbol: currencySymbol,
-        currency_position: currencyPosition(country.locale, currency),
-        currency_fraction_digits: getCurrencyFractionDigits(currency),
+        country: snapshot.country,
+        currency: snapshot.currency,
+        currency_symbol: snapshot.currencySymbol,
+        currency_position: snapshot.currencyPosition,
+        currency_fraction_digits: snapshot.currencyFractionDigits,
         kds_enabled: settings.kds_enabled !== 'false',
       });
     });
@@ -239,8 +220,8 @@ export function startServerApp(): Promise<void> {
         if (!user || !passwordMatches) {
           return res.status(401).json({ error: 'Invalid credentials' });
         }
-        if (!SERVER_APP_ALLOWED_ROLES.has(user.role)) {
-          return res.status(403).json({ error: 'Access denied. Only server, manager, or owner accounts allowed.' });
+        if (!hasPermission(user.id, 'server-app.use')) {
+          return res.status(403).json({ error: 'Access denied. Only server, manager, or owner accounts allowed.', code: 'permission_denied' });
         }
 
         const token = jwt.sign(
@@ -251,7 +232,14 @@ export function startServerApp(): Promise<void> {
 
         res.json({
           access_token: token,
-          user: { id: user.id, name: user.name, email: user.email, role: user.role },
+          user: {
+            id: user.id,
+            name: user.name,
+            email: user.email,
+            role: user.role,
+            permission_ids: [...(resolveEffectivePermissions(user.id)?.permissionIds ?? [])],
+            authorization_revision: effectivePermissionRevision(user.id),
+          },
         });
       } catch (error: any) {
         console.error('[Server App] Login error:', error);
@@ -263,7 +251,13 @@ export function startServerApp(): Promise<void> {
       const user = (req as any).user as ServerAppUser;
       const row = getDatabase().prepare('SELECT id, name, email, role FROM users WHERE id = ? AND is_active = 1').get(user.userId) as any;
       if (!row) return res.status(401).json({ error: 'Invalid token' });
-      res.json({ user: row });
+      res.json({
+        user: {
+          ...row,
+          permission_ids: [...(resolveEffectivePermissions(row.id)?.permissionIds ?? [])],
+          authorization_revision: effectivePermissionRevision(row.id),
+        },
+      });
     });
 
     app.post('/api/auth/logout', requireServerAppAuth, (req: Request, res: Response) => {
@@ -280,8 +274,19 @@ export function startServerApp(): Promise<void> {
     app.post('/api/orders/:id/items', requireServerAppAuth, (req, res) => forwardToMainApi(req, res, `/orders/${encodeURIComponent(String(req.params.id))}/items`));
     app.get('/api/customers-search', requireServerAppAuth, (req, res) => forwardToMainApi(req, res, '/customers-search'));
     app.get('/api/crm/lookup', requireServerAppAuth, (req, res) => forwardToMainApi(req, res, '/crm/lookup'));
-    app.post('/api/customers', requireServerAppAuth, (req, res) => forwardToMainApi(req, res, '/customers'));
-    const printForwardRateLimit = rateLimit({ windowMs: 60 * 1000, max: 30 });
+    const customerWriteRateLimit = expressRateLimit({
+      windowMs: 60 * 1000,
+      limit: 150,
+      standardHeaders: true,
+      legacyHeaders: false,
+    });
+    app.post('/api/customers', customerWriteRateLimit, requireServerAppAuth, (req, res) => forwardToMainApi(req, res, '/customers'));
+    const printForwardRateLimit = expressRateLimit({
+      windowMs: 60 * 1000,
+      limit: 30,
+      standardHeaders: true,
+      legacyHeaders: false,
+    });
     app.post('/api/printers/print-kot', printForwardRateLimit, requireServerAppAuth, (req, res) => forwardToMainApi(req, res, '/printers/print-kot'));
     app.post('/api/printers/print-bill', printForwardRateLimit, requireServerAppAuth, (req, res) => forwardToMainApi(req, res, '/printers/print-bill'));
 

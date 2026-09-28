@@ -1,13 +1,8 @@
 import { Router, Request, Response } from 'express';
 import { getDatabase, now } from '../db';
-import { requireRole } from '../middleware/security';
+import { requirePermission } from '../services/authorization';
 
 const router = Router();
-
-// Finances are sensitive (salaries, operating costs), so every expenses route is
-// gated to owner/manager — the same authority level as reports. Cashiers/servers
-// never see or touch expense data.
-const MANAGE_ROLES = ['owner', 'manager'] as const;
 
 export const EXPENSE_CATEGORIES = [
   'salary', 'rent', 'utilities', 'supplies', 'inventory',
@@ -52,7 +47,7 @@ function parseExpenseBody(body: any): { value: ParsedExpense } | { error: string
 }
 
 // ── List (optional date range / category / staff filter) ─────────────────────
-router.get('/', requireRole(...MANAGE_ROLES), (req: Request, res: Response) => {
+router.get('/', requirePermission('expenses.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const { start_date, end_date, category, staff_id } = req.query;
@@ -81,7 +76,7 @@ router.get('/', requireRole(...MANAGE_ROLES), (req: Request, res: Response) => {
 });
 
 // ── Summary (totals by category + grand total for a period) ──────────────────
-router.get('/summary', requireRole(...MANAGE_ROLES), (req: Request, res: Response) => {
+router.get('/summary', requirePermission('expenses.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const { start_date, end_date } = req.query;
@@ -105,7 +100,7 @@ router.get('/summary', requireRole(...MANAGE_ROLES), (req: Request, res: Respons
 });
 
 // ── Create ───────────────────────────────────────────────────────────────────
-router.post('/', requireRole(...MANAGE_ROLES), (req: Request, res: Response) => {
+router.post('/', requirePermission('expenses.manage'), (req: Request, res: Response) => {
   try {
     const parsed = parseExpenseBody(req.body);
     if ('error' in parsed) return res.status(400).json({ error: parsed.error });
@@ -129,7 +124,7 @@ router.post('/', requireRole(...MANAGE_ROLES), (req: Request, res: Response) => 
 });
 
 // ── Update ───────────────────────────────────────────────────────────────────
-router.put('/:id', requireRole(...MANAGE_ROLES), (req: Request, res: Response) => {
+router.put('/:id', requirePermission('expenses.manage'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const existing = db.prepare('SELECT * FROM expenses WHERE id = ?').get(req.params.id);
@@ -154,7 +149,7 @@ router.put('/:id', requireRole(...MANAGE_ROLES), (req: Request, res: Response) =
 });
 
 // ── Delete (owner only — deleting financial records is the most privileged) ───
-router.delete('/:id', requireRole('owner'), (req: Request, res: Response) => {
+router.delete('/:id', requirePermission('expenses.delete'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const result = db.prepare('DELETE FROM expenses WHERE id = ?').run(req.params.id);

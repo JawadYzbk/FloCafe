@@ -1,8 +1,7 @@
 import { createHash } from 'crypto';
 import { Router, Request, Response } from 'express';
 import { getDatabase, now, withTxn } from '../db';
-import { requireRole } from '../middleware/security';
-import { ROLE_ACCESS } from '../../shared/role-permissions';
+import { requirePermission } from '../services/authorization';
 import { checkPinRateLimit } from './orders';
 import { createRefund, getTenantCurrency, RefundRequest } from '../services/refund';
 import { getCurrencyFractionDigits, getCurrencyMinorUnitFactor } from '../countries';
@@ -20,7 +19,7 @@ function refundIdempotencyKey(req: Request): string | null {
   return supplied;
 }
 
-function refundRequestHash(billId: string, body: any): string {
+function refundRequestHash(billId: string, body: any, approverId: string): string {
   return createHash('sha256').update(JSON.stringify({
     billId,
     order_item_id: body.order_item_id ?? null,
@@ -28,6 +27,7 @@ function refundRequestHash(billId: string, body: any): string {
     method: body.method ?? null,
     reason: body.reason ?? null,
     shift_id: body.shift_id ?? null,
+    approver_id: approverId,
   })).digest('hex');
 }
 
@@ -51,7 +51,7 @@ function refundAmountMinorUnits(value: unknown, currency: string): number {
   return minorUnits;
 }
 
-router.post('/', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.post('/', requirePermission('refunds.initiate'), (req: Request, res: Response) => {
   try {
     const body = req.body || {};
     const billId = body.bill_id;
@@ -74,8 +74,21 @@ router.post('/', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: R
       return res.status(400).json({ error: 'reason is too long' });
     }
 
+    const approverId = body.approver_id !== undefined && body.approver_id !== null
+      ? String(body.approver_id).trim()
+      : '';
+    const managerId = body.manager_id !== undefined && body.manager_id !== null
+      ? String(body.manager_id).trim()
+      : '';
+    if (!approverId && !managerId) {
+      return res.status(400).json({ error: 'approver_id is required', code: 'APPROVER_REQUIRED' });
+    }
+    if (approverId && managerId && approverId !== managerId) {
+      return res.status(400).json({ error: 'approver_id and manager_id must identify the same approver', code: 'APPROVER_CONFLICT' });
+    }
+    const selectedApproverId = approverId || managerId;
     const idempotencyKey = refundIdempotencyKey(req);
-    const requestHash = idempotencyKey ? refundRequestHash(String(billId), body) : undefined;
+    const requestHash = idempotencyKey ? refundRequestHash(String(billId), body, selectedApproverId) : undefined;
 
     const userId = String((req as any).user.userId);
     const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
@@ -88,7 +101,7 @@ router.post('/', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: R
       reason: body.reason ?? null,
       shiftId: body.shift_id ?? null,
       overridePin: body.override_pin,
-      managerId: body.manager_id || body.user_id,
+      approverId: selectedApproverId,
       createdByUserId: userId,
       clientIp,
       checkPinRateLimit,
@@ -103,7 +116,7 @@ router.post('/', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: R
   }
 });
 
-router.get('/', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, res: Response) => {
+router.get('/', requirePermission('refunds.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     let query = 'SELECT * FROM refunds WHERE 1=1';

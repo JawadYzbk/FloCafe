@@ -30,12 +30,15 @@
  *      layout carries `HtmlLangSync`.
  *
  *   5. The Server App and KDS disabled states and operational strings must be
- *      localized through i18n keys across all supported languages (en/es/fr/pt/fa).
+ *      localized through i18n keys across all supported languages, including Albanian (sq).
  *
  *   6. The Server App inherits the tenant language through the shared
  *      `useSyncServerLanguage` path pointed at `/api/server-app/info`
  *      (same `language` field as `/api/kds/info`). This is exercised
  *      end-to-end through `fetchServerInfo`.
+ *
+ *   7. Server App send uses the LAN-safe `createPaymentIdempotencyKey`
+ *      helper so plain-HTTP LAN tablets never stick on "Sending...".
  *
  * Run: npm run test:rtl-kds-server-whatsapp
  */
@@ -209,7 +212,7 @@ async function run(): Promise<void> {
 
   // #375: prime the shared locale cache so synchronous t() resolves the
   // on-demand bundles in this test process.
-  for (const lang of ['en', 'es', 'fr', 'pt', 'fa'] as const) {
+  for (const lang of ['en', 'es', 'fr', 'pt', 'ru', 'fa', 'ur', 'it', 'ja', 'zh', 'zh-tw', 'ko', 'id', 'nl', 'hi', 'bn', 'sq', 'vi', 'th', 'ne'] as const) {
     await loadLocaleMessages(lang);
   }
 
@@ -287,7 +290,7 @@ async function run(): Promise<void> {
   //    #376: HtmlLangSync reads the active locale from the i18n context
   //    (useLocale), so each render is wrapped in an IntlProvider whose locale
   //    matches the language under test.
-  for (const lang of ['en', 'es', 'fr', 'pt', 'fa'] as const) {
+  for (const lang of ['en', 'es', 'fr', 'pt', 'ru', 'fa', 'ur', 'it', 'ja', 'zh', 'zh-tw', 'ko', 'id', 'nl', 'hi', 'bn', 'sq', 'vi', 'th', 'ne'] as const) {
     usePosSettingsStore.getState().setLanguage(lang);
     const kdsMarkup = ReactDOMServer.renderToStaticMarkup(React.createElement(KdsHtmlLang));
     assert(kdsMarkup === '', `KdsHtmlLang must render null, got: ${kdsMarkup}`);
@@ -297,15 +300,17 @@ async function run(): Promise<void> {
     assert(serverMarkup === '', `HtmlLangSync must render null, got: ${serverMarkup}`);
   }
 
-  assert(getLanguageDirection('fa') === 'rtl', 'Persian (fa) must resolve to rtl');
-  for (const ltrLang of ['en', 'es', 'fr', 'pt'] as const) {
+  for (const rtlLang of ['fa', 'ur'] as const) {
+    assert(getLanguageDirection(rtlLang) === 'rtl', `${rtlLang} must resolve to rtl`);
+  }
+  for (const ltrLang of ['en', 'es', 'fr', 'pt', 'ru', 'it', 'ja', 'zh', 'zh-tw', 'ko', 'id', 'nl', 'hi', 'bn', 'sq', 'vi', 'th', 'ne'] as const) {
     assert(getLanguageDirection(ltrLang) === 'ltr', `${ltrLang} must resolve to ltr`);
   }
   console.log('  ✓ standalone layouts sync document dir/lang (KdsHtmlLang / HtmlLangSync)');
 
   // 5. KDS disabled screens and Server App strings resolve localized i18n keys.
   const { createTranslator } = frontendRequire('use-intl/core');
-  const getTestTranslator = (lang: 'en' | 'es' | 'fr' | 'pt' | 'fa') => {
+  const getTestTranslator = (lang: 'en' | 'es' | 'fr' | 'pt' | 'ru' | 'fa' | 'ur' | 'it' | 'ja' | 'zh' | 'zh-tw' | 'ko' | 'id' | 'nl' | 'hi' | 'bn' | 'sq' | 'vi' | 'th' | 'ne') => {
     const messages = getCachedMessages(lang) ?? getCachedMessages('en') ?? {};
     return createTranslator({ locale: getLanguageLocale(lang), messages }) as unknown as (
       key: string,
@@ -343,7 +348,7 @@ async function run(): Promise<void> {
   const guestFa = getTestTranslator('fa')('serverApp.guestFallbackName', { last4: '5678' });
   assert(guestFa.includes('5678') && !guestFa.startsWith('Guest '), `serverApp.guestFallbackName FA substitution failed, got: ${guestFa}`);
 
-  for (const lang of ['en', 'es', 'fr', 'pt', 'fa'] as const) {
+  for (const lang of ['en', 'es', 'fr', 'pt', 'ru', 'fa', 'ur', 'it', 'ja', 'zh', 'zh-tw', 'ko', 'id', 'nl', 'hi', 'bn', 'sq', 'vi', 'th', 'ne'] as const) {
     for (const key of ['kds.disabledTitle', 'kds.disabledHint', 'serverApp.disabledTitle', 'serverApp.disabledHint']) {
       const val = getTestTranslator(lang)(key);
       assert(val && val !== key, `Translation key ${key} must resolve for ${lang}`);
@@ -377,6 +382,37 @@ async function run(): Promise<void> {
     (global as any).window = realWindow;
   }
   console.log('  ✓ Server App inherits tenant language via /api/server-app/info (useSyncServerLanguage path)');
+
+  // 7. LAN-safe send nonce, scoped to sendDraft so an unrelated later call cannot mask a regression.
+  const serverAppPage = fs.readFileSync(
+    path.join(ROOT, 'frontend/src/app/server-standalone/page.tsx'),
+    'utf8',
+  );
+  assert(
+    !serverAppPage.includes('crypto.randomUUID'),
+    'server-standalone/page.tsx must not call crypto.randomUUID directly (throws on plain-HTTP LAN); use the LAN-safe helper',
+  );
+  const sendDraftBody = serverAppPage.slice(
+    serverAppPage.indexOf('async function sendDraft()'),
+    serverAppPage.indexOf('const activeTable ='),
+  );
+  assert(
+    sendDraftBody.includes('createPaymentIdempotencyKey()'),
+    'sendDraft must generate its nonce via the LAN-safe createPaymentIdempotencyKey helper',
+  );
+  assert(
+    sendDraftBody.indexOf('createPaymentIdempotencyKey()') < sendDraftBody.indexOf('setSending(true)'),
+    'sendDraft must compute its nonce before setSending(true) so a sync throw cannot stick the UI on Sending...',
+  );
+  const { createPaymentIdempotencyKey } = frontendRequire('./src/lib/payment-idempotency');
+  assert(
+    typeof createPaymentIdempotencyKey() === 'string' && createPaymentIdempotencyKey().length > 0,
+    'createPaymentIdempotencyKey must produce a key with no crypto argument (legacy fallback)',
+  );
+  const lanKeyA = createPaymentIdempotencyKey({ getRandomValues: (v: Uint32Array) => v.fill(7) });
+  const lanKeyB = createPaymentIdempotencyKey({ getRandomValues: (v: Uint32Array) => v.fill(8) });
+  assert(lanKeyA !== lanKeyB, 'LAN fallback keys must be unique per send attempt');
+  console.log('  ✓ Server App send uses a LAN-safe nonce computed before Sending...');
 
   console.log('\n✅ All RTL/LTR KDS, Server App, and WhatsApp checks passed.');
 }

@@ -12,7 +12,8 @@ import { SHUTDOWN_TIMEOUT_MS } from './shutdown';
 import { resolveContainedPath } from './lib/path-containment';
 import { serializeMerchantTemplatePayload, validateMerchantTemplateText } from '../shared/print';
 import { ROLE_KEYS } from '../shared/role-permissions';
-import { getCurrencyFractionDigits } from './countries';
+import { businessDateForInstant, dayBoundsInTimezone, normalizeBusinessDayStartTime, utcDayBounds } from '../shared/business-date';
+import { getCurrencyFractionDigits, resolveRegionalSnapshot } from './countries';
 
 const USER_ROLE_SQL_CHECK = `CHECK (role IN (${ROLE_KEYS.map((role) => `'${role}'`).join(', ')}))`;
 
@@ -209,13 +210,23 @@ const DATABASE_MAINTENANCE_ROUTES = new Set([
   'POST /api/db/backup',
   'GET /api/db/download',
   'POST /api/db-tools/initialize',
+  'POST /api/db-tools/currency-reset',
 ]);
 
 function isDatabaseMaintenanceRoute(req: Request): boolean {
-  return DATABASE_MAINTENANCE_ROUTES.has(`${req.method} ${req.path}`);
+  // Lowercased for the same reason as requireAuth: the mount is case-insensitive,
+  // so an exact-match lookup on the raw spelling misses case variants.
+  const fullPath = ((req.baseUrl || '') + req.path).toLowerCase();
+  return DATABASE_MAINTENANCE_ROUTES.has(`${req.method} ${fullPath}`);
 }
 
 export function databaseMaintenanceMiddleware(req: Request, res: Response, next: NextFunction): void {
+  const fullPath = ((req.baseUrl || '') + req.path).toLowerCase();
+  if (!fullPath.startsWith('/api')) {
+    next();
+    return;
+  }
+
   if (databaseShutdownRequested) {
     res.status(503).json({ error: 'Database is shutting down' });
     return;
@@ -328,15 +339,13 @@ export function getSettingValue(key: string): string | null {
   return row?.value ?? null;
 }
 
-/** Resolves the tenant's configured business day start time ('HH:mm', 00:00 to 11:59). */
+/** Resolves the tenant's configured business day start time, holding it to the
+ *  `00:00`-`11:59` contract the settings endpoint enforces. */
 export function tenantBusinessDayStartTime(customDb?: ReturnType<typeof getDatabase>): string {
   const raw = customDb
     ? (customDb.prepare("SELECT value FROM settings WHERE key = 'business_day_start_time'").get() as { value?: unknown } | undefined)?.value
     : getSettingValue('business_day_start_time');
-  if (typeof raw === 'string' && /^(?:0\d|1[01]):[0-5]\d$/.test(raw.trim())) {
-    return raw.trim();
-  }
-  return '00:00';
+  return normalizeBusinessDayStartTime(typeof raw === 'string' ? raw : null);
 }
 
 export function upsertSettings(entries: Record<string, string | undefined | null>): void {
@@ -347,6 +356,34 @@ export function upsertSettings(entries: Record<string, string | undefined | null
   for (const [key, val] of Object.entries(entries)) {
     if (val !== undefined) stmt.run(key, val ?? '', now());
   }
+}
+
+export const GOOGLE_DRIVE_PRIVATE_SETTING_KEYS = [
+  'google_drive_account_subject',
+  'google_drive_account_email',
+  'google_drive_destination_folder_id',
+  'google_drive_destination_folder_name',
+  'google_drive_folder_id',
+  'google_drive_owned_destinations',
+  'google_drive_last_backup_at',
+  'google_drive_last_backup_status',
+  'google_drive_last_automatic_backup_at',
+  'google_drive_last_attempt_at',
+  'google_drive_last_success_at',
+  'google_drive_last_success_kind',
+  'google_drive_next_retry_at',
+  'google_drive_retention_status',
+  'google_drive_retention_retry_count',
+  'google_drive_last_error_code',
+  'google_drive_pending_upload',
+  'google_drive_job',
+  'google_drive_revoke_status',
+  'google_drive_revoke_cleanup_pending',
+];
+
+export function clearGoogleDriveRestoreBinding(dbInstance: Database.Database = db): void {
+  const placeholders = GOOGLE_DRIVE_PRIVATE_SETTING_KEYS.map(() => '?').join(', ');
+  dbInstance.prepare(`DELETE FROM settings WHERE key IN (${placeholders})`).run(...GOOGLE_DRIVE_PRIVATE_SETTING_KEYS);
 }
 
 function upsertSetting(key: string, value: string): void {
@@ -394,6 +431,14 @@ type ReplacementJournal = {
   recoveryPath: string;
   dbPath: string;
   baselineForeignKeyViolations?: string[];
+  driveInvalidationRequired?: boolean;
+};
+
+export type DatabaseReplacementJournalHandle = {
+  phase: 'prepared' | 'committed';
+  journalPath: string;
+  recoveryPath: string;
+  dbPath: string;
 };
 
 function syncFile(filePath: string): void {
@@ -443,11 +488,247 @@ function syncDirectory(directoryPath: string): boolean {
   }
 }
 
-function removeReplacementArtifacts(journalPath: string, recoveryPath: string): void {
-  for (const filePath of [journalPath, `${journalPath}.tmp`, recoveryPath, `${recoveryPath}-wal`, `${recoveryPath}-shm`]) {
-    try { if (pathEntryExists(filePath)) fs.unlinkSync(filePath); } catch { }
+function removeReplacementArtifactsDurably(journalPath: string, recoveryPath: string): void {
+  const directoryPath = path.dirname(journalPath);
+  const artifactPaths = [journalPath, `${journalPath}.tmp`, recoveryPath, `${recoveryPath}-wal`, `${recoveryPath}-shm`];
+  const cleanupId = crypto.randomBytes(8).toString('hex');
+  const backups: { originalPath: string; backupPath: string }[] = [];
+  let restorationFailed = false;
+  try {
+    for (const originalPath of artifactPaths) {
+      if (!pathEntryExists(originalPath)) continue;
+      const backupPath = `${originalPath}.cleanup-${cleanupId}`;
+      fs.copyFileSync(originalPath, backupPath);
+      syncFile(backupPath);
+      backups.push({ originalPath, backupPath });
+    }
+    if (!syncDirectory(directoryPath) && process.platform !== 'win32') throw new Error('Could not durably prepare database replacement cleanup');
+    for (const filePath of [recoveryPath, `${recoveryPath}-wal`, `${recoveryPath}-shm`]) {
+      if (pathEntryExists(filePath)) fs.unlinkSync(filePath);
+    }
+    if (!syncDirectory(directoryPath) && process.platform !== 'win32') throw new Error('Could not durably remove database replacement artifacts');
+    for (const filePath of [`${journalPath}.tmp`, journalPath]) {
+      if (pathEntryExists(filePath)) fs.unlinkSync(filePath);
+    }
+    if (!syncDirectory(directoryPath) && process.platform !== 'win32') throw new Error('Could not durably remove database replacement journal');
+    for (const { backupPath } of backups) {
+      if (pathEntryExists(backupPath)) fs.unlinkSync(backupPath);
+    }
+    if (!syncDirectory(directoryPath) && process.platform !== 'win32') throw new Error('Could not durably remove database replacement cleanup copies');
+  } catch (error) {
+    for (const { originalPath, backupPath } of backups) {
+      try {
+        if (!pathEntryExists(originalPath) && pathEntryExists(backupPath)) {
+          fs.copyFileSync(backupPath, originalPath);
+          syncFile(originalPath);
+        }
+      } catch { restorationFailed = true; }
+    }
+    if (!syncDirectory(directoryPath)) restorationFailed = true;
+    if (!restorationFailed) {
+      for (const { backupPath } of backups) {
+        try { if (pathEntryExists(backupPath)) fs.unlinkSync(backupPath); } catch { restorationFailed = true; }
+      }
+      if (!syncDirectory(directoryPath)) restorationFailed = true;
+    }
+    if (restorationFailed) {
+      throw new Error(
+        `Database replacement cleanup failed and recovery evidence was retained: ${error instanceof Error ? error.message : 'unknown error'}`,
+        { cause: error },
+      );
+    }
+    throw error;
   }
-  syncDirectory(path.dirname(journalPath));
+}
+
+function restoreReplacementCleanupEvidence(backupDir: string, dbPath: string): void {
+  let names: string[];
+  try {
+    names = fs.readdirSync(backupDir);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  const groups = new Map<string, Map<string, string>>();
+  for (const name of names) {
+    const markerIndex = name.lastIndexOf('.cleanup-');
+    if (markerIndex < 0) continue;
+    const originalName = name.slice(0, markerIndex);
+    const cleanupId = name.slice(markerIndex + '.cleanup-'.length);
+    if (!/^[a-f0-9]{16}$/.test(cleanupId)) continue;
+    if (!/^(?:flo-restore|flo-reset)-recovery-.+\.(?:json|json\.tmp|db(?:-(?:wal|shm))?)$/.test(originalName)) continue;
+    const canonicalName = originalName.endsWith('.json.tmp') ? originalName.slice(0, -'.tmp'.length) : originalName;
+    const canonicalBase = canonicalName.replace(/(?:\.json|\.db(?:-(?:wal|shm))?)$/, '');
+    const groupKey = `${canonicalBase}:${cleanupId}`;
+    const group = groups.get(groupKey) || new Map<string, string>();
+    group.set(canonicalName, name);
+    groups.set(groupKey, group);
+  }
+  for (const [groupKey, group] of groups) {
+    const separator = groupKey.lastIndexOf(':');
+    const canonicalBase = groupKey.slice(0, separator);
+    const journalName = `${canonicalBase}.json`;
+    const recoveryName = `${canonicalBase}.db`;
+    const journalPath = path.join(backupDir, journalName);
+    const recoveryPath = path.join(backupDir, recoveryName);
+    const journalEvidence = group.get(journalName) || group.get(`${journalName}.tmp`);
+    const recoveryEvidence = group.get(recoveryName);
+    if (!journalEvidence || !recoveryEvidence) {
+      if (pathEntryExists(journalPath) || pathEntryExists(recoveryPath)) throw new Error(`Incomplete database replacement cleanup evidence: ${canonicalBase}`);
+      for (const evidenceName of new Set(group.values())) {
+        const evidencePath = path.join(backupDir, evidenceName);
+        if (pathEntryExists(evidencePath)) fs.unlinkSync(evidencePath);
+      }
+      if (!syncDirectory(backupDir) && process.platform !== 'win32') throw new Error('Could not durably remove incomplete database replacement cleanup evidence');
+      continue;
+    }
+    for (const [canonicalPath, evidenceName] of [[journalPath, journalEvidence], [recoveryPath, recoveryEvidence]] as const) {
+      if (pathEntryExists(canonicalPath)) continue;
+      const evidencePath = path.join(backupDir, evidenceName);
+      const evidenceStat = fs.lstatSync(evidencePath);
+      if (evidenceStat.isSymbolicLink() || !evidenceStat.isFile()) throw new Error(`Invalid database replacement cleanup evidence: ${evidenceName}`);
+      if (canonicalPath === journalPath) {
+        const journal = JSON.parse(fs.readFileSync(evidencePath, 'utf8')) as Partial<ReplacementJournal>;
+        if (journal.dbPath !== dbPath || journal.recoveryPath !== recoveryPath) throw new Error(`Invalid database replacement cleanup journal: ${evidenceName}`);
+      }
+      fs.copyFileSync(evidencePath, canonicalPath);
+      syncFile(canonicalPath);
+    }
+    for (const evidenceName of new Set(group.values())) {
+      const evidencePath = path.join(backupDir, evidenceName);
+      if (pathEntryExists(evidencePath)) fs.unlinkSync(evidencePath);
+    }
+    if (!syncDirectory(backupDir) && process.platform !== 'win32') throw new Error('Could not durably restore database replacement cleanup evidence');
+  }
+}
+
+function replacementJournalPath(kind: 'restore' | 'reset'): string {
+  const recoveryPath = path.join(getBackupDir(), `flo-${kind}-recovery-${crypto.randomBytes(8).toString('hex')}.db`);
+  return recoveryPath.replace(/\.db$/, '.json');
+}
+
+function readReplacementJournal(journalPath: string): ReplacementJournal | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(journalPath, 'utf8')) as Partial<ReplacementJournal>;
+    if ((parsed.phase !== 'prepared' && parsed.phase !== 'committed')
+      || typeof parsed.recoveryPath !== 'string'
+      || typeof parsed.dbPath !== 'string'
+      || !path.isAbsolute(parsed.recoveryPath)
+      || !path.isAbsolute(parsed.dbPath)
+      || parsed.driveInvalidationRequired !== true
+      || parsed.dbPath !== getDbPath()
+      || path.dirname(parsed.recoveryPath) !== path.resolve(getBackupDir())
+      || `${path.basename(journalPath, '.json')}.db` !== path.basename(parsed.recoveryPath)) return null;
+    return parsed as ReplacementJournal;
+  } catch {
+    return null;
+  }
+}
+
+export function getDatabaseReplacementJournal(): DatabaseReplacementJournalHandle | null {
+  restoreReplacementCleanupEvidence(getBackupDir(), getDbPath());
+  let journals: string[];
+  try {
+    journals = fs.readdirSync(getBackupDir())
+      .filter((name) => /^(?:flo-restore|flo-reset)-recovery-.+\.json$/.test(name))
+      .map((name) => path.join(getBackupDir(), name))
+      .sort((a, b) => fs.lstatSync(b).mtimeMs - fs.lstatSync(a).mtimeMs);
+  } catch {
+    return null;
+  }
+  const journalPath = journals[0];
+  if (!journalPath) return null;
+  const journal = readReplacementJournal(journalPath);
+  if (!journal) return null;
+  return {
+    phase: journal.phase,
+    journalPath,
+    recoveryPath: journal.recoveryPath,
+    dbPath: journal.dbPath,
+  };
+}
+
+export function beginDatabaseReplacementJournal(
+  recoverySourcePath: string,
+  kind: 'restore' | 'reset',
+): DatabaseReplacementJournalHandle {
+  const dbPath = getDbPath();
+  const journalPath = replacementJournalPath(kind);
+  const recoveryPath = journalPath.replace(/\.json$/, '.db');
+  try {
+    fs.copyFileSync(recoverySourcePath, recoveryPath);
+    syncFile(recoveryPath);
+    writeReplacementJournal(journalPath, {
+      phase: 'prepared', recoveryPath, dbPath, driveInvalidationRequired: true,
+    });
+    return { phase: 'prepared', journalPath, recoveryPath, dbPath };
+  } catch (error) {
+    removeReplacementArtifactsDurably(journalPath, recoveryPath);
+    throw error;
+  }
+}
+
+export function commitDatabaseReplacementJournal(handle: DatabaseReplacementJournalHandle): void {
+  getDatabase().pragma('wal_checkpoint(TRUNCATE)');
+  syncFile(handle.dbPath);
+  if (!syncDirectory(path.dirname(handle.dbPath)) && process.platform !== 'win32') {
+    throw new Error('Could not durably commit database replacement');
+  }
+  try {
+    writeReplacementJournal(handle.journalPath, {
+      phase: 'committed',
+      recoveryPath: handle.recoveryPath,
+      dbPath: handle.dbPath,
+      driveInvalidationRequired: true,
+    });
+  } catch (error) {
+    if (readReplacementJournal(handle.journalPath)?.phase === 'committed') handle.phase = 'committed';
+    throw error;
+  }
+  handle.phase = 'committed';
+}
+
+export function abortDatabaseReplacementJournal(handle: DatabaseReplacementJournalHandle): void {
+  const journal = readReplacementJournal(handle.journalPath);
+  if (!journal || journal.phase === 'committed') return;
+  removeReplacementArtifactsDurably(handle.journalPath, handle.recoveryPath);
+}
+
+export function finalizeDatabaseReplacementJournal(handle: DatabaseReplacementJournalHandle): void {
+  const journal = readReplacementJournal(handle.journalPath);
+  if (journal?.phase !== 'committed') throw new Error('Database replacement is not committed');
+  removeReplacementArtifactsDurably(handle.journalPath, handle.recoveryPath);
+}
+
+export function recoverDatabaseReplacementJournal(handle: DatabaseReplacementJournalHandle): void {
+  const journal = readReplacementJournal(handle.journalPath);
+  if (journal?.phase === 'committed') return;
+  if (!journal || journal.recoveryPath !== handle.recoveryPath || journal.dbPath !== handle.dbPath) {
+    throw new Error('Database replacement journal could not be validated');
+  }
+  try {
+    const recoveryStat = fs.lstatSync(handle.recoveryPath);
+    if (recoveryStat.isSymbolicLink() || !recoveryStat.isFile()
+      || pathEntryExists(`${handle.recoveryPath}-wal`)
+      || pathEntryExists(`${handle.recoveryPath}-shm`)
+      || !isHealthyDatabaseFile(handle.recoveryPath, undefined, false)) {
+      throw new Error('Database replacement recovery snapshot could not be validated');
+    }
+  } catch (error) {
+    throw error instanceof Error
+      ? error
+      : new Error('Database replacement recovery snapshot could not be validated', { cause: error });
+  }
+  closeDatabase();
+  const failures = removeDatabaseFiles(handle.dbPath);
+  if (failures.length > 0) throw new Error(`Could not clear failed database replacement: ${failures.join(', ')}`);
+  fs.copyFileSync(handle.recoveryPath, handle.dbPath);
+  syncFile(handle.dbPath);
+  if (!syncDirectory(path.dirname(handle.dbPath)) && process.platform !== 'win32') {
+    throw new Error('Could not durably recover failed database replacement');
+  }
+  initDatabase(false, true);
+  removeReplacementArtifactsDurably(handle.journalPath, handle.recoveryPath);
 }
 
 let recoverySchemaReference: Map<string, string[]> | null = null;
@@ -521,6 +802,73 @@ function isHealthyDatabaseFile(
   }
 }
 
+export const MAX_RETAINED_RESTORE_SAFETY_COPIES = 3;
+
+/** True for the retained copies a successful restore leaves behind as an undo. */
+export function isRestoreSafetyCopyName(fileName: string): boolean {
+  return fileName.startsWith('flo-backup-') && fileName.includes('-pre-restore-') && fileName.endsWith('.db');
+}
+
+/**
+ * A successful restore replaces the live database, so the pre-restore snapshot is
+ * the only copy of what it replaced. It is copied into the managed backup naming
+ * scheme rather than deleted, which makes it appear in listBackups() and makes it
+ * restorable through the same preset-path route as any other managed backup.
+ * Retention is bounded so a long-lived install cannot accumulate copies forever.
+ *
+ * The snapshot is copied rather than renamed so the replacement journal keeps
+ * pointing at a real file: a crash between the committed journal and cleanup must
+ * still be able to roll the live database back from it.
+ */
+export function retainRestoreSafetyCopy(recoveryPath: string, schemaVersion: number): string | null {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const retainedPath = path.join(
+    getBackupDir(),
+    `flo-backup-${timestamp}-pre-restore-v${schemaVersion}.db`,
+  );
+  try {
+    if (!pathEntryExists(recoveryPath)) return null;
+    // The replacement journal snapshots the live file with a raw copy, so the
+    // snapshot carries no _flo_meta stamp and every restore route would refuse
+    // it. Stamp it before copying, so a failure here leaves the recovery copy
+    // exactly where the journal expects it and changes nothing.
+    const snapshotDb = new Database(recoveryPath);
+    try {
+      snapshotDb.pragma('journal_mode = DELETE');
+      snapshotDb.exec('CREATE TABLE IF NOT EXISTS _flo_meta (key TEXT PRIMARY KEY, value TEXT)');
+      snapshotDb.prepare('INSERT OR REPLACE INTO _flo_meta (key, value) VALUES (?, ?)')
+        .run('schema_version', String(schemaVersion));
+      snapshotDb.prepare('INSERT OR REPLACE INTO _flo_meta (key, value) VALUES (?, ?)')
+        .run('backup_created_at', new Date().toISOString());
+      snapshotDb.prepare('INSERT OR REPLACE INTO _flo_meta (key, value) VALUES (?, ?)')
+        .run('app_version', app.getVersion());
+    } finally {
+      snapshotDb.close();
+    }
+    syncFile(recoveryPath);
+    fs.copyFileSync(recoveryPath, retainedPath);
+    syncFile(retainedPath);
+    syncDirectory(getBackupDir());
+  } catch (error) {
+    // Retention is a safety net, never a reason to fail a committed restore.
+    console.warn('[DB] Could not retain the pre-restore safety copy:', error);
+    return null;
+  }
+  try {
+    const existing = fs.readdirSync(getBackupDir())
+      .filter(isRestoreSafetyCopyName)
+      .map((name) => ({ name, mtimeMs: fs.lstatSync(path.join(getBackupDir(), name)).mtimeMs }))
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    for (const stale of existing.slice(MAX_RETAINED_RESTORE_SAFETY_COPIES)) {
+      fs.unlinkSync(path.join(getBackupDir(), stale.name));
+    }
+    syncDirectory(getBackupDir());
+  } catch (error) {
+    console.warn('[DB] Could not apply pre-restore safety copy retention:', error);
+  }
+  return retainedPath;
+}
+
 function removeOlderReplacementJournals(journals: string[], dbPath: string, backupDir: string): void {
   const backupRoot = path.resolve(backupDir);
   for (const journalPath of journals) {
@@ -535,17 +883,18 @@ function removeOlderReplacementJournals(journals: string[], dbPath: string, back
         || `${path.basename(journalPath, '.json')}.db` !== path.basename(journal.recoveryPath)) {
         throw new Error('invalid stale replacement journal');
       }
-      removeReplacementArtifacts(journalPath, journal.recoveryPath);
+      removeReplacementArtifactsDurably(journalPath, journal.recoveryPath);
     } catch (error) {
       // Remove invalid stale journal and its snapshot without blocking startup.
       const fallbackRecovery = path.join(backupRoot, `${path.basename(journalPath, '.json')}.db`);
-      removeReplacementArtifacts(journalPath, fallbackRecovery);
+      removeReplacementArtifactsDurably(journalPath, fallbackRecovery);
       console.warn(`[DB] Removed stale invalid replacement journal: ${journalPath}`);
     }
   }
 }
 
 function recoverInterruptedDatabaseReplacement(dbPath: string, backupDir: string): void {
+  restoreReplacementCleanupEvidence(backupDir, dbPath);
   let journals: string[] = [];
   try {
     journals = fs.readdirSync(backupDir)
@@ -559,11 +908,11 @@ function recoverInterruptedDatabaseReplacement(dbPath: string, backupDir: string
     const fallbackRecovery = path.join(path.resolve(backupDir), `${path.basename(journalPath, '.json')}.db`);
     let journalStat: fs.Stats;
     try { journalStat = fs.lstatSync(journalPath); } catch {
-      removeReplacementArtifacts(journalPath, fallbackRecovery);
+      removeReplacementArtifactsDurably(journalPath, fallbackRecovery);
       continue;
     }
     if (journalStat.isSymbolicLink() || !journalStat.isFile()) {
-      removeReplacementArtifacts(journalPath, fallbackRecovery);
+      removeReplacementArtifactsDurably(journalPath, fallbackRecovery);
       continue;
     }
     let journal: ReplacementJournal;
@@ -599,7 +948,18 @@ function recoverInterruptedDatabaseReplacement(dbPath: string, backupDir: string
     const requireMetadata = false;
     // Finalize committed replacement if database file is healthy.
     if (journal.phase === 'committed' && isHealthyDatabaseFile(dbPath, allowedForeignKeyViolations, requireMetadata)) {
-      removeReplacementArtifacts(journalPath, recoveryPath);
+      if (journal.driveInvalidationRequired !== false) {
+        if (journal.driveInvalidationRequired !== true) {
+          writeReplacementJournal(journalPath, {
+            ...journal,
+            driveInvalidationRequired: true,
+          });
+        }
+        removeOlderReplacementJournals(journals.slice(1), dbPath, backupDir);
+        console.warn(`[DB] Preserved committed replacement journal for Drive invalidation: ${journalPath}`);
+        return;
+      }
+      removeReplacementArtifactsDurably(journalPath, recoveryPath);
       removeOlderReplacementJournals(journals.slice(1), dbPath, backupDir);
       console.warn(`[DB] Finalized committed database replacement journal: ${journalPath}`);
       return;
@@ -618,7 +978,7 @@ function recoverInterruptedDatabaseReplacement(dbPath: string, backupDir: string
     if (!syncDirectory(path.dirname(dbPath)) && process.platform !== 'win32') {
       throw new Error('Could not durably install recovered database');
     }
-    removeReplacementArtifacts(journalPath, recoveryPath);
+    removeReplacementArtifactsDurably(journalPath, recoveryPath);
     removeOlderReplacementJournals(journals.slice(1), dbPath, backupDir);
     console.warn(`[DB] Recovered database from interrupted replacement snapshot: ${recoveryPath}`);
     return;
@@ -727,6 +1087,11 @@ export function isTelemetryEnabled(): boolean {
 /** Tier 2 diagnostics consent toggle; separate from anonymous telemetry. */
 export function isDiagnosticsConsentEnabled(): boolean {
   return getSettingValue('diagnostics_consent') !== 'false';
+}
+
+/** Automatic transmission of captured diagnostics; off until an operator turns it on. */
+export function isDiagnosticsTransmissionEnabled(): boolean {
+  return getSettingValue('diagnostics_transmission_enabled') === 'true';
 }
 
 /** Kitchen Display System on/off switch. Defaults to enabled. */
@@ -952,25 +1317,25 @@ export function closeDatabase(): void {
   }
 }
 
-export async function createBackupUnlocked(targetPath?: string, signal?: AbortSignal): Promise<{ path: string; schemaVersion: number }> {
+type BackupOptions = { stagingDirectory?: string };
+
+export async function createBackupUnlocked(targetPath?: string, signal?: AbortSignal, options?: BackupOptions): Promise<{ path: string; schemaVersion: number }> {
   // Internal callers must already hold withDatabaseMaintenanceLock().
   if (signal?.aborted) throw createMaintenanceAbortError();
   console.log('[DB] createBackup: Starting...');
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
   const uniqueSuffix = crypto.randomBytes(4).toString('hex');
   const backupDir = getBackupDir();
-
-  if (!fs.existsSync(backupDir)) {
-    fs.mkdirSync(backupDir, { recursive: true });
-  }
-
-  // Write to userData temp path first to support sandbox constraints, then copy to targetPath.
-  const tempPath = path.join(backupDir, `flo-backup-${timestamp}-${uniqueSuffix}.db`);
+  const stagingDir = options?.stagingDirectory ? path.resolve(options.stagingDirectory) : backupDir;
+  const tempPath = path.join(stagingDir, `flo-backup-${timestamp}-${uniqueSuffix}.db`);
   const finalPath = targetPath ? path.resolve(targetPath) : tempPath;
   const stagedTargetPath = finalPath !== tempPath
     ? path.join(path.dirname(finalPath), `.${path.basename(finalPath)}.tmp-${uniqueSuffix}`)
     : null;
   let completed = false;
+
+  if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir, { recursive: true });
+  if (stagingDir !== backupDir && !fs.existsSync(stagingDir)) fs.mkdirSync(stagingDir, { recursive: true });
 
   const liveDatabasePath = getDbPath();
   if ([liveDatabasePath, `${liveDatabasePath}-wal`, `${liveDatabasePath}-shm`].some((livePath) => isLiveDatabaseTarget(finalPath, livePath))) {
@@ -1065,8 +1430,8 @@ export async function createBackupUnlocked(targetPath?: string, signal?: AbortSi
   }
 }
 
-export function createBackup(targetPath?: string, signal?: AbortSignal): Promise<{ path: string; schemaVersion: number }> {
-  return withDatabaseMaintenanceLock((maintenanceSignal) => createBackupUnlocked(targetPath, maintenanceSignal), signal);
+export function createBackup(targetPath?: string, signal?: AbortSignal, options?: BackupOptions): Promise<{ path: string; schemaVersion: number }> {
+  return withDatabaseMaintenanceLock((maintenanceSignal) => createBackupUnlocked(targetPath, maintenanceSignal, options), signal);
 }
 
 function removeDatabaseFiles(dbPath: string): string[] {
@@ -1082,18 +1447,22 @@ function removeDatabaseFiles(dbPath: string): string[] {
   return failures;
 }
 
-/** Resets database while holding maintenance lock; recovers safety backup if reset fails. */
-export async function resetDatabaseWithBackup(signal?: AbortSignal): Promise<{ backupPath: string }> {
-  return withDatabaseMaintenanceLock(async (maintenanceSignal) => {
+type ResetAfterInit = (freshDb: Database.Database) => void;
+
+/** Resets database under an existing maintenance lock; recovers its safety backup if reset fails. */
+async function resetDatabaseWithBackupUnlocked(
+  maintenanceSignal: AbortSignal,
+  afterInit?: ResetAfterInit,
+): Promise<{ backupPath: string; committed?: boolean; cleanupPending?: boolean }> {
     const { path: backupPath } = await createBackupUnlocked(undefined, maintenanceSignal);
     throwIfDatabaseMaintenanceAborted(maintenanceSignal);
     const dbPath = getDbPath();
     const baselineForeignKeyViolations = getForeignKeyViolationKeys(getDatabase());
     const recoveryPath = path.join(getBackupDir(), `flo-reset-recovery-${crypto.randomBytes(8).toString('hex')}.db`);
     const journalPath = recoveryPath.replace(/\.db$/, '.json');
-    let replacementCompleted = false;
     let recoveryCompleted = false;
     let replacementStarted = false;
+    let replacementCommitted = false;
 
     try {
       fs.copyFileSync(backupPath, recoveryPath);
@@ -1101,6 +1470,7 @@ export async function resetDatabaseWithBackup(signal?: AbortSignal): Promise<{ b
       writeReplacementJournal(journalPath, {
         phase: 'prepared', recoveryPath, dbPath,
         baselineForeignKeyViolations: [...baselineForeignKeyViolations],
+        driveInvalidationRequired: true,
       });
       throwIfDatabaseMaintenanceAborted(maintenanceSignal);
       replacementStarted = true;
@@ -1116,6 +1486,8 @@ export async function resetDatabaseWithBackup(signal?: AbortSignal): Promise<{ b
       initDatabase(false, true);
       await new Promise<void>((resolve) => setImmediate(resolve));
       throwIfDatabaseMaintenanceAborted(maintenanceSignal);
+      afterInit?.(getDatabase());
+      throwIfDatabaseMaintenanceAborted(maintenanceSignal);
       (db ?? getDatabase()).pragma('wal_checkpoint(TRUNCATE)');
       syncFile(dbPath);
       if (!syncDirectory(path.dirname(dbPath)) && process.platform !== 'win32') {
@@ -1126,14 +1498,20 @@ export async function resetDatabaseWithBackup(signal?: AbortSignal): Promise<{ b
       writeReplacementJournal(journalPath, {
         phase: 'committed', recoveryPath, dbPath,
         baselineForeignKeyViolations: [...baselineForeignKeyViolations],
+        driveInvalidationRequired: true,
       });
-      replacementCompleted = true;
-      return { backupPath };
+      replacementCommitted = true;
+      return { backupPath, committed: true, cleanupPending: false };
     } catch (error: any) {
+      const committedJournal = readReplacementJournal(journalPath)?.phase === 'committed';
+      if (replacementCommitted || committedJournal) {
+        console.error('[DB] Reset committed; cleanup remains pending:', error);
+        return { backupPath, committed: true, cleanupPending: true };
+      }
       // Reopen the pre-wipe snapshot so a partial filesystem failure cannot
       // leave the process serving an empty or closed database.
       if (!replacementStarted) {
-        removeReplacementArtifacts(journalPath, recoveryPath);
+        removeReplacementArtifactsDurably(journalPath, recoveryPath);
         throw error;
       }
       try {
@@ -1154,8 +1532,149 @@ export async function resetDatabaseWithBackup(signal?: AbortSignal): Promise<{ b
       }
       throw error;
     } finally {
-      if (replacementCompleted || recoveryCompleted) removeReplacementArtifacts(journalPath, recoveryPath);
+      if (recoveryCompleted) removeReplacementArtifactsDurably(journalPath, recoveryPath);
     }
+}
+
+/** Resets database while holding maintenance lock; recovers safety backup if reset fails. */
+export async function resetDatabaseWithBackup(signal?: AbortSignal): Promise<{ backupPath: string; committed?: boolean; cleanupPending?: boolean }> {
+  return withDatabaseMaintenanceLock(
+    (maintenanceSignal) => resetDatabaseWithBackupUnlocked(maintenanceSignal),
+    signal,
+  );
+}
+
+type CurrencyResetMenuSnapshot = {
+  categories: Record<string, unknown>[];
+  products: Record<string, unknown>[];
+  addonGroups: Record<string, unknown>[];
+  addons: Record<string, unknown>[];
+  addonGroupProducts: Record<string, unknown>[];
+};
+
+export interface CurrencyResetImpact {
+  currentCurrency: string;
+  invoices: number;
+  orders: number;
+  refunds: number;
+  customers: number;
+  products: number;
+  addons: number;
+}
+
+function countTableRows(dbInstance: Database.Database, table: string): number {
+  return (dbInstance.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count;
+}
+
+export function getCurrencyResetImpact(dbInstance: Database.Database = getDatabase()): CurrencyResetImpact {
+  const currentCurrency = (dbInstance.prepare("SELECT value FROM settings WHERE key = 'currency'").get() as { value?: string } | undefined)?.value || '';
+  return {
+    currentCurrency,
+    invoices: countTableRows(dbInstance, 'bills'),
+    orders: countTableRows(dbInstance, 'orders'),
+    refunds: countTableRows(dbInstance, 'refunds'),
+    customers: countTableRows(dbInstance, 'customers'),
+    products: countTableRows(dbInstance, 'products'),
+    addons: countTableRows(dbInstance, 'addons'),
+  };
+}
+
+function captureCurrencyResetMenu(dbInstance: Database.Database): CurrencyResetMenuSnapshot {
+  const rows = (table: string) => dbInstance.prepare(`SELECT * FROM ${table}`).all() as Record<string, unknown>[];
+  return {
+    categories: rows('categories'),
+    products: rows('products'),
+    addonGroups: rows('addon_groups'),
+    addons: rows('addons'),
+    addonGroupProducts: rows('addon_group_product'),
+  };
+}
+
+function insertSnapshotRows(dbInstance: Database.Database, table: string, rows: Record<string, unknown>[]): void {
+  if (rows.length === 0) return;
+  const targetColumns = new Set(
+    (dbInstance.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((column) => column.name),
+  );
+  const columns = Object.keys(rows[0]).filter((column) => targetColumns.has(column));
+  const sql = `INSERT INTO ${table} (${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`;
+  const insert = dbInstance.prepare(sql);
+  for (const row of rows) insert.run(...columns.map((column) => row[column]));
+}
+
+function restoreCurrencyResetMenu(dbInstance: Database.Database, snapshot: CurrencyResetMenuSnapshot): void {
+  const categoryIds = new Set(snapshot.categories.map((category) => category.id));
+  const productIds = new Set(snapshot.products.map((product) => product.id));
+  const addonGroupIds = new Set(snapshot.addonGroups.map((group) => group.id));
+  const inventoryLinks = snapshot.products.map((product) => ({ id: product.id, inventoryProductId: product.inventory_product_id }));
+  const products = snapshot.products.map((product) => ({
+    ...product,
+    category_id: categoryIds.has(product.category_id) ? product.category_id : null,
+    price: 0,
+    cost: 0,
+    stock_quantity: 0,
+    tax_type: 'none',
+    tax_rate: 0,
+    tax_category_id: null,
+    tax_behavior: 'country_default',
+    cb_percent: 0,
+    inventory_product_id: null,
+  }));
+  const addons = snapshot.addons
+    .filter((addon) => addonGroupIds.has(addon.addon_group_id))
+    .map((addon) => ({
+      ...addon,
+      price: 0,
+      tax_category_id: null,
+      tax_behavior: 'country_default',
+      inherit_parent_tax_category: 1,
+    }));
+  const addonGroupProducts = snapshot.addonGroupProducts.filter(
+    (link) => productIds.has(link.product_id) && addonGroupIds.has(link.addon_group_id),
+  );
+
+  insertSnapshotRows(dbInstance, 'categories', snapshot.categories);
+  insertSnapshotRows(dbInstance, 'addon_groups', snapshot.addonGroups);
+  insertSnapshotRows(dbInstance, 'products', products);
+  const restoreInventoryLink = dbInstance.prepare('UPDATE products SET inventory_product_id = ? WHERE id = ?');
+  for (const link of inventoryLinks) {
+    if (link.inventoryProductId && productIds.has(link.inventoryProductId)) {
+      restoreInventoryLink.run(link.inventoryProductId, link.id);
+    }
+  }
+  insertSnapshotRows(dbInstance, 'addons', addons);
+  insertSnapshotRows(dbInstance, 'addon_group_product', addonGroupProducts);
+}
+
+export async function resetDatabaseForCurrencyChange(
+  targetCurrency: string,
+  expectedCurrentCurrency: string,
+  signal?: AbortSignal,
+): Promise<{ backupPath: string; committed?: boolean; cleanupPending?: boolean }> {
+  return withDatabaseMaintenanceLock(async (maintenanceSignal) => {
+    const currentDb = getDatabase();
+    const settingsRows = currentDb.prepare("SELECT key, value FROM settings WHERE key IN ('country', 'currency', 'timezone')").all() as { key: string; value: string }[];
+    const settings = Object.fromEntries(settingsRows.map((row) => [row.key, row.value]));
+    if (settings.currency !== expectedCurrentCurrency || settings.currency === targetCurrency) {
+      throw Object.assign(new Error('Active currency changed'), { code: 'ERR_CURRENCY_CHANGED' });
+    }
+    const snapshot = captureCurrencyResetMenu(currentDb);
+    const regional = resolveRegionalSnapshot({ country: settings.country, currency: targetCurrency, timezone: settings.timezone });
+
+    return resetDatabaseWithBackupUnlocked(maintenanceSignal, (freshDb) => {
+      freshDb.transaction(() => {
+        freshDb.exec('CREATE TABLE IF NOT EXISTS _flo_meta (key TEXT PRIMARY KEY, value TEXT)');
+        restoreCurrencyResetMenu(freshDb, snapshot);
+        const writeSetting = freshDb.prepare('INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, ?)');
+        writeSetting.run('country', regional.country, now());
+        writeSetting.run('currency', regional.currency, now());
+        writeSetting.run('currency_symbol', regional.currencySymbol, now());
+        writeSetting.run('timezone', regional.timezone, now());
+        freshDb.prepare('INSERT OR REPLACE INTO _flo_meta (key, value) VALUES (?, ?)').run(
+          'currency_reset_pending',
+          JSON.stringify({ country: regional.country, currency: regional.currency, timezone: regional.timezone }),
+        );
+      })();
+    });
   }, signal);
 }
 
@@ -1174,6 +1693,37 @@ function readBackupSchemaVersion(fullPath: string): number | null {
     return row ? parseCanonicalSchemaVersion(row.value) : null;
   } catch {
     return null;
+  } finally {
+    backupDb?.close();
+  }
+}
+
+export type BackupMetadata = {
+  schemaVersion: number | null;
+  appVersion: string | null;
+  backupCreatedAt: string | null;
+};
+
+/** Reads the canonical metadata stamp without changing local backup behavior. */
+export function getBackupMetadata(backupPath: string): BackupMetadata {
+  let backupDb: Database.Database | undefined;
+  try {
+    backupDb = new Database(backupPath, { readonly: true, fileMustExist: true });
+    const rows = backupDb.prepare(
+      `SELECT key, value FROM _flo_meta WHERE key IN ('schema_version', 'app_version', 'backup_created_at')`,
+    ).all() as { key: string; value: string }[];
+    const values = new Map(rows.map((row) => [row.key, row.value]));
+    const schemaValue = values.get('schema_version');
+    const schemaVersion = schemaValue && /^(?:0|[1-9]\d*)$/.test(schemaValue)
+      ? Number(schemaValue)
+      : null;
+    return {
+      schemaVersion: schemaVersion !== null && Number.isSafeInteger(schemaVersion) ? schemaVersion : null,
+      appVersion: values.get('app_version') || null,
+      backupCreatedAt: values.get('backup_created_at') || null,
+    };
+  } catch {
+    return { schemaVersion: null, appVersion: null, backupCreatedAt: null };
   } finally {
     backupDb?.close();
   }
@@ -1198,7 +1748,7 @@ export function listBackups(): { fileName: string; path: string; sizeBytes: numb
         path: fullPath,
         sizeBytes: stat.size,
         createdAt: stat.mtime.toISOString(),
-        kind: (fileName.includes('-pre-v') ? 'auto' : 'manual') as 'manual' | 'auto',
+        kind: (fileName.includes('-pre-v') || isRestoreSafetyCopyName(fileName) ? 'auto' : 'manual') as 'manual' | 'auto',
         schemaVersion: readBackupSchemaVersion(fullPath),
       };
     })
@@ -1272,6 +1822,50 @@ function getColumns(dbInstance: Database.Database, tableName: string): string[] 
   }
 }
 
+/**
+ * Re-create the refunds tables when they are absent.
+ *
+ * A database can carry a `user_version` that claims migrations it never ran:
+ * a branch whose migration numbering diverged from upstream can stamp v86
+ * while the v76 that creates `refunds` never executed on that file. The
+ * column guard in `getColumns` cannot see that, because it returns `[]` for a
+ * missing table, so the following `ALTER TABLE refunds` fails outright and
+ * startup aborts.
+ *
+ * Creating the table here is the same self-heal the revoked-token repair
+ * (#71) performs: idempotent, additive, and it never touches existing rows.
+ */
+function ensureRefundsTables(dbInstance: Database.Database): void {
+  const existing = new Set(getTables(dbInstance));
+  if (existing.has('refunds') && existing.has('refund_idempotency')) return;
+  dbInstance.exec(`
+    CREATE TABLE IF NOT EXISTS refunds (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      bill_id INTEGER NOT NULL REFERENCES bills(id),
+      order_item_id INTEGER REFERENCES order_items(id),
+      amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+      method TEXT NOT NULL,
+      reason TEXT,
+      shift_id TEXT,
+      approved_by TEXT NOT NULL REFERENCES users(id),
+      created_by TEXT NOT NULL REFERENCES users(id),
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_refunds_bill ON refunds(bill_id);
+    CREATE INDEX IF NOT EXISTS idx_refunds_order_item ON refunds(order_item_id);
+    CREATE TABLE IF NOT EXISTS refund_idempotency (
+      user_id TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL,
+      bill_id TEXT NOT NULL,
+      request_hash TEXT NOT NULL,
+      response_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, idempotency_key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_refund_idempotency_bill ON refund_idempotency(bill_id);
+  `);
+}
+
 export function getTables(dbInstance: Database.Database): string[] {
   try {
     const tables = dbInstance.prepare(`
@@ -1284,12 +1878,187 @@ export function getTables(dbInstance: Database.Database): string[] {
   }
 }
 
+export function validateInventoryLedgerRows(
+  productRows: readonly Record<string, unknown>[],
+  movementRows: readonly Record<string, unknown>[],
+): string | null {
+  const movementsByProduct = new Map<string, { createdAt: string; id: number; movementType: string; quantityDelta: number; stockAfter: number }[]>();
+
+  for (const [index, row] of movementRows.entries()) {
+    const productId = row?.product_id == null ? '' : String(row.product_id);
+    const movementType = String(row?.movement_type ?? '');
+    const quantityDelta = Number(row?.quantity_delta);
+    const stockAfter = Number(row?.stock_after);
+    if (!productId || !Number.isFinite(quantityDelta) || quantityDelta === 0 || !Number.isFinite(stockAfter) || stockAfter < 0) {
+      return 'Inventory movement history contains an invalid stock state';
+    }
+    if (movementType === 'sale' && quantityDelta >= 0) {
+      return 'Sale movements must reduce product stock';
+    }
+    const createdAt = String(row?.created_at ?? '');
+    const rawId = Number(row?.id);
+    const id = Number.isFinite(rawId) ? rawId : index;
+    const movements = movementsByProduct.get(productId) ?? [];
+    movements.push({ createdAt, id, movementType, quantityDelta, stockAfter });
+    movementsByProduct.set(productId, movements);
+  }
+
+  const latestMovementByProduct = new Map<string, { createdAt: string; id: number; stockAfter: number }>();
+  for (const [productId, movements] of movementsByProduct) {
+    movements.sort((left, right) => left.createdAt < right.createdAt ? -1 : left.createdAt > right.createdAt ? 1 : left.id - right.id);
+    const firstMovement = movements[0];
+    const firstTolerance = Number.EPSILON * Math.max(1, Math.abs(firstMovement.quantityDelta), Math.abs(firstMovement.stockAfter)) * 10;
+    if (Math.abs(firstMovement.quantityDelta - firstMovement.stockAfter) > firstTolerance) {
+      return 'Inventory movement history is missing an opening balance';
+    }
+    for (let index = 1; index < movements.length; index += 1) {
+      const previous = movements[index - 1];
+      const current = movements[index];
+      const expectedStockAfter = previous.stockAfter + current.quantityDelta;
+      const tolerance = Number.EPSILON * Math.max(1, Math.abs(expectedStockAfter), Math.abs(current.stockAfter)) * 10;
+      if (Math.abs(expectedStockAfter - current.stockAfter) > tolerance) {
+        return 'Inventory movement history contains a broken stock chain';
+      }
+    }
+    const latestMovement = movements[movements.length - 1];
+    latestMovementByProduct.set(productId, latestMovement);
+  }
+
+  for (const row of productRows) {
+    const productId = row?.id == null ? '' : String(row.id);
+    if (!row || typeof row !== 'object' || !productId || !Object.prototype.hasOwnProperty.call(row, 'stock_quantity')) {
+      return 'Product stock quantity is missing from the inventory snapshot';
+    }
+    const stockQuantity = row.stock_quantity == null ? 0 : Number(row.stock_quantity);
+    if (!Number.isFinite(stockQuantity) || stockQuantity < 0) {
+      return 'Product stock quantity is invalid in the inventory snapshot';
+    }
+    const latestMovement = latestMovementByProduct.get(productId);
+    if (!latestMovement) {
+      if (stockQuantity !== 0) return 'Product stock has no matching inventory movement history';
+      continue;
+    }
+    const cacheTolerance = Number.EPSILON * Math.max(1, Math.abs(latestMovement.stockAfter), Math.abs(stockQuantity)) * 10;
+    if (Math.abs(latestMovement.stockAfter - stockQuantity) > cacheTolerance) {
+      return 'Product stock does not match the latest inventory movement';
+    }
+  }
+
+  return null;
+}
+
+export function validateInventoryLedgerDatabase(dbInstance: Database.Database): string | null {
+  const tables = new Set(getTables(dbInstance));
+  if (!tables.has('products')) return null;
+  if (!getColumns(dbInstance, 'products').includes('stock_quantity')) {
+    return 'Backup products table is missing stock_quantity';
+  }
+
+  const products = dbInstance.prepare('SELECT id, stock_quantity FROM products').all() as Record<string, unknown>[];
+  if (!tables.has('inventory_movements')) {
+    return products.some((product) => Number(product.stock_quantity ?? 0) !== 0)
+      ? 'Backup is missing inventory movement history for product stock'
+      : null;
+  }
+
+  const movements = getInventoryMovementRows(dbInstance);
+  return validateInventoryLedgerRows(products, movements);
+}
+
+export function getInventoryMovementRows(dbInstance: Database.Database): Record<string, unknown>[] {
+  const columns = new Set(getColumns(dbInstance, 'inventory_movements'));
+  const selectableColumns = [
+    'id', 'product_id', 'quantity_delta', 'movement_type', 'reference_type', 'reference_id',
+    'reason', 'actor_user_id', 'stock_after', 'created_at', 'imported_by_user_id', 'import_batch_id',
+    'source_actor_user_id', 'source_reference_type', 'source_reference_id',
+    'source_reason', 'source_created_at',
+  ].filter((column) => columns.has(column));
+  if (selectableColumns.length === 0) return [];
+  return dbInstance.prepare(`SELECT ${selectableColumns.join(', ')} FROM inventory_movements`).all() as Record<string, unknown>[];
+}
+
+function inventoryMovementHistoryKey(row: Record<string, unknown>): string {
+  const nullableString = (value: unknown): string | null => value == null ? null : String(value);
+  const numericValue = (value: unknown): number | string | null => {
+    if (value == null) return null;
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric : String(value);
+  };
+  return JSON.stringify([
+    numericValue(row.id),
+    nullableString(row.product_id),
+    numericValue(row.quantity_delta),
+    nullableString(row.movement_type),
+    nullableString(row.reference_type),
+    nullableString(row.reference_id),
+    nullableString(row.reason),
+    nullableString(row.actor_user_id),
+    nullableString(row.imported_by_user_id),
+    nullableString(row.import_batch_id),
+    numericValue(row.stock_after),
+    nullableString(row.created_at),
+    nullableString(row.source_actor_user_id ?? row.actor_user_id),
+    nullableString(row.source_reference_type ?? row.reference_type),
+    nullableString(row.source_reference_id ?? row.reference_id),
+    nullableString(row.source_reason ?? row.reason),
+    nullableString(row.source_created_at ?? row.created_at),
+  ]);
+}
+
+export function validateInventoryLedgerReplacement(
+  currentProductRows: readonly Record<string, unknown>[],
+  currentMovementRows: readonly Record<string, unknown>[],
+  replacementProductRows: readonly Record<string, unknown>[],
+  replacementMovementRows: readonly Record<string, unknown>[],
+): string | null {
+  const replacementByProduct = new Map<string, Record<string, unknown>>();
+  for (const row of replacementProductRows) {
+    const productId = row?.id == null ? '' : String(row.id);
+    if (productId) replacementByProduct.set(productId, row);
+  }
+  const replacementMovementProductIds = new Set(
+    replacementMovementRows
+      .map((row) => row?.product_id == null ? '' : String(row.product_id))
+      .filter(Boolean),
+  );
+  const replacementHistoryCounts = new Map<string, number>();
+  for (const row of replacementMovementRows) {
+    const key = inventoryMovementHistoryKey(row);
+    replacementHistoryCounts.set(key, (replacementHistoryCounts.get(key) ?? 0) + 1);
+  }
+  for (const row of currentMovementRows) {
+    const key = inventoryMovementHistoryKey(row);
+    const count = replacementHistoryCounts.get(key) ?? 0;
+    if (count === 0) return 'Inventory movement history cannot be erased by a replacement';
+    replacementHistoryCounts.set(key, count - 1);
+  }
+
+  for (const row of currentProductRows) {
+    const productId = row?.id == null ? '' : String(row.id);
+    const replacement = replacementByProduct.get(productId);
+    if (!productId || !replacement) continue;
+
+    const currentStock = Number(row?.stock_quantity ?? 0);
+    const replacementStock = Number(replacement.stock_quantity ?? 0);
+    if (!Number.isFinite(currentStock) || !Number.isFinite(replacementStock)) continue;
+    const tolerance = Number.EPSILON * Math.max(1, Math.abs(currentStock), Math.abs(replacementStock)) * 10;
+    if (Math.abs(currentStock - replacementStock) > tolerance && !replacementMovementProductIds.has(productId)) {
+      return 'Product stock replacement is missing matching inventory movement history';
+    }
+  }
+
+  return null;
+}
+
 export interface RestoreResult {
   success: boolean;
   mode: 'direct' | 'data_only' | 'full';
   backupSchemaVersion: number;
   currentSchemaVersion: number;
   tablesRestored: number;
+  committed?: boolean;
+  cleanupPending?: boolean;
+  ambiguous?: boolean;
   error?: string;
 }
 
@@ -1331,6 +2100,17 @@ function validateDirectBackup(backupPath: string, currentDb: Database.Database, 
         return `Backup table ${tableName} is missing required column(s): ${missingColumns.join(', ')}`;
       }
     }
+
+    const inventoryValidationError = validateInventoryLedgerDatabase(backupDb);
+    if (inventoryValidationError) return inventoryValidationError;
+
+    const inventoryReplacementError = validateInventoryLedgerReplacement(
+      currentDb.prepare('SELECT id, stock_quantity FROM products').all() as Record<string, unknown>[],
+      getInventoryMovementRows(currentDb),
+      backupDb.prepare('SELECT id, stock_quantity FROM products').all() as Record<string, unknown>[],
+      getInventoryMovementRows(backupDb),
+    );
+    if (inventoryReplacementError) return inventoryReplacementError;
 
     const currentSchema = getSchemaDefinitions(currentDb);
     const backupSchema = getSchemaDefinitions(backupDb);
@@ -1379,10 +2159,12 @@ export type RestoreOutboxState = {
   cloud: Record<string, unknown>[];
   support: Record<string, unknown>[];
   diagnostics: Record<string, unknown>[];
+  /** Device-local failure log; present on restores that predate it. */
+  local?: Record<string, unknown>[];
 };
 const RESTORE_PROTECTED_SETTING_KEYS = [
   'jwt_secret', 'cloud_api_key', 'cloud_device_secret', 'cloud_pos_hash',
-  'telemetry_enabled', 'diagnostics_consent',
+  'telemetry_enabled', 'diagnostics_consent', 'diagnostics_transmission_enabled',
   'mobile_pairing_code', 'mobile_pairing_code_expires_at',
 ];
 
@@ -1422,11 +2204,15 @@ export function mergeRestoreProtectedSettings(dbInstance: Database.Database, sta
 
 export function captureRestoreOutboxState(dbInstance: Database.Database): RestoreOutboxState {
   const pending = (table: string) => dbInstance.prepare(`SELECT * FROM ${table} WHERE status IN ('pending', 'failed', 'sending')`).all() as Record<string, unknown>[];
-  return { cloud: pending('cloud_sync_outbox'), support: pending('support_ticket_outbox'), diagnostics: pending('store_diagnostics_outbox') };
+  // A SQLite backup copies the whole file, so local_diagnostics travels with it.
+  // Those rows describe the till that produced them, so the receiving device
+  // keeps its own and drops the incoming one.
+  const local = dbInstance.prepare('SELECT * FROM local_diagnostics ORDER BY id ASC').all() as Record<string, unknown>[];
+  return { cloud: pending('cloud_sync_outbox'), support: pending('support_ticket_outbox'), diagnostics: pending('store_diagnostics_outbox'), local };
 }
 
 export function mergeRestoreOutboxState(dbInstance: Database.Database, state: RestoreOutboxState): void {
-  dbInstance.exec('DELETE FROM cloud_sync_outbox; DELETE FROM support_ticket_outbox; DELETE FROM store_diagnostics_outbox');
+  dbInstance.exec('DELETE FROM cloud_sync_outbox; DELETE FROM support_ticket_outbox; DELETE FROM store_diagnostics_outbox; DELETE FROM local_diagnostics');
   const cloud = dbInstance.prepare(`INSERT OR REPLACE INTO cloud_sync_outbox
     (id, event_type, entity_type, entity_id, payload, status, attempt_count, next_attempt_at, last_error, delivered_at, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
@@ -1439,6 +2225,12 @@ export function mergeRestoreOutboxState(dbInstance: Database.Database, state: Re
     (event_id, payload, status, attempt_count, next_attempt_at, last_error, created_at, updated_at, delivered_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   for (const row of state.diagnostics) diagnostics.run(row.event_id, row.payload, row.status === 'sending' ? 'failed' : row.status, row.attempt_count || 0, row.next_attempt_at || now(), row.last_error || null, row.created_at || now(), row.updated_at || now(), row.delivered_at || null);
+  const local = dbInstance.prepare(`INSERT INTO local_diagnostics
+    (event_code, severity, error_class, signature, summary, metadata_json, occurred_at, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
+  for (const row of state.local || []) local.run(row.event_code, row.severity, row.error_class, row.signature, row.summary, row.metadata_json || null, row.occurred_at, row.created_at);
+  // Re-cap in case this device was already at the limit before the restore.
+  dbInstance.prepare('DELETE FROM local_diagnostics WHERE id NOT IN (SELECT id FROM local_diagnostics ORDER BY id DESC LIMIT ?)').run(200);
 }
 
 export function captureKdsEnabledSetting(dbInstance: Database.Database): KdsEnabledSettingState {
@@ -1745,14 +2537,30 @@ export function restoreBackup(backupPath: string, forceDirect: boolean = false, 
   let metadataStampPresent = false;
   let pragmaVersion = 0;
   let backupDb: Database.Database | undefined;
+  let unreadableSource = false;
   try {
     backupDb = new Database(backupPath, { readonly: true, fileMustExist: true });
     const metaRow = backupDb.prepare(`SELECT value FROM _flo_meta WHERE key = 'schema_version'`).get() as { value: string } | undefined;
     metadataStampPresent = Boolean(metaRow);
     metadataVersion = metaRow ? parseCanonicalSchemaVersion(metaRow.value) ?? 0 : 0;
     pragmaVersion = Number(backupDb.pragma('user_version', { simple: true }));
+  } catch {
+    // A file that is not a readable SQLite database (truncated, corrupt, or
+    // simply not a database at all) must be refused, never applied.
+    unreadableSource = true;
   } finally {
     backupDb?.close();
+  }
+
+  if (unreadableSource) {
+    return {
+      success: false,
+      mode: forceDirect ? 'direct' : 'data_only',
+      backupSchemaVersion: 0,
+      currentSchemaVersion: getCurrentSchemaVersion(),
+      tablesRestored: 0,
+      error: 'Restore source is not a readable Flo database file',
+    };
   }
 
   // Determine schema version from metadata stamp or SQLite user_version pragma.
@@ -1811,21 +2619,23 @@ export function restoreBackup(backupPath: string, forceDirect: boolean = false, 
 
     console.log('[DB] restoreBackup: Direct restore (same schema version)');
     const dbPath = getDbPath();
-    const recoveryPath = path.join(getBackupDir(), `flo-restore-recovery-${crypto.randomBytes(8).toString('hex')}.db`);
-    const journalPath = recoveryPath.replace(/\.db$/, '.json');
+    let recoveryPath = '';
+    let journalPath = '';
 
     let recoveryCopyReady = false;
     let recoveryCompleted = false;
     try {
       // Checkpoint the live WAL before making a synchronous recovery copy.
       currentDb.pragma('wal_checkpoint(TRUNCATE)');
-      fs.copyFileSync(dbPath, recoveryPath);
-      syncFile(recoveryPath);
+      const replacementJournal = beginDatabaseReplacementJournal(dbPath, 'restore');
+      recoveryPath = replacementJournal.recoveryPath;
+      journalPath = replacementJournal.journalPath;
+      recoveryCopyReady = true;
       writeReplacementJournal(journalPath, {
         phase: 'prepared', recoveryPath, dbPath,
         baselineForeignKeyViolations: [...baselineForeignKeyViolations],
+        driveInvalidationRequired: true,
       });
-      recoveryCopyReady = true;
       throwIfDatabaseMaintenanceAborted(signal);
       closeDatabase();
       throwIfDatabaseMaintenanceAborted(signal);
@@ -1861,18 +2671,40 @@ export function restoreBackup(backupPath: string, forceDirect: boolean = false, 
         throw new Error('Could not durably commit restored database');
       }
       throwIfDatabaseMaintenanceAborted(signal);
+      clearGoogleDriveRestoreBinding(freshDb);
       writeReplacementJournal(journalPath, {
         phase: 'committed', recoveryPath, dbPath,
         baselineForeignKeyViolations: [...baselineForeignKeyViolations],
+        driveInvalidationRequired: true,
       });
+      // The replacement is durable; keep the snapshot of what it replaced so a
+      // customer who restores the wrong file can undo it.
+      retainRestoreSafetyCopy(recoveryPath, currentVersion);
       return {
         success: true,
         mode: 'direct',
         backupSchemaVersion,
         currentSchemaVersion: currentVersion,
         tablesRestored: getTables(freshDb).length,
+        committed: true,
+        cleanupPending: false,
       };
     } catch (error: any) {
+      const committedJournal = readReplacementJournal(journalPath);
+      if (committedJournal?.phase === 'committed') {
+        // The replacement is authoritative once the committed journal is durable.
+        // Do not roll it back after a post-commit error; Drive invalidation and
+        // artifact cleanup must finish from the durable boundary.
+        return {
+          success: true,
+          mode: 'direct',
+          backupSchemaVersion,
+          currentSchemaVersion: currentVersion,
+          tablesRestored: getTables(getDatabase()).length,
+          committed: true,
+          cleanupPending: true,
+        };
+      }
       // A corrupt/incompatible same-version file must not strand the live
       // database. Restore the checkpointed safety copy before rethrowing.
       if (!recoveryCopyReady) throw error;
@@ -1899,14 +2731,14 @@ export function restoreBackup(backupPath: string, forceDirect: boolean = false, 
       throw error;
     } finally {
       if (recoveryCompleted) {
-        removeReplacementArtifacts(journalPath, recoveryPath);
-      } else if (isHealthyDatabaseFile(dbPath, baselineForeignKeyViolations, false)
+        removeReplacementArtifactsDurably(journalPath, recoveryPath);
+      } else if (recoveryCopyReady && isHealthyDatabaseFile(dbPath, baselineForeignKeyViolations, false)
         && isHealthyDatabaseFile(recoveryPath, baselineForeignKeyViolations, false)) {
         // A committed journal is finalized here; an uncommitted journal is
         // intentionally retained if recovery itself failed.
         try {
           const journal = JSON.parse(fs.readFileSync(journalPath, 'utf8')) as ReplacementJournal;
-          if (journal.phase === 'committed') removeReplacementArtifacts(journalPath, recoveryPath);
+          if (journal.phase === 'committed' && journal.driveInvalidationRequired !== true) removeReplacementArtifactsDurably(journalPath, recoveryPath);
         } catch { }
       }
     }
@@ -2020,6 +2852,8 @@ function dataOnlyRestore(
   }
   let backupDb: Database.Database | undefined;
   let backupTables: string[] = [];
+  let backupProductRows: Record<string, unknown>[] = [];
+  let backupMovementRows: Record<string, unknown>[] = [];
   const backupColumns = new Map<string, string[]>();
   try {
     backupDb = new Database(backupPath, { readonly: true, fileMustExist: true });
@@ -2027,11 +2861,56 @@ function dataOnlyRestore(
     for (const tableName of backupTables) {
       if (isSafeIdentifier(tableName)) backupColumns.set(tableName, getColumns(backupDb, tableName));
     }
+    const inventoryValidationError = validateInventoryLedgerDatabase(backupDb);
+    if (inventoryValidationError) {
+      return {
+        success: false,
+        mode: 'data_only',
+        backupSchemaVersion: backupVersion,
+        currentSchemaVersion: currentVersion,
+        tablesRestored: 0,
+        error: inventoryValidationError,
+      };
+    }
+    if (backupTables.includes('products')) {
+      backupProductRows = backupDb.prepare('SELECT id, stock_quantity FROM products').all() as Record<string, unknown>[];
+    }
+    if (backupTables.includes('inventory_movements')) {
+      backupMovementRows = getInventoryMovementRows(backupDb);
+    }
   } finally {
     backupDb?.close();
   }
 
   const currentDb = getDatabase();
+  if (backupTables.includes('inventory_movements') && !backupTables.includes('products')) {
+    return {
+      success: false,
+      mode: 'data_only',
+      backupSchemaVersion: backupVersion,
+      currentSchemaVersion: currentVersion,
+      tablesRestored: 0,
+      error: 'Data-only restore source cannot contain inventory movement history without products',
+    };
+  }
+  if (backupTables.includes('products')) {
+    const inventoryReplacementError = validateInventoryLedgerReplacement(
+      currentDb.prepare('SELECT id, stock_quantity FROM products').all() as Record<string, unknown>[],
+      backupTables.includes('inventory_movements') ? getInventoryMovementRows(currentDb) : [],
+      backupProductRows,
+      backupMovementRows,
+    );
+    if (inventoryReplacementError) {
+      return {
+        success: false,
+        mode: 'data_only',
+        backupSchemaVersion: backupVersion,
+        currentSchemaVersion: currentVersion,
+        tablesRestored: 0,
+        error: inventoryReplacementError,
+      };
+    }
+  }
   const baselineForeignKeyViolations = getForeignKeyViolationKeys(currentDb);
   const currentTables = getTables(currentDb);
   const commonTables = backupTables.filter((tableName) => currentTables.includes(tableName));
@@ -2039,6 +2918,9 @@ function dataOnlyRestore(
   let attached = false;
   let inTransaction = false;
   let tablesRestored = 0;
+  let replacementJournal: DatabaseReplacementJournalHandle | null = null;
+  let replacementCommitted = false;
+  let replacementRecoveryFailed = false;
 
   // Existing failed versions of this function could strand this alias on the
   // long-lived connection. Remove it before attempting a fresh restore.
@@ -2055,6 +2937,21 @@ function dataOnlyRestore(
       currentSchemaVersion: currentVersion,
       tablesRestored: 0,
       error: `Could not clear a previous restore attachment: ${error?.message || 'unknown error'}`,
+    };
+  }
+
+  try {
+    currentDb.pragma('wal_checkpoint(TRUNCATE)');
+    syncFile(livePath);
+    replacementJournal = beginDatabaseReplacementJournal(livePath, 'restore');
+  } catch (error: any) {
+    return {
+      success: false,
+      mode: 'data_only',
+      backupSchemaVersion: backupVersion,
+      currentSchemaVersion: currentVersion,
+      tablesRestored: 0,
+      error: error?.message || 'Could not prepare restore recovery journal',
     };
   }
 
@@ -2099,9 +2996,14 @@ function dataOnlyRestore(
     mergeUserStationSecurityState(currentDb, preservedUserStations, preservedUserSecurity.map((row) => row.id), preservedStationSecurity);
     mergeKdsEnabledSetting(currentDb, preservedKdsEnabled);
     mergeRestoreProtectedSettings(currentDb, preservedProtectedSettings);
+    clearGoogleDriveRestoreBinding(currentDb);
     currentDb.prepare('DELETE FROM kds_pairing_tokens').run();
     mergeRestoreOutboxState(currentDb, preservedOutboxes);
     mergeRevocations(currentDb, preservedRevocations);
+    const inventoryValidationError = validateInventoryLedgerDatabase(currentDb);
+    if (inventoryValidationError) {
+      throw new Error(`Restore would violate the inventory ledger: ${inventoryValidationError}`);
+    }
     const newForeignKeyViolations = [...getForeignKeyViolationKeys(currentDb)]
       .filter((key) => !baselineForeignKeyViolations.has(key));
     if (newForeignKeyViolations.length > 0) {
@@ -2112,6 +3014,22 @@ function dataOnlyRestore(
     throwIfDatabaseMaintenanceAborted(signal);
     currentDb.exec('COMMIT');
     inTransaction = false;
+    if (!replacementJournal) throw new Error('Restore recovery journal is unavailable');
+    try {
+      commitDatabaseReplacementJournal(replacementJournal);
+    } catch (journalError) {
+      try { recoverDatabaseReplacementJournal(replacementJournal); } catch (recoveryError: any) {
+        replacementRecoveryFailed = true;
+        throw new Error(
+          `Restore journal commit failed: ${journalError instanceof Error ? journalError.message : 'unknown error'}; ` +
+          `database recovery also failed: ${recoveryError?.message || 'unknown error'}`,
+          { cause: recoveryError },
+        );
+      }
+      throw journalError;
+    }
+    replacementCommitted = true;
+    retainRestoreSafetyCopy(replacementJournal.recoveryPath, currentVersion);
     try {
       currentDb.exec('DETACH DATABASE _restore_src');
       attached = false;
@@ -2135,6 +3053,8 @@ function dataOnlyRestore(
       backupSchemaVersion: backupVersion,
       currentSchemaVersion: currentVersion,
       tablesRestored,
+      committed: true,
+      cleanupPending: false,
     };
   } catch (error: any) {
     let cleanupFailure: unknown = null;
@@ -2161,6 +3081,22 @@ function dataOnlyRestore(
           `database reopen failed: ${recoveryError?.message || 'unknown error'}`,
         );
       }
+    }
+    const committedJournal = replacementJournal && readReplacementJournal(replacementJournal.journalPath)?.phase === 'committed';
+    if (replacementCommitted || committedJournal) {
+      console.error('[DB] Data-only restore committed; cleanup remains pending:', error);
+      return {
+        success: true,
+        mode: 'data_only',
+        backupSchemaVersion: backupVersion,
+        currentSchemaVersion: currentVersion,
+        tablesRestored,
+        committed: true,
+        cleanupPending: true,
+      };
+    }
+    if (!cleanupFailure && replacementJournal && !replacementRecoveryFailed) {
+      try { abortDatabaseReplacementJournal(replacementJournal); } catch { }
     }
     throwIfDatabaseMaintenanceAborted(signal);
     console.error('[DB] dataOnlyRestore failed:', error);
@@ -2501,8 +3437,12 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
       }
 
       const tenantCountryRow = db.prepare("SELECT value FROM settings WHERE key = 'country'").get() as any;
+      // Deliberate exception to "no India default" (docs/reference/product-invariants.md):
+      // this is a one-time best-effort cleanup of pre-existing customer phone
+      // records on an upgrading install, most of which predate multi-country
+      // support and were Indian. Not a live store's regional identity.
       const tenantCountry = tenantCountryRow?.value || 'IN';
-      
+
       const { parsePhoneE164 } = require('./lib/phone');
 
       const customers = db.prepare(
@@ -2594,6 +3534,8 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     name: 'normalize_customer_phones_retry',
     up: () => {
       const tenantCountryRow = db.prepare("SELECT value FROM settings WHERE key = 'country'").get() as any;
+      // Same deliberate exception as migration v23 above — historical
+      // customer-data cleanup, not a live store's regional identity.
       const tenantCountry = tenantCountryRow?.value || 'IN';
 
       const { parsePhoneE164 } = require('./lib/phone');
@@ -4046,7 +4988,7 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     version: 82,
     name: 'add_order_audit_log',
     up: () => {
-      // Append-only actor log for order/item mutations (docs/business-decisions.md).
+      // Append-only actor log for order/item mutations (docs/reference/product-invariants.md).
       db.exec(`
         CREATE TABLE IF NOT EXISTS order_audit_log (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4072,6 +5014,455 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
   },
   {
     version: 84,
+    name: 'add_cash_drawer_movements',
+    up: () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS cash_drawer_movements (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          business_date TEXT NOT NULL CHECK (business_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+          movement_type TEXT NOT NULL CHECK (movement_type IN ('opening_float', 'pay_in', 'pay_out', 'safe_drop')),
+          amount_cents INTEGER NOT NULL CHECK (amount_cents >= 0),
+          reason TEXT,
+          created_by TEXT NOT NULL REFERENCES users(id),
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          voided_at TEXT,
+          voided_by TEXT REFERENCES users(id),
+          void_reason TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_cash_drawer_movements_date
+          ON cash_drawer_movements(business_date, created_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS cash_drawer_one_opening_float
+          ON cash_drawer_movements(business_date)
+          WHERE movement_type = 'opening_float' AND voided_at IS NULL;
+      `);
+      const columns = new Set(
+        (db.prepare(`PRAGMA table_info(cash_closures)`).all() as { name: string }[]).map((column) => column.name),
+      );
+      const addColumn = (name: string, definition: string) => {
+        if (!columns.has(name)) {
+          db.exec(`ALTER TABLE cash_closures ADD COLUMN ${definition}`);
+          columns.add(name);
+        }
+      };
+      addColumn('pay_in_cents', 'pay_in_cents INTEGER NOT NULL DEFAULT 0');
+      addColumn('pay_out_cents', 'pay_out_cents INTEGER NOT NULL DEFAULT 0');
+      addColumn('safe_drop_cents', 'safe_drop_cents INTEGER NOT NULL DEFAULT 0');
+      addColumn('cash_movements_json', "cash_movements_json TEXT NOT NULL DEFAULT '[]'");
+    },
+  },
+  {
+    version: 85,
+    name: 'add_inventory_movements',
+    up: () => {
+      const negativeStockedProduct = db.prepare(`
+        SELECT id, stock_quantity
+        FROM products
+        WHERE stock_quantity < 0
+        ORDER BY id
+        LIMIT 1
+      `).get() as { id: string; stock_quantity: number } | undefined;
+      if (negativeStockedProduct) {
+        throw new Error(
+          `Cannot migrate inventory movements while product ${negativeStockedProduct.id} has negative stock_quantity (${negativeStockedProduct.stock_quantity}). Correct the stock quantity and retry the migration.`,
+        );
+      }
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS inventory_movements (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          product_id TEXT NOT NULL REFERENCES products(id),
+          quantity_delta REAL NOT NULL CHECK (quantity_delta <> 0),
+          movement_type TEXT NOT NULL CHECK (movement_type IN ('sale', 'cancel_restore', 'adjustment')),
+          reference_type TEXT,
+          reference_id TEXT,
+          reason TEXT,
+          actor_user_id TEXT NOT NULL REFERENCES users(id),
+          stock_after REAL NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_inventory_movements_product_created
+          ON inventory_movements(product_id, created_at, id);
+        CREATE INDEX IF NOT EXISTS idx_inventory_movements_reference
+          ON inventory_movements(reference_type, reference_id);
+        CREATE INDEX IF NOT EXISTS idx_inventory_movements_created
+          ON inventory_movements(created_at, id);
+      `);
+
+      const stockedProducts = db.prepare(`
+        SELECT id, stock_quantity
+        FROM products
+        WHERE COALESCE(stock_quantity, 0) <> 0
+        ORDER BY id
+      `).all() as { id: string; stock_quantity: number }[];
+      if (stockedProducts.length === 0) return;
+
+      const actor = db.prepare(`
+        SELECT id
+        FROM users
+        ORDER BY CASE WHEN role = 'owner' THEN 0 ELSE 1 END, created_at, id
+        LIMIT 1
+      `).get() as { id: string } | undefined;
+      if (!actor) throw new Error('Cannot backfill inventory movements without an existing staff actor');
+
+      const createdAt = now();
+      const insertOpeningMovement = db.prepare(`
+        INSERT INTO inventory_movements (
+          product_id, quantity_delta, movement_type, reference_type, reference_id,
+          reason, actor_user_id, stock_after, created_at
+        ) VALUES (?, ?, 'adjustment', 'opening_balance', ?, ?, ?, ?, ?)
+      `);
+      for (const product of stockedProducts) {
+        insertOpeningMovement.run(
+          product.id,
+          product.stock_quantity,
+          product.id,
+          'Opening balance migrated to inventory ledger',
+          actor.id,
+          product.stock_quantity,
+          createdAt,
+        );
+      }
+    },
+  },
+  {
+    version: 86,
+    name: 'add_inventory_import_provenance',
+    up: () => {
+      const columns = new Set(
+        (db.prepare('PRAGMA table_info(inventory_movements)').all() as { name: string }[]).map((column) => column.name),
+      );
+      const addColumn = (name: string, definition: string) => {
+        if (!columns.has(name)) {
+          db.exec(`ALTER TABLE inventory_movements ADD COLUMN ${definition}`);
+          columns.add(name);
+        }
+      };
+      addColumn('imported_by_user_id', 'imported_by_user_id TEXT REFERENCES users(id)');
+      addColumn('import_batch_id', 'import_batch_id TEXT');
+      addColumn('source_actor_user_id', 'source_actor_user_id TEXT');
+      addColumn('source_reference_type', 'source_reference_type TEXT');
+      addColumn('source_reference_id', 'source_reference_id TEXT');
+      addColumn('source_reason', 'source_reason TEXT');
+      addColumn('source_created_at', 'source_created_at TEXT');
+    },
+  },
+  {
+    version: 87,
+    name: 'add_volume_units_and_inventory_links',
+    up: () => {
+      const productColumns = getColumns(db, 'products');
+      const has = (column: string) => productColumns.includes(column);
+      const needsRebuild = !has('inventory_product_id')
+        || !has('inventory_deduction_quantity');
+      const saleUnitSql = db.prepare(`
+        SELECT sql FROM sqlite_master
+        WHERE type = 'table' AND name = 'products'
+      `).get() as { sql: string } | undefined;
+      const needsWideSaleUnit = !!saleUnitSql
+        && !/sale_unit[^)]*'ml'/.test(saleUnitSql.sql);
+
+      if (needsRebuild || needsWideSaleUnit) {
+        // SQLite cannot ALTER a column CHECK constraint; rebuild products with
+        // volume units and the 1-to-1 inventory-link columns in one pass.
+        const productIndexes = (db.prepare(`
+          SELECT name, sql FROM sqlite_master
+          WHERE type = 'index' AND tbl_name = 'products' AND sql IS NOT NULL
+        `).all() as { name: string; sql: string }[])
+          .filter((index) => index.name.startsWith('idx_products_'));
+        db.exec(`
+          PRAGMA foreign_keys = OFF;
+          CREATE TABLE products_volume_migration (
+            id TEXT PRIMARY KEY,
+            category_id TEXT,
+            name TEXT NOT NULL,
+            description TEXT,
+            price REAL NOT NULL DEFAULT 0,
+            cost REAL DEFAULT 0,
+            sku TEXT,
+            barcode TEXT,
+            sale_unit TEXT NOT NULL DEFAULT 'each' CHECK (sale_unit IN ('each', 'kg', 'g', 'lb', 'ml', 'cl', 'l', 'fl oz', 'oz')),
+            allow_fractional_quantity INTEGER NOT NULL DEFAULT 0,
+            weight_precision INTEGER NOT NULL DEFAULT 3 CHECK (weight_precision BETWEEN 0 AND 4),
+            image_url TEXT,
+            is_active INTEGER DEFAULT 1,
+            sort_order INTEGER DEFAULT 0,
+            track_inventory INTEGER DEFAULT 0,
+            stock_quantity REAL DEFAULT 0,
+            low_stock_threshold REAL DEFAULT 5,
+            tax_type TEXT DEFAULT 'none',
+            tax_rate REAL DEFAULT 0,
+            tax_category_id TEXT DEFAULT NULL,
+            tax_behavior TEXT DEFAULT 'country_default',
+            cb_percent REAL DEFAULT 0,
+            tags TEXT,
+            inventory_product_id TEXT DEFAULT NULL REFERENCES products(id),
+            inventory_deduction_quantity REAL DEFAULT 1,
+            deleted_at TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (category_id) REFERENCES categories(id)
+          );
+          INSERT INTO products_volume_migration (
+            id, category_id, name, description, price, cost, sku, barcode,
+            sale_unit, allow_fractional_quantity, weight_precision, image_url,
+            is_active, sort_order, track_inventory, stock_quantity, low_stock_threshold,
+            tax_type, tax_rate, tax_category_id, tax_behavior, cb_percent, tags,
+            inventory_product_id, inventory_deduction_quantity, deleted_at, created_at, updated_at
+          )
+          SELECT
+            id, category_id, name, description, price, cost, sku, barcode,
+            ${has('sale_unit') ? 'sale_unit' : "'each'"},
+            ${has('allow_fractional_quantity') ? 'allow_fractional_quantity' : '0'},
+            ${has('weight_precision') ? 'weight_precision' : '3'},
+            image_url,
+            is_active, sort_order, track_inventory, stock_quantity, low_stock_threshold,
+            tax_type, tax_rate, tax_category_id, tax_behavior, cb_percent, tags,
+            ${productColumns.includes('inventory_product_id') ? 'inventory_product_id' : 'NULL'},
+            ${productColumns.includes('inventory_deduction_quantity') ? 'inventory_deduction_quantity' : '1'},
+            deleted_at, created_at, updated_at
+          FROM products;
+          DROP TABLE products;
+          ALTER TABLE products_volume_migration RENAME TO products;
+          PRAGMA foreign_keys = ON;
+        `);
+        for (const index of productIndexes) {
+          db.exec(index.sql);
+        }
+      }
+
+      if (!getColumns(db, 'order_items').includes('inventory_product_id')) {
+        db.exec(`ALTER TABLE order_items ADD COLUMN inventory_product_id TEXT DEFAULT NULL`);
+      }
+    },
+  },
+  {
+    version: 88,
+    name: 'add_supplies_and_recipes',
+    up: () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS supplies (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          base_unit TEXT NOT NULL CHECK (base_unit IN ('each', 'g', 'kg', 'ml', 'l')),
+          stock_quantity REAL NOT NULL DEFAULT 0,
+          low_stock_threshold REAL,
+          is_active INTEGER NOT NULL DEFAULT 1,
+          deleted_at TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_supplies_name ON supplies(name COLLATE NOCASE);
+        CREATE INDEX IF NOT EXISTS idx_supplies_deleted ON supplies(deleted_at);
+
+        CREATE TABLE IF NOT EXISTS supply_movements (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          supply_id TEXT NOT NULL REFERENCES supplies(id),
+          quantity_delta REAL NOT NULL,
+          movement_type TEXT NOT NULL CHECK (movement_type IN ('receive', 'count', 'adjustment', 'waste', 'recipe_depletion', 'recipe_restore')),
+          unit TEXT NOT NULL CHECK (unit IN ('each', 'g', 'kg', 'ml', 'l')),
+          stock_after REAL NOT NULL,
+          reason TEXT,
+          actor_user_id TEXT NOT NULL REFERENCES users(id),
+          reference_type TEXT,
+          reference_id TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_supply_movements_supply_created
+          ON supply_movements(supply_id, created_at, id);
+        CREATE INDEX IF NOT EXISTS idx_supply_movements_reference
+          ON supply_movements(reference_type, reference_id);
+        CREATE INDEX IF NOT EXISTS idx_supply_movements_created
+          ON supply_movements(created_at, id);
+
+        CREATE TABLE IF NOT EXISTS recipes (
+          id TEXT PRIMARY KEY,
+          product_id TEXT NOT NULL REFERENCES products(id),
+          yield_quantity REAL NOT NULL DEFAULT 1 CHECK (yield_quantity > 0),
+          is_active INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_recipes_product
+          ON recipes(product_id);
+
+        CREATE TABLE IF NOT EXISTS recipe_items (
+          id TEXT PRIMARY KEY,
+          recipe_id TEXT NOT NULL REFERENCES recipes(id) ON DELETE CASCADE,
+          supply_id TEXT NOT NULL REFERENCES supplies(id),
+          quantity REAL NOT NULL CHECK (quantity > 0),
+          unit TEXT NOT NULL CHECK (unit IN ('each', 'g', 'kg', 'ml', 'l')),
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_recipe_items_recipe ON recipe_items(recipe_id);
+      `);
+    },
+  },
+  {
+    version: 89,
+    name: 'add_order_item_recipe_snapshot',
+    up: () => {
+      if (!getColumns(db, 'order_items').includes('recipe_snapshot')) {
+        db.exec(`ALTER TABLE order_items ADD COLUMN recipe_snapshot TEXT DEFAULT NULL`);
+      }
+    },
+  },
+  {
+    version: 90,
+    name: 'add_cash_sessions',
+    up: () => {
+      // Shift lifecycle, open state (#279, approach A). Close rows stay
+      // final in `cash_closures` (scope='session'); an open session has no
+      // count and no Z number yet, so it lives here until close writes the
+      // closure row and points back via `closure_id`.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS cash_sessions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          opened_by TEXT NOT NULL REFERENCES users(id),
+          opened_by_name TEXT NOT NULL DEFAULT '',
+          opened_at TEXT NOT NULL,
+          opening_float_cents INTEGER NOT NULL DEFAULT 0 CHECK (opening_float_cents >= 0),
+          status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+          closed_at TEXT,
+          closed_by TEXT REFERENCES users(id),
+          closure_id INTEGER REFERENCES cash_closures(id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS cash_sessions_one_open
+          ON cash_sessions(status) WHERE status = 'open';
+      `);
+      // Seeded here (not only in seedInstallDefaults) so pre-v90 upgrades
+      // get the rows too — same pattern as v83's opt-in toggle.
+      insertSettingIfMissing('require_open_shift', 'false');
+      insertSettingIfMissing('stale_session_days', '7');
+    },
+  },
+  {
+    version: 91,
+    name: 'add_cash_session_ownership',
+    up: () => {
+      if (!getColumns(db, 'cash_drawer_movements').includes('cash_session_id')) {
+        db.exec(`ALTER TABLE cash_drawer_movements ADD COLUMN cash_session_id INTEGER`);
+      }
+      // A database whose user_version outran the migration that created
+      // `refunds` has no such table, and getColumns cannot distinguish that
+      // from "no columns". Re-create it before altering.
+      ensureRefundsTables(db);
+      if (!getColumns(db, 'refunds').includes('cash_session_id')) {
+        db.exec(`ALTER TABLE refunds ADD COLUMN cash_session_id INTEGER`);
+      }
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_cash_drawer_movements_session ON cash_drawer_movements(cash_session_id)`);
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_refunds_session ON refunds(cash_session_id)`);
+    },
+  },
+  {
+    version: 92,
+    name: 'add_table_reservation_customer',
+    up: () => {
+      if (!getColumns(db, 'tables').includes('reservation_customer_id')) {
+        db.exec('ALTER TABLE tables ADD COLUMN reservation_customer_id TEXT REFERENCES customers(id) ON DELETE SET NULL');
+      }
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS clear_table_reservation_customer_on_status_change
+        AFTER UPDATE OF status ON tables
+        WHEN NEW.status != 'reserved' AND NEW.reservation_customer_id IS NOT NULL
+        BEGIN
+          UPDATE tables SET reservation_customer_id = NULL WHERE id = NEW.id;
+        END;
+      `);
+    },
+  },
+  {
+    version: 93,
+    name: 'add_configurable_permissions',
+    up: () => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS role_permission_overrides (
+          role TEXT NOT NULL ${USER_ROLE_SQL_CHECK},
+          permission_id TEXT NOT NULL,
+          effect TEXT NOT NULL CHECK (effect IN ('allow', 'deny')),
+          updated_by TEXT NOT NULL REFERENCES users(id),
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (role, permission_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_role_permission_overrides_role
+          ON role_permission_overrides(role);
+
+        CREATE TABLE IF NOT EXISTS user_permission_overrides (
+          user_id TEXT NOT NULL REFERENCES users(id),
+          permission_id TEXT NOT NULL,
+          effect TEXT NOT NULL CHECK (effect IN ('allow', 'deny')),
+          updated_by TEXT NOT NULL REFERENCES users(id),
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY (user_id, permission_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_permission_overrides_user
+          ON user_permission_overrides(user_id);
+
+        CREATE TABLE IF NOT EXISTS authorization_audit_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          batch_id TEXT NOT NULL,
+          actor_user_id TEXT NOT NULL REFERENCES users(id),
+          target_type TEXT NOT NULL CHECK (target_type IN ('role', 'user')),
+          target_id TEXT NOT NULL,
+          permission_id TEXT NOT NULL,
+          previous_effect TEXT CHECK (previous_effect IS NULL OR previous_effect IN ('allow', 'deny')),
+          next_effect TEXT CHECK (next_effect IS NULL OR next_effect IN ('allow', 'deny')),
+          details_json TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_authorization_audit_created
+          ON authorization_audit_log(created_at, id);
+        CREATE INDEX IF NOT EXISTS idx_authorization_audit_target
+          ON authorization_audit_log(target_type, target_id, id);
+      `);
+    },
+  },
+  {
+    version: 94,
+    name: 'add_order_delivery_address',
+    up: () => {
+      // A fresh install gets this column from the CREATE TABLE, so the ALTER is
+      // guarded the way the online_platform migration guards its own columns.
+      const orderColumns = getColumns(db, 'orders');
+      if (!orderColumns.includes('delivery_address')) {
+        db.exec(`ALTER TABLE orders ADD COLUMN delivery_address TEXT DEFAULT NULL`);
+      }
+      // On by default: delivery documents show the number unless the merchant
+      // turns it off. See docs/reference/product-invariants.md.
+      db.prepare('INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)').run(
+        'bill_delivery_show_customer_phone_always',
+        'true',
+        now(),
+      );
+    },
+  },
+  {
+    version: 95,
+    name: 'add_local_diagnostics_log',
+    up: () => {
+      // Local, operator-readable failure log. Nothing here is transmitted; the
+      // diagnostics screen reads it and the copy-for-support bundle quotes it.
+      insertSettingIfMissing('diagnostics_transmission_enabled', 'false');
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS local_diagnostics (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          event_code TEXT NOT NULL,
+          severity TEXT NOT NULL,
+          error_class TEXT NOT NULL,
+          signature TEXT NOT NULL,
+          summary TEXT NOT NULL,
+          metadata_json TEXT,
+          occurred_at TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_local_diagnostics_created
+          ON local_diagnostics(created_at, id);
+      `);
+    },
+  },
+  {
+    version: 96,
     name: 'add_cash_shifts',
     up: () => {
       db.exec(`
@@ -4113,7 +5504,7 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     },
   },
   {
-    version: 85,
+    version: 97,
     name: 'add_exchange_rate_history',
     up: () => {
       // Append-only log of secondary-currency exchange rates over time, so the
@@ -4136,7 +5527,7 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     },
   },
   {
-    version: 86,
+    version: 98,
     name: 'add_expenses',
     up: () => {
       // Business expenses (staff salaries + operating costs) so the owner can
@@ -4166,7 +5557,7 @@ export const MIGRATIONS: { version: number; name: string; up: () => void }[] = [
     },
   },
   {
-    version: 87,
+    version: 99,
     name: 'snapshot_order_item_cost',
     up: () => {
       // Snapshot the product's cost onto each line at sale time so COGS/profit
@@ -4320,7 +5711,7 @@ function createSchema(): void {
       cost REAL DEFAULT 0,
       sku TEXT,
       barcode TEXT,
-      sale_unit TEXT NOT NULL DEFAULT 'each' CHECK (sale_unit IN ('each', 'kg', 'g', 'lb')),
+      sale_unit TEXT NOT NULL DEFAULT 'each' CHECK (sale_unit IN ('each', 'kg', 'g', 'lb', 'ml', 'cl', 'l', 'fl oz', 'oz')),
       allow_fractional_quantity INTEGER NOT NULL DEFAULT 0,
       weight_precision INTEGER NOT NULL DEFAULT 3 CHECK (weight_precision BETWEEN 0 AND 4),
       image_url TEXT,
@@ -4336,6 +5727,8 @@ function createSchema(): void {
       -- Defaults to 0 so fresh and upgraded installs have identical schema.
       cb_percent REAL DEFAULT 0,
       tags TEXT,
+      inventory_product_id TEXT DEFAULT NULL REFERENCES products(id),
+      inventory_deduction_quantity REAL DEFAULT 1,
       deleted_at TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -4414,7 +5807,8 @@ function createSchema(): void {
       kitchen_station_id TEXT,
       is_active INTEGER DEFAULT 1,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      reservation_customer_id TEXT REFERENCES customers(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS customers (
@@ -4460,6 +5854,7 @@ function createSchema(): void {
       customer_id TEXT,
       user_id TEXT,
       type TEXT DEFAULT 'takeaway',
+      delivery_address TEXT DEFAULT NULL,
       guest_count INTEGER,
       special_instructions TEXT,
       packaging_charge REAL DEFAULT 0,
@@ -4497,9 +5892,9 @@ function createSchema(): void {
       product_name TEXT NOT NULL,
       product_sku TEXT,
       unit_price REAL NOT NULL,
-      unit_cost REAL,
       quantity INTEGER NOT NULL DEFAULT 1,
       inventory_deducted_quantity REAL NOT NULL DEFAULT 0,
+      inventory_product_id TEXT DEFAULT NULL,
       subtotal REAL NOT NULL,
       tax_amount REAL DEFAULT 0,
       tax_breakdown TEXT,
@@ -4556,38 +5951,6 @@ function createSchema(): void {
       expires_at TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS shifts (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
-      opened_by TEXT,
-      opened_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      closed_by TEXT,
-      closed_at TEXT,
-      base_currency TEXT,
-      opening_floats TEXT NOT NULL DEFAULT '{}',
-      counted_close TEXT,
-      expected_close TEXT,
-      notes TEXT,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS shift_movements (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      shift_id INTEGER NOT NULL,
-      type TEXT NOT NULL CHECK (type IN ('pay_in', 'pay_out', 'exchange')),
-      currency TEXT,
-      amount REAL,
-      from_currency TEXT,
-      from_amount REAL,
-      to_currency TEXT,
-      to_amount REAL,
-      reason TEXT,
-      user_id TEXT,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (shift_id) REFERENCES shifts(id)
     );
 
     -- ── Config tables ────────────────────────────────────────────────────
@@ -4722,9 +6085,6 @@ function createSchema(): void {
     CREATE INDEX IF NOT EXISTS idx_orders_user       ON orders(user_id);
     CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id);
     CREATE INDEX IF NOT EXISTS idx_bills_order       ON bills(order_id);
-    CREATE INDEX IF NOT EXISTS idx_shifts_status     ON shifts(status);
-    CREATE INDEX IF NOT EXISTS idx_shifts_opened_at  ON shifts(opened_at);
-    CREATE INDEX IF NOT EXISTS idx_shift_movements_shift ON shift_movements(shift_id);
     CREATE INDEX IF NOT EXISTS idx_country_pack_versions_pack ON country_pack_versions(pack_id);
     CREATE INDEX IF NOT EXISTS idx_tax_categories_pack_version ON tax_categories(pack_version_id);
     CREATE INDEX IF NOT EXISTS idx_tax_rules_pack_version ON tax_rules(pack_version_id);
@@ -4940,11 +6300,16 @@ function seedInstallDefaults(): void {
 
   insert('business_name', '');
   insert('business_type', 'restaurant');
-  insert('country', 'IN');
-  insert('currency', 'INR');
-  insert('currency_symbol', '₹');
-  insert('timezone', 'Asia/Kolkata');
+  // country/currency/currency_symbol/timezone are deliberately not seeded here:
+  // they come only from the signup wizard (docs/reference/product-invariants.md,
+  // "Regional settings come from signup, never from a fallback"). Until setup
+  // completes, resolveRegionalSnapshot() throws RegionalNotConfiguredError
+  // rather than a caller substituting a default country.
   insert('business_day_start_time', '00:00');
+  // Shift enforcement ships default-off (#279, approach A): sales work with
+  // no open session unless the owner opts in. Stale auto-close threshold in days.
+  insert('require_open_shift', 'false');
+  insert('stale_session_days', '7');
   insert('address', '');
   insert('phone', '');
   insert('email', '');
@@ -4985,6 +6350,7 @@ function seedInstallDefaults(): void {
   insert('bill_show_tax_breakdown', 'true');
   insert('bill_show_customer_name', 'true');
   insert('bill_show_customer_phone', 'true');
+  insert('bill_delivery_show_customer_phone_always', 'true');
   insert('bill_show_table_number', 'true');
   insert('order_number_prefix', 'ORD');
   insert('order_number_include_date', 'true');
@@ -5123,11 +6489,26 @@ function sanitizedNumberPrefix(value: string | null | undefined, fallback: strin
   return (value ?? fallback).replace(/[^A-Za-z0-9]/g, '');
 }
 
+// Order/bill numbering buckets and displayed date/period segments on a
+// tenant-local day. A missing timezone must not silently fall through to the
+// date helpers' own UTC fallback — at a local day/month/year boundary that
+// produces the wrong period segment and sequence bucket for the identifier.
+// Resolves through the country profile when the stored timezone is missing
+// or invalid, matching resolveRegionalSnapshot's own contract — only throws
+// RegionalNotConfiguredError when the country itself is unresolvable.
+function requireTenantTimezone(): string {
+  return resolveRegionalSnapshot({
+    country: getSettingValue('country') ?? undefined,
+    currency: getSettingValue('currency') ?? undefined,
+    timezone: getSettingValue('timezone') ?? undefined,
+  }).timezone;
+}
+
 export function generateOrderNumber(): string {
   const prefix = sanitizedNumberPrefix(getSettingValue('order_number_prefix'), 'ORD');
   const includeDate = getSettingValue('order_number_include_date') !== 'false';
   const resetDaily = getSettingValue('order_number_reset_daily') !== 'false';
-  const timezone = getSettingValue('timezone') || 'Asia/Kolkata';
+  const timezone = requireTenantTimezone();
 
   // Per-day bucket when reset daily, otherwise a single bucket.
   const bucket = resetDaily ? dateStampInTimezone(timezone) : 'ALL';
@@ -5144,7 +6525,7 @@ export function generateBillNumber(): string {
   const resetPeriod: InvoiceResetPeriod = ['never', 'daily', 'monthly', 'financial_year'].includes(configuredPeriod)
     ? configuredPeriod as InvoiceResetPeriod
     : 'daily';
-  const timezone = getSettingValue('timezone') || 'Asia/Kolkata';
+  const timezone = requireTenantTimezone();
   const fyStart = clampFinancialYearStart(
     getSettingValue('invoice_financial_year_start_month'),
     getSettingValue('invoice_financial_year_start_day'),
@@ -5160,7 +6541,7 @@ export function now(): string {
   return new Date().toISOString().replace('T', ' ').replace(/\..*$/, '');
 }
 
-/** Records who performed an order/item mutation (docs/business-decisions.md). */
+/** Records who performed an order/item mutation (docs/reference/product-invariants.md). */
 export function recordOrderAudit(
   db: ReturnType<typeof getDatabase>,
   params: { orderId: number | string; orderItemId?: number | string | null; actorUserId: string; action: string; details?: Record<string, unknown> },
@@ -5190,88 +6571,19 @@ export function utcTodayDate(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-function parseStartTimeOffsetMs(startTime: string = '00:00'): number {
-  const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(startTime.trim());
-  if (!match) return 0;
-  const hours = Number(match[1]);
-  const minutes = Number(match[2]);
-  return (hours * 60 + minutes) * 60 * 1000;
-}
+// The business-day rule lives in shared/business-date.ts so the renderer cannot
+// restate it. These re-exports keep the existing importer surface for one
+// release: every remaining import of a business-date symbol from this module is
+// visible in review instead of hidden behind a silent copy. Delete them and
+// repoint the importers in a follow-on, or the move is cosmetic.
+export { dayBoundsInTimezone, utcDayBounds };
 
-function calendarDateInTimezone(instant: Date, timezone: string): string {
-  try {
-    const parts = new Intl.DateTimeFormat('en-US', {
-      timeZone: timezone,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    }).formatToParts(instant);
-    const get = (type: string) => parts.find((part) => part.type === type)?.value ?? '';
-    return `${get('year')}-${get('month')}-${get('day')}`;
-  } catch {
-    return instant.toISOString().slice(0, 10);
-  }
-}
-
-/** Return the business date represented by an instant in an IANA timezone with an optional day start offset. */
+/** Deprecated positional alias of `businessDateForInstant`, kept so the existing
+ *  `localDateInTimezone(instant, timezone, startTime)` importers keep their exact
+ *  signature for one release. A bare rename would have changed the argument order
+ *  of a live export without any of those callers changing. */
 export function localDateInTimezone(instant: Date, timezone: string, startTime: string = '00:00'): string {
-  if (parseStartTimeOffsetMs(startTime) === 0) return calendarDateInTimezone(instant, timezone);
-
-  const calendarDate = calendarDateInTimezone(instant, timezone);
-  const [start] = dayBoundsInTimezone(calendarDate, timezone, startTime);
-  if (instant >= parseDbTimestamp(start)) return calendarDate;
-
-  const [year, month, day] = calendarDate.split('-').map(Number);
-  return new Date(Date.UTC(year, month - 1, day - 1)).toISOString().slice(0, 10);
-}
-
-function timezoneOffsetMilliseconds(instant: Date, timezone: string): number {
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: timezone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hourCycle: 'h23',
-  }).formatToParts(instant);
-  const get = (type: string) => Number(parts.find((part) => part.type === type)?.value);
-  return Date.UTC(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'), get('second')) - instant.getTime();
-}
-
-/** Half-open UTC ranges `[start, end)` for one date in the tenant timezone with an optional day start offset. */
-export function dayBoundsInTimezone(date: string, timezone: string, startTime: string = '00:00'): [string, string] {
-  const [y, m, d] = date.split('-').map(Number);
-  const format = (instant: Date) => instant.toISOString().replace('T', ' ').replace(/\..*$/, '');
-  const offsetMinutes = parseStartTimeOffsetMs(startTime) / 60000;
-  const startHour = Math.floor(offsetMinutes / 60);
-  const startMinute = offsetMinutes % 60;
-  try {
-    const toUtc = (localWallTime: number): Date => {
-      let instant = new Date(localWallTime);
-      for (let attempt = 0; attempt < 3; attempt++) {
-        instant = new Date(localWallTime - timezoneOffsetMilliseconds(instant, timezone));
-      }
-      return instant;
-    };
-    return [
-      format(toUtc(Date.UTC(y, m - 1, d, startHour, startMinute))),
-      format(toUtc(Date.UTC(y, m - 1, d + 1, startHour, startMinute))),
-    ];
-  } catch {
-    return utcDayBounds(date, startTime);
-  }
-}
-
-/** Half-open UTC range strings `[start, end)` for a UTC calendar date with an optional day start offset. */
-export function utcDayBounds(date: string, startTime: string = '00:00'): [string, string] {
-  const [y, m, d] = date.split('-').map(Number);
-  const offsetMs = parseStartTimeOffsetMs(startTime);
-  const start = new Date(Date.UTC(y, m - 1, d, 0, 0, 0) + offsetMs);
-  const end = new Date(start.getTime() + 24 * 3600 * 1000);
-  const fmt = (dt: Date) => dt.toISOString().replace('T', ' ').replace(/\..*$/, '');
-  return [fmt(start), fmt(end)];
+  return businessDateForInstant({ instant, timezone, startTime });
 }
 
 /** Verify a user PIN against the stored pin_hash. */
@@ -5371,6 +6683,7 @@ export function parseItemJson(item: any): any {
     modifier_selection: tryParse(item.modifier_selection),
     tax_breakdown: tryParse(item.tax_breakdown),
     tax_snapshot: tryParse(item.tax_snapshot),
+    recipe_snapshot: tryParse(item.recipe_snapshot),
   };
 }
 
@@ -5411,7 +6724,7 @@ export function parseRowJson(row: any): any {
   if (Array.isArray(taxBreakdown) && taxBreakdown.length > 0 && Array.isArray(taxBreakdown[0])) {
     let fractionDigits = 2;
     try {
-      fractionDigits = getCurrencyFractionDigits(getSettingValue('currency') || 'INR');
+      fractionDigits = getCurrencyFractionDigits(getSettingValue('currency') || '');
     } catch { }
     const merged: Record<string, { title: string; rate: number; amount: number }> = {};
     for (const itemBreakdown of taxBreakdown) {

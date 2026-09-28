@@ -1,9 +1,11 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import { getDatabase, getKdsStationCategoryIds, getKdsStationRoutingScope, getUserKdsStationIds, hasUserKdsStationAssignments, isDatabaseMaintenanceActive, isKdsStationItemAllowed, now, parseItemJson, attachEffectiveAddons, isKdsEnabled, isVoidedItemKdsVisible, KDS_VOIDED_ITEM_VISIBILITY_MS, projectKdsItem, projectKdsOrder, registerDatabaseMaintenanceStartListener, withTxn } from '../db';
 import * as jwt from 'jsonwebtoken';
-import { getJWTSecret, parseCategoryIds } from '../routes/auth';
+import { getJWTSecret } from '../security/jwt-secret';
+import { parseCategoryIds } from '../routes/auth';
 import { getUserAuthStatus, isTokenRevoked, isTokenStale } from '../middleware/security';
 import { ROLE_ACCESS, hasRole } from '../../shared/role-permissions';
+import { hasPermission } from './authorization';
 
 interface KdsClient {
   ws: WebSocket;
@@ -70,8 +72,17 @@ function closeKdsClient(client: KdsClient, message?: string): void {
   }
   clearClientIdentity(client);
   if (client.ws.readyState === WebSocket.OPEN || client.ws.readyState === WebSocket.CONNECTING) {
-    client.ws.close(1008, message || 'Session invalid');
+    try { client.ws.close(1008, message || 'Session invalid'); } catch { }
   }
+}
+
+export function getKdsClientCount(): number {
+  return clients.size;
+}
+
+export function closeKdsClientForTest(ws: WebSocket, message?: string): void {
+  const client = clients.get(ws);
+  if (client) closeKdsClient(client, message);
 }
 
 function isKdsClientAuthorized(client: KdsClient): boolean {
@@ -82,7 +93,7 @@ function isKdsClientAuthorized(client: KdsClient): boolean {
     if (
       decoded.userId !== client.userId ||
       !status?.isActive ||
-      !hasRole(status.role, ROLE_ACCESS.kitchen) ||
+      !hasPermission(decoded.userId, 'kitchen.use') ||
       isTokenStale(decoded.iat, status.tokensValidAfter)
     ) return false;
     const currentUser = getDatabase()
@@ -307,7 +318,7 @@ function handleAuth(ws: WebSocket, client: KdsClient, message: any): void {
       return;
     }
 
-    if (!hasRole(user.role, ROLE_ACCESS.kitchen)) {
+    if (!hasPermission(user.id, 'kitchen.use')) {
       closeKdsClient(client, 'Only kitchen staff can access KDS');
       return;
     }
@@ -362,6 +373,10 @@ function handleStatusUpdate(client: KdsClient, message: any): void {
   }
   if (!isKdsClientAuthorized(client)) {
     closeKdsClient(client, 'Session expired or revoked');
+    return;
+  }
+  if (!client.userId || !hasPermission(client.userId, 'kitchen.status.update')) {
+    client.ws.send(JSON.stringify({ type: 'error', message: 'Insufficient permissions' }));
     return;
   }
 
@@ -618,11 +633,22 @@ function broadcastOrderUpdate(): void {
   // and share it across every client in this broadcast.
   const sharedExpiredVoidMarker = getExpiredVoidMarker();
   clients.forEach((client) => {
+    if (client.ws.readyState !== WebSocket.OPEN) {
+      clients.delete(client.ws);
+      clearClientAuthTimeout(client);
+      return;
+    }
+    // A socket still inside its connect-to-auth window is not a revoked
+    // session — its lifecycle belongs to the KDS_AUTH_TIMEOUT_MS timer, the
+    // same way the heartbeat below treats it. Skip it before sendActiveOrders
+    // so no order snapshot can reach an unauthenticated socket.
+    if (!client.userId) {
+      return;
+    }
     if (!isKdsClientAuthorized(client)) {
       closeKdsClient(client, 'Session expired or revoked');
       return;
     }
-    if (client.ws.readyState !== WebSocket.OPEN) return;
     try {
       sendActiveOrders(client.ws, client.categoryIds, client.stationIds, client.role === 'chef' || client.categoryIds.length > 0 || client.stationIds.length > 0);
       client.categoryIdsChanged = false;

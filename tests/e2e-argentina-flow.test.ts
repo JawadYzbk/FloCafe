@@ -97,7 +97,7 @@ async function runLegacyOnboardingInIsolation(legacyTestDir) {
   const db2 = initTestDb();
 
   try {
-    seedSetupProfile(db2, 'demo', 'finedine', 'IN');
+    seedSetupProfile(db2, 'demo', 'finedine', 'en', 'IN');
     const india = db2.prepare("SELECT id FROM products WHERE id = 'prod-demo-paneer-tikka'").get();
     assert(!!india, 'legacy India demo seeds paneer tikka');
     const burger = db2.prepare("SELECT id FROM products WHERE id = 'prod-demo-hamburguesa-clasica'").get();
@@ -125,6 +125,8 @@ async function runArgentinaOnboarding(baseUrl, db) {
       timezone: 'America/Argentina/Buenos_Aires',
       language: 'es',
       terms_accepted: true,
+      owner_approval_pin: '5678',
+      owner_approval_pin_confirmation: '5678',
     },
   });
 

@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { getDatabase, now, withTxn } from '../db';
-import { requireRole } from '../middleware/security';
+import { requirePermission } from '../services/authorization';
 import { getBaseCurrency, getSecondaryCurrencies } from '../currency-config';
 
 /**
@@ -155,7 +155,7 @@ function getOpenShift(db: ReturnType<typeof getDatabase>): any {
 
 // ── Routes ───────────────────────────────────────────────────────────────────
 
-shiftRoutes.get('/current', requireRole('owner', 'manager', 'cashier'), (req: Request, res: Response) => {
+shiftRoutes.get('/current', requirePermission('cash.shifts.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const shift = getOpenShift(db);
@@ -166,7 +166,7 @@ shiftRoutes.get('/current', requireRole('owner', 'manager', 'cashier'), (req: Re
   }
 });
 
-shiftRoutes.get('/', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+shiftRoutes.get('/', requirePermission('cash.shifts.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 30));
@@ -178,7 +178,7 @@ shiftRoutes.get('/', requireRole('owner', 'manager'), (req: Request, res: Respon
   }
 });
 
-shiftRoutes.get('/:id', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+shiftRoutes.get('/:id', requirePermission('cash.shifts.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const shift = db.prepare('SELECT * FROM shifts WHERE id = ?').get(req.params.id);
@@ -190,7 +190,7 @@ shiftRoutes.get('/:id', requireRole('owner', 'manager'), (req: Request, res: Res
   }
 });
 
-shiftRoutes.post('/open', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+shiftRoutes.post('/open', requirePermission('cash.shifts.open'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const accepted = new Set(acceptedCurrencies());
@@ -214,7 +214,7 @@ shiftRoutes.post('/open', requireRole('owner', 'manager'), (req: Request, res: R
   }
 });
 
-shiftRoutes.post('/movements', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+shiftRoutes.post('/movements', requirePermission('cash.movements.manage'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const accepted = new Set(acceptedCurrencies());
@@ -262,7 +262,7 @@ shiftRoutes.post('/movements', requireRole('owner', 'manager'), (req: Request, r
   }
 });
 
-shiftRoutes.post('/close', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+shiftRoutes.post('/close', requirePermission('cash.shifts.close'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const accepted = new Set(acceptedCurrencies());

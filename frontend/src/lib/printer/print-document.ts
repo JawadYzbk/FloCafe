@@ -6,6 +6,8 @@ import {
   type LabelResolver,
   type KotDocument,
   type KotPrintData,
+  optionalPaymentAmount,
+  type PaymentSnapshot,
   type PrintContext,
   type PrintData,
   type PrintDocument,
@@ -18,6 +20,7 @@ import { LANGUAGES, getLanguageDirection, type Language } from '@/lib/i18n/langu
 import { usePosSettingsStore } from '@/store/pos-settings';
 import { getCountryByCode, getCurrencySymbol, resolveTenantCurrency } from '@countries';
 import { resolveTaxComponents } from './tax-components';
+import { shouldShowCustomerNumber } from '@print/document';
 import type { Bill, Order, OrderItem } from '@/lib/types';
 
 /** Business contact facts and visibility flags for one bill print run. */
@@ -38,6 +41,7 @@ export interface BillBusinessOptions {
   showBusinessName?: boolean;
   showCustomerName?: boolean;
   showCustomerPhone?: boolean;
+  deliveryShowCustomerPhoneAlways?: boolean;
   showTableNumber?: boolean;
   isReprint?: boolean;
 }
@@ -112,18 +116,22 @@ function baseDirectionFor(languages: ResolvedPrintLanguages): ReturnType<typeof 
   }
 }
 
-function parsePaymentDetails(
-  raw: Bill['payment_details'],
-): Array<{ method: string; amount: number; tenderCurrency?: string; tenderAmount?: number }> {
+function parsePaymentDetails(raw: Bill['payment_details']): PaymentSnapshot[] {
   if (!Array.isArray(raw)) return [];
-  return raw.map((entry) => ({
-    method: String(entry?.method ?? ''),
-    amount: Number(entry?.amount) || 0,
-    // Carry the secondary-currency tender through to the semantic document so
-    // receipts can annotate "Cash (22,250,000 LBP)" — base amount unchanged.
-    tenderCurrency: entry?.tender_currency || undefined,
-    tenderAmount: entry?.tender_amount || undefined,
-  }));
+  return raw.map((entry) => {
+    const tendered = optionalPaymentAmount(entry?.tendered_amount);
+    const change = optionalPaymentAmount(entry?.change_amount);
+    return {
+      method: String(entry?.method ?? ''),
+      amount: Number(entry?.amount) || 0,
+      // Carry the secondary-currency tender through to the semantic document so
+      // receipts can annotate "Cash (22,250,000 LBP)" — base amount unchanged.
+      ...(entry?.tender_currency ? { tenderCurrency: entry.tender_currency } : {}),
+      ...(entry?.tender_amount ? { tenderAmount: entry.tender_amount } : {}),
+      ...(tendered !== undefined ? { tendered } : {}),
+      ...(change !== undefined ? { change } : {}),
+    };
+  });
 }
 
 /** Normalize a Bill and nested Order into authoritative PrintData. */
@@ -148,6 +156,7 @@ export function buildBillPrintData(bill: Bill, opts: BillBusinessOptions = {}): 
       tableName: String(order?.table?.name ?? ''),
       onlinePlatform: String(order?.online_platform ?? ''),
       externalOrderId: String(order?.external_order_id ?? ''),
+      deliveryAddress: String(order?.delivery_address ?? ''),
       items: items.map((item) => ({
         productName: String(item?.product_name ?? ''),
         quantity: Number(item?.quantity) || 0,
@@ -201,7 +210,11 @@ export function buildBillPrintData(bill: Bill, opts: BillBusinessOptions = {}): 
       showTaxBreakdown: opts.showTaxBreakdown === true,
       showTableNumber: opts.showTableNumber !== false,
       showCustomerName: opts.showCustomerName !== false,
-      showCustomerPhone: opts.showCustomerPhone !== false,
+      showCustomerPhone: shouldShowCustomerNumber({
+        showOnReceipts: opts.showCustomerPhone !== false,
+        alwaysForDeliveryOrders: opts.deliveryShowCustomerPhoneAlways !== false,
+        orderType: String(order?.type ?? ''),
+      }),
     },
   };
 }
@@ -223,7 +236,7 @@ export function buildBillPrintContext(opts: {
   trimDecimals?: boolean;
 }): PrintContext {
   const country = getCountryByCode(opts.tenant.country ?? '');
-  const currency = resolveTenantCurrency(opts.tenant.currency, opts.tenant.country);
+  const currency = resolveTenantCurrency(opts.tenant.currency, opts.tenant.country ?? '');
   return {
     columns: opts.columns ?? 42,
     languages: opts.languages,

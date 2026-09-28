@@ -1,6 +1,6 @@
 /**
  * Refunds on already-completed orders: business-day approval tiers, expanded
- * item eligibility, and store-credit refunds (docs/business-decisions.md).
+ * item eligibility, and store-credit refunds (docs/reference/product-invariants.md).
  *
  * Kept separate from tests/refunds.test.ts because that file's PIN
  * rate-limit budget is deliberately tuned to exactly 5 attempts; adding more
@@ -90,7 +90,7 @@ async function main() {
     // ── Same bill, owner PIN: accepted, and recorded in the order audit log ──
     const ownerApproval = await api(baseUrl, '/api/refunds', {
       method: 'POST',
-      body: { bill_id: lateBill.bill.id, amount: lateBill.bill.paid_amount, method: 'cash', override_pin: '9999', manager_id: ownerId },
+      body: { bill_id: lateBill.bill.id, amount: lateBill.bill.paid_amount, method: 'cash', override_pin: '9999', approver_id: ownerId },
       headers: managerAuth,
     });
     assertEqual(ownerApproval.status, 201, 'an owner PIN can approve a refund after the 1-hour window, same business day');

@@ -1,17 +1,19 @@
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt, { SignOptions } from 'jsonwebtoken';
-import { randomBytes, randomUUID } from 'crypto';
-import { getCountryCallingCode, type CountryCode } from 'libphonenumber-js';
+import { randomUUID } from 'crypto';
 import { getCurrentSchemaVersion, getDatabase, getSettingValue, now } from '../db';
+import { getJWTSecret } from '../security/jwt-secret';
+import { seedSetupProfile } from '../setup/seed-data';
 import { authorizeMasterPin, isMasterPinAvailable, setMasterPin } from '../services/master-pin';
 import { authRateLimit, validatePassword, revokeToken, isTokenRevoked, isTokenStale, invalidateUserAuthCache } from '../middleware/security';
-import { getCurrencySymbol, getCountryByCode, isValidTimeZone } from '../countries';
+import { getCurrencySymbol, getCountryByCode, isValidTimeZone, resolveRegionalSnapshot, type RegionalSnapshot } from '../countries';
 import { countryConfirmationPatch } from '../services/country-provenance';
 import { cloudSync, DEFAULT_CLOUD_SERVER_URL, normalizeCloudServerUrl } from '../services/cloud-sync';
 import { asyncHandler } from '../middleware/async-handler';
 import { normalizeOptionalPhone } from '../lib/phone';
-import { isSyntacticallyValidCurrencyCode } from '../../shared/print/currency';
+import { isSupportedCurrencyCode } from '../../shared/currencies';
+import { effectivePermissionRevision, hasActiveAdministrator, resolveEffectivePermissions } from '../services/authorization';
 
 const router = Router();
 
@@ -23,61 +25,37 @@ function expiresInFor(remember: boolean): SignOptions['expiresIn'] {
   return remember ? JWT_REMEMBER_EXPIRES_IN : JWT_EXPIRES_IN;
 }
 
-function dialCodeFor(country: string | undefined): string {
-  if (!country) return '+1';
-  try { return `+${getCountryCallingCode(country.toUpperCase() as CountryCode)}`; }
-  catch { return '+1'; }
-}
-
 const INITIAL_ADMIN_ROLE = 'owner';
 const VALID_BUSINESS_TYPES = new Set(['restaurant']);
 const VALID_SETUP_PROFILES = new Set(['empty', 'express', 'demo']);
 const VALID_SERVICE_MODELS = new Set(['qsr', 'finedine']);
 const LOCAL_SETUP_HOSTS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 
-/** Lazy-loaded JWT secret stored in settings table, generated on first launch. */
-let _jwtSecret: string | null = null;
+// The secret itself now lives in main/security/jwt-secret.ts, which is the only
+// module allowed to hold its cache. Re-exported here for one release so the
+// ~45 test files that resolve the secret through this router do not become a
+// mechanical 45-file diff; main/ importers already point at the security module.
+export { getJWTSecret, clearJWTSecretCache } from '../security/jwt-secret';
 
-export function clearJWTSecretCache(): void {
-  _jwtSecret = null;
-}
-
-export function getJWTSecret(): string {
-  if (_jwtSecret) return _jwtSecret;
-
-  // Environment variable always wins (for CI/testing)
-  if (process.env.JWT_SECRET) {
-    _jwtSecret = process.env.JWT_SECRET;
-    return _jwtSecret;
-  }
-
-  try {
-    const db = getDatabase();
-    const row = db.prepare("SELECT value FROM settings WHERE key = 'jwt_secret'").get() as { value: string } | undefined;
-
-    if (row?.value) {
-      _jwtSecret = row.value;
-    } else {
-      // First launch: generate and persist a random secret
-      _jwtSecret = randomBytes(32).toString('hex');
-      db.prepare("INSERT INTO settings (key, value, updated_at) VALUES ('jwt_secret', ?, ?)")
-        .run(_jwtSecret, now());
-      console.log('[Auth] Generated new JWT secret for this install');
-    }
-  } catch (err) {
-    // Database not ready — refuse to operate with a static secret.
-    // JWT operations will fail until the database is accessible.
-    console.error('[Auth] Database not ready — JWT secret unavailable:', err);
-    throw new Error('Database not ready — authentication unavailable');
-  }
-
-  return _jwtSecret;
-}
+// The demo/express fixture data likewise belongs to no router. Re-exported
+// here for one release, on the same terms as the secret above.
+export { seedSetupProfile, ENGLISH_IDENTICAL_SEED_LANGUAGES } from '../setup/seed-data';
 
 /** Build synthetic tenant object from local settings for frontend routing. */
-function buildLocalTenant(db: ReturnType<typeof getDatabase>, userRole: string) {
+function buildLocalTenant(db: ReturnType<typeof getDatabase>, userId: string, userRole: string) {
   const rows = db.prepare('SELECT key, value FROM settings').all() as { key: string; value: string }[];
   const s: Record<string, string> = Object.fromEntries(rows.map(r => [r.key, r.value]));
+
+  // Login must never fail on a missing/unresolvable regional snapshot
+  // (unreachable for an authenticated, post-setup store per
+  // docs/reference/product-invariants.md) — degrade to a neutral en-US-shaped format
+  // rather than throw, and never silently claim India.
+  let snapshot: RegionalSnapshot | null = null;
+  try {
+    snapshot = resolveRegionalSnapshot(s);
+  } catch {
+    snapshot = null;
+  }
 
   return {
     id: 1,
@@ -85,27 +63,47 @@ function buildLocalTenant(db: ReturnType<typeof getDatabase>, userRole: string) 
     slug: 'local',
     database_name: 'local',
     business_type: s.business_type || 'restaurant',
-    country: s.country || 'IN',
-    currency: s.currency || 'INR',
-    currency_symbol: getCurrencySymbol(s.currency || 'INR', getCountryByCode(s.country)?.locale) || '₹',
-    timezone: s.timezone || 'Asia/Kolkata',
+    country: snapshot?.country || '',
+    currency: snapshot?.currency || '',
+    currency_symbol: snapshot?.currencySymbol || '',
+    currency_position: snapshot?.currencyPosition || 'prefix',
+    currency_fraction_digits: snapshot?.currencyFractionDigits ?? 2,
+    decimal_separator: snapshot?.decimalSeparator || '.',
+    group_separator: snapshot?.groupSeparator ?? ',',
+    timezone: snapshot?.timezone || s.timezone || '',
     business_day_start_time: s.business_day_start_time || '00:00',
     language: s.language || 'en',
     // Include print policies in tenant snapshot so renderer bootstraps them before first print.
     bill_language_policy: s.bill_language_policy || null,
     kot_language_policy: s.kot_language_policy || null,
     service_model: s.service_model || 'finedine',
-    currency_display: s.currency_display || 'rial',
-    number_digits: s.number_digits || 'locale',
-    calendar: s.calendar || 'locale',
+    currency_display: snapshot?.preferences.currencyDisplay || s.currency_display || 'rial',
+    number_digits: snapshot?.preferences.digits || s.number_digits || 'locale',
+    calendar: snapshot?.preferences.calendar || s.calendar || 'locale',
     plan: 'desktop',
     status: 'active',
     role: userRole,  // user's role — AuthGuard uses this for routing
+    permission_ids: [...(resolveEffectivePermissions(userId)?.permissionIds ?? [])],
+    authorization_revision: effectivePermissionRevision(userId),
   };
 }
 
 function getUserCount(db: ReturnType<typeof getDatabase>): number {
   return (db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number }).count;
+}
+
+type PendingCurrencyReset = { country: string; currency: string; timezone: string };
+
+function getPendingCurrencyReset(db: ReturnType<typeof getDatabase>): PendingCurrencyReset | null {
+  try {
+    const row = db.prepare("SELECT value FROM _flo_meta WHERE key = 'currency_reset_pending'").get() as { value?: string } | undefined;
+    if (!row?.value) return null;
+    const parsed = JSON.parse(row.value) as Partial<PendingCurrencyReset>;
+    if (typeof parsed.country !== 'string' || typeof parsed.currency !== 'string' || typeof parsed.timezone !== 'string') return null;
+    return { country: parsed.country, currency: parsed.currency, timezone: parsed.timezone };
+  } catch {
+    return null;
+  }
 }
 
 function normalizeEmail(email: unknown): string {
@@ -137,280 +135,6 @@ function upsertSettings(db: ReturnType<typeof getDatabase>, entries: Record<stri
 
   for (const [key, value] of Object.entries(entries)) {
     if (value !== undefined && value !== null) stmt.run(key, String(value), now());
-  }
-}
-
-
-function insertCategory(db: ReturnType<typeof getDatabase>, id: string, name: string, color: string, icon: string, sortOrder: number): void {
-  db.prepare(`
-    INSERT OR IGNORE INTO categories (id, name, color, icon, sort_order, is_active, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, 1, ?, ?)
-  `).run(id, name, color, icon, sortOrder, now(), now());
-}
-
-function insertProduct(db: ReturnType<typeof getDatabase>, id: string, categoryId: string, name: string, price: number, sortOrder: number): void {
-  db.prepare(`
-    INSERT OR IGNORE INTO products (id, category_id, name, price, sort_order, is_active, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, 1, ?, ?)
-  `).run(id, categoryId, name, price, sortOrder, now(), now());
-}
-
-function insertTable(db: ReturnType<typeof getDatabase>, id: string, number: string, capacity: number): void {
-  db.prepare(`
-    INSERT OR IGNORE INTO tables (id, number, capacity, status, created_at, updated_at)
-    VALUES (?, ?, ?, 'available', ?, ?)
-  `).run(id, number, capacity, now(), now());
-}
-
-function insertCustomer(db: ReturnType<typeof getDatabase>, id: string, name: string, rawPhone: string, fallbackDialCode: string, country = 'IN'): void {
-  const norm = normalizeOptionalPhone(rawPhone, country);
-  const finalPhone = norm.valid && norm.e164 ? norm.e164 : rawPhone;
-  const finalCountryCode = norm.valid && norm.countryCode ? norm.countryCode : fallbackDialCode;
-  db.prepare(`
-    INSERT OR IGNORE INTO customers (id, name, phone, country_code, is_active, created_at, updated_at)
-    VALUES (?, ?, ?, ?, 1, ?, ?)
-  `).run(id, name, finalPhone, finalCountryCode, now(), now());
-}
-
-function insertStaffUser(db: ReturnType<typeof getDatabase>, id: string, name: string, email: string, role: string, password: string, isActive = 1): void {
-  db.prepare(`
-    INSERT OR IGNORE INTO users (id, name, email, password, role, is_active, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, name, email, bcrypt.hashSync(password, 10), role, isActive, now(), now());
-}
-
-type SeedLanguage = 'en' | 'es' | 'fr' | 'pt' | 'de' | 'tr' | 'fil' | 'fa';
-
-/** Filipino intentionally uses the English sample data as its reviewed exception. */
-export const ENGLISH_IDENTICAL_SEED_LANGUAGES = ['fil'] as const;
-
-function resolveSeedLanguage(language?: string): SeedLanguage {
-  return language === 'es' || language === 'fr' || language === 'pt' || language === 'de'
-    || language === 'tr' || language === 'fil' || language === 'fa'
-    ? language
-    : 'en';
-}
-
-function seedExpressRestaurant(db: ReturnType<typeof getDatabase>, serviceModel: string, language?: string): void {
-  const lang = resolveSeedLanguage(language);
-  const labels: Record<SeedLanguage, [string, string, string, string]> = {
-    en: ['Food', 'Beverages', 'Meal', 'Tea'],
-    es: ['Comida', 'Bebidas', 'Comida', 'Té'],
-    fr: ['Plats', 'Boissons', 'Plat', 'Thé'],
-    pt: ['Comidas', 'Bebidas', 'Refeição', 'Chá'],
-    de: ['Speisen', 'Getränke', 'Mahlzeit', 'Tee'],
-    tr: ['Yiyecekler', 'İçecekler', 'Yemek', 'Çay'],
-    fil: ['Food', 'Beverages', 'Meal', 'Tea'],
-    fa: ['غذاها', 'نوشیدنی‌ها', 'غذا', 'چای'],
-  };
-  const [food, beverages, meal, tea] = labels[lang];
-  const coffee = lang === 'es' ? 'Café' : lang === 'fr' ? 'Café' : lang === 'pt' ? 'Café'
-    : lang === 'de' ? 'Kaffee' : lang === 'tr' ? 'Kahve' : lang === 'fa' ? 'قهوه' : 'Coffee';
-  const snack = lang === 'es' ? 'Bocadillo' : lang === 'fr' ? 'Snack' : lang === 'pt' ? 'Lanche'
-    : lang === 'de' ? 'Snack' : lang === 'tr' ? 'Atıştırmalık' : lang === 'fa' ? 'میان‌وعده' : 'Snack';
-  insertCategory(db, 'cat-express-food', food, '#F97316', '🍽️', 1);
-  insertCategory(db, 'cat-express-beverages', beverages, '#0EA5E9', '🥤', 2);
-  insertProduct(db, 'prod-express-meal', 'cat-express-food', meal, 150, 1);
-  insertProduct(db, 'prod-express-snack', 'cat-express-food', snack, 80, 2);
-  insertProduct(db, 'prod-express-tea', 'cat-express-beverages', tea, 25, 1);
-  insertProduct(db, 'prod-express-coffee', 'cat-express-beverages', coffee, 40, 2);
-
-  if (serviceModel === 'finedine') {
-    insertTable(db, 'tbl-express-1', 'T1', 4);
-    insertTable(db, 'tbl-express-2', 'T2', 4);
-    insertTable(db, 'tbl-express-3', 'T3', 6);
-  }
-}
-
-function seedDemoRestaurant(db: ReturnType<typeof getDatabase>, serviceModel: string, language?: string, country?: string): void {
-  const lang = resolveSeedLanguage(language);
-
-  const cats = lang === 'es'
-    ? [
-        ['cat-demo-starters', 'Entradas', '#FF6B6B', '🍟', 1],
-        ['cat-demo-burger', 'Hamburguesas', '#4ECDC4', '🍔', 2],
-        ['cat-demo-beverages', 'Bebidas', '#45B7D1', '🥤', 3],
-        ['cat-demo-desserts', 'Postres', '#96CEB4', '🍰', 4],
-      ] as const
-    : lang === 'fr'
-    ? [
-        ['cat-demo-starters', 'Entrées', '#FF6B6B', '🍟', 1],
-        ['cat-demo-burger', 'Hamburgers', '#4ECDC4', '🍔', 2],
-        ['cat-demo-beverages', 'Boissons', '#45B7D1', '🥤', 3],
-        ['cat-demo-desserts', 'Desserts', '#96CEB4', '🍰', 4],
-      ] as const
-    : lang === 'pt'
-    ? [
-        ['cat-demo-starters', 'Entradas', '#FF6B6B', '🍟', 1],
-        ['cat-demo-burger', 'Hambúrgueres', '#4ECDC4', '🍔', 2],
-        ['cat-demo-beverages', 'Bebidas', '#45B7D1', '🥤', 3],
-        ['cat-demo-desserts', 'Sobremesas', '#96CEB4', '🍰', 4],
-      ] as const
-    : lang === 'de'
-    ? [
-        ['cat-demo-starters', 'Vorspeisen', '#FF6B6B', '🍟', 1],
-        ['cat-demo-burger', 'Burger', '#4ECDC4', '🍔', 2],
-        ['cat-demo-beverages', 'Getränke', '#45B7D1', '🥤', 3],
-        ['cat-demo-desserts', 'Desserts', '#96CEB4', '🍰', 4],
-      ] as const
-    : lang === 'tr'
-    ? [
-        ['cat-demo-starters', 'Başlangıçlar', '#FF6B6B', '🍟', 1],
-        ['cat-demo-main', 'Ana Yemekler', '#4ECDC4', '🍛', 2],
-        ['cat-demo-beverages', 'İçecekler', '#45B7D1', '🥤', 3],
-        ['cat-demo-desserts', 'Tatlılar', '#96CEB4', '🍰', 4],
-      ] as const
-    : lang === 'fa'
-    ? [
-        ['cat-demo-starters', 'پیش‌غذاها', '#FF6B6B', '🍟', 1],
-        ['cat-demo-main', 'غذاهای اصلی', '#4ECDC4', '🍛', 2],
-        ['cat-demo-beverages', 'نوشیدنی‌ها', '#45B7D1', '🥤', 3],
-        ['cat-demo-desserts', 'دسرها', '#96CEB4', '🍰', 4],
-      ] as const
-    : [
-        ['cat-demo-starters', 'Starters', '#FF6B6B', '🍔', 1],
-        ['cat-demo-main', 'Main Course', '#4ECDC4', '🍛', 2],
-        ['cat-demo-beverages', 'Beverages', '#45B7D1', '🥤', 3],
-        ['cat-demo-desserts', 'Desserts', '#96CEB4', '🍰', 4],
-      ] as const;
-  for (const [id, name, color, icon, sort] of cats) insertCategory(db, id, name, color, icon, sort);
-
-  const products = lang === 'es'
-    ? [
-        ['prod-demo-empanadas', 'cat-demo-starters', 'Empanadas de Carne', 280, 1],
-        ['prod-demo-papas', 'cat-demo-starters', 'Papas Fritas', 250, 2],
-        ['prod-demo-hamburguesa-clasica', 'cat-demo-burger', 'Hamburguesa Clásica', 800, 1],
-        ['prod-demo-doble', 'cat-demo-burger', 'Hamburguesa Doble', 1100, 2],
-        ['prod-demo-bbq', 'cat-demo-burger', 'Hamburguesa BBQ', 1200, 3],
-        ['prod-demo-gaseosa', 'cat-demo-beverages', 'Gaseosa Cola', 350, 1],
-        ['prod-demo-agua', 'cat-demo-beverages', 'Agua Mineral', 200, 2],
-        ['prod-demo-flan', 'cat-demo-desserts', 'Flan Casero', 400, 1],
-      ] as const
-    : lang === 'fr'
-    ? [
-        ['prod-demo-quiche', 'cat-demo-starters', 'Quiche Lorraine', 280, 1],
-        ['prod-demo-frites', 'cat-demo-starters', 'Frites Maison', 250, 2],
-        ['prod-demo-burger', 'cat-demo-burger', 'Burger Classique', 800, 1],
-        ['prod-demo-burger-double', 'cat-demo-burger', 'Burger Double', 1100, 2],
-        ['prod-demo-burger-bbq', 'cat-demo-burger', 'Burger BBQ', 1200, 3],
-        ['prod-demo-citronnade', 'cat-demo-beverages', 'Citronnade', 350, 1],
-        ['prod-demo-eau', 'cat-demo-beverages', 'Eau Minérale', 200, 2],
-        ['prod-demo-mousse', 'cat-demo-desserts', 'Mousse au Chocolat', 400, 1],
-      ] as const
-    : lang === 'pt'
-    ? [
-        ['prod-demo-coxinha', 'cat-demo-starters', 'Coxinha de Frango', 280, 1],
-        ['prod-demo-pastel', 'cat-demo-starters', 'Pastel de Queijo', 250, 2],
-        ['prod-demo-x-burger', 'cat-demo-burger', 'X-Burger', 800, 1],
-        ['prod-demo-x-dobro', 'cat-demo-burger', 'X-Dobro', 1100, 2],
-        ['prod-demo-x-bacon', 'cat-demo-burger', 'X-Bacon', 1200, 3],
-        ['prod-demo-refri', 'cat-demo-beverages', 'Refrigerante Cola', 350, 1],
-        ['prod-demo-agua', 'cat-demo-beverages', 'Água Mineral', 200, 2],
-        ['prod-demo-pudim', 'cat-demo-desserts', 'Pudim de Leite', 400, 1],
-      ] as const
-    : lang === 'de'
-    ? [
-        ['prod-demo-currywurst', 'cat-demo-starters', 'Currywurst', 280, 1],
-        ['prod-demo-kartoffelecken', 'cat-demo-starters', 'Kartoffelecken', 250, 2],
-        ['prod-demo-schnitzel', 'cat-demo-burger', 'Schnitzel', 800, 1],
-        ['prod-demo-bratwurst', 'cat-demo-burger', 'Bratwurst', 1100, 2],
-        ['prod-demo-burger', 'cat-demo-burger', 'Klassischer Burger', 1200, 3],
-        ['prod-demo-apfelschorle', 'cat-demo-beverages', 'Apfelschorle', 350, 1],
-        ['prod-demo-mineralwasser', 'cat-demo-beverages', 'Mineralwasser', 200, 2],
-        ['prod-demo-apfelstrudel', 'cat-demo-desserts', 'Apfelstrudel', 400, 1],
-      ] as const
-    : lang === 'tr'
-    ? [
-        ['prod-demo-patates', 'cat-demo-starters', 'Patates Kızartması', 280, 1],
-        ['prod-demo-sigara-boregi', 'cat-demo-starters', 'Sigara Böreği', 250, 2],
-        ['prod-demo-kofte', 'cat-demo-main', 'Izgara Köfte', 800, 1],
-        ['prod-demo-doner', 'cat-demo-main', 'Döner', 1100, 2],
-        ['prod-demo-burger', 'cat-demo-main', 'Klasik Burger', 1200, 3],
-        ['prod-demo-kola', 'cat-demo-beverages', 'Kola', 350, 1],
-        ['prod-demo-su', 'cat-demo-beverages', 'Maden Suyu', 200, 2],
-        ['prod-demo-baklava', 'cat-demo-desserts', 'Baklava', 400, 1],
-      ] as const
-    : lang === 'fa'
-    ? [
-        ['prod-demo-kashk', 'cat-demo-starters', 'کشک بادمجان', 280, 1],
-        ['prod-demo-sibzamini', 'cat-demo-starters', 'سیب‌زمینی سرخ‌کرده', 250, 2],
-        ['prod-demo-ghormeh', 'cat-demo-main', 'قرمه‌سبزی', 800, 1],
-        ['prod-demo-zereshk', 'cat-demo-main', 'زرشک‌پلو با مرغ', 1100, 2],
-        ['prod-demo-kebab', 'cat-demo-main', 'کباب کوبیده', 1200, 3],
-        ['prod-demo-doogh', 'cat-demo-beverages', 'دوغ', 350, 1],
-        ['prod-demo-water', 'cat-demo-beverages', 'آب معدنی', 200, 2],
-        ['prod-demo-sholeh', 'cat-demo-desserts', 'شله‌زرد', 400, 1],
-      ] as const
-    : [
-        ['prod-demo-paneer-tikka', 'cat-demo-starters', 'Paneer Tikka', 250, 1],
-        ['prod-demo-chicken-wings', 'cat-demo-starters', 'Chicken Wings', 280, 2],
-        ['prod-demo-butter-chicken', 'cat-demo-main', 'Butter Chicken', 320, 1],
-        ['prod-demo-dal-makhani', 'cat-demo-main', 'Dal Makhani', 220, 2],
-        ['prod-demo-jeera-rice', 'cat-demo-main', 'Jeera Rice', 150, 3],
-        ['prod-demo-cola', 'cat-demo-beverages', 'Cola', 60, 1],
-        ['prod-demo-lemon-soda', 'cat-demo-beverages', 'Lemon Soda', 70, 2],
-        ['prod-demo-gulab-jamun', 'cat-demo-desserts', 'Gulab Jamun', 80, 1],
-      ] as const;
-  for (const [id, categoryId, name, price, sort] of products) insertProduct(db, id, categoryId, name, price, sort);
-
-  if (serviceModel === 'finedine') {
-    const tableLabel = lang === 'es' ? 'M' : lang === 'pt' ? 'M' : 'T';
-    insertTable(db, 'tbl-demo-1', `${tableLabel}1`, 4);
-    insertTable(db, 'tbl-demo-2', `${tableLabel}2`, 4);
-    insertTable(db, 'tbl-demo-3', `${tableLabel}3`, 6);
-    insertTable(db, 'tbl-demo-4', `${tableLabel}4`, 2);
-  }
-
-  // Default to setup country (IN) if unspecified; country is independent of UI language.
-  const demoCountry = country || 'IN';
-  const dialCode = dialCodeFor(demoCountry);
-  if (lang === 'es') {
-    insertCustomer(db, 'cust-demo-1', 'Juan Pérez', '1145678901', dialCode, demoCountry);
-    insertCustomer(db, 'cust-demo-2', 'María González', '1145678902', dialCode, demoCountry);
-    insertCustomer(db, 'cust-demo-3', 'Carlos Rodríguez', '1145678903', dialCode, demoCountry);
-  } else if (lang === 'fr') {
-    insertCustomer(db, 'cust-demo-1', 'Camille Martin', '+33145678901', dialCode, demoCountry);
-    insertCustomer(db, 'cust-demo-2', 'Julien Bernard', '+33145678902', dialCode, demoCountry);
-    insertCustomer(db, 'cust-demo-3', 'Sophie Dubois', '+33145678903', dialCode, demoCountry);
-  } else if (lang === 'pt') {
-    insertCustomer(db, 'cust-demo-1', 'João Silva', '1198765432', dialCode, demoCountry);
-    insertCustomer(db, 'cust-demo-2', 'Maria Santos', '1198765433', dialCode, demoCountry);
-    insertCustomer(db, 'cust-demo-3', 'Carlos Oliveira', '1198765434', dialCode, demoCountry);
-  } else if (lang === 'de') {
-    insertCustomer(db, 'cust-demo-1', 'Anna Müller', '15123456789', dialCode, demoCountry);
-    insertCustomer(db, 'cust-demo-2', 'Lukas Schneider', '15123456790', dialCode, demoCountry);
-    insertCustomer(db, 'cust-demo-3', 'Sophie Weber', '15123456791', dialCode, demoCountry);
-  } else if (lang === 'tr') {
-    insertCustomer(db, 'cust-demo-1', 'Ayşe Yılmaz', '5321234567', dialCode, demoCountry);
-    insertCustomer(db, 'cust-demo-2', 'Mehmet Kaya', '5321234568', dialCode, demoCountry);
-    insertCustomer(db, 'cust-demo-3', 'Elif Demir', '5321234569', dialCode, demoCountry);
-  } else if (lang === 'fa') {
-    insertCustomer(db, 'cust-demo-1', 'علی رضایی', '9121234567', dialCode, demoCountry);
-    insertCustomer(db, 'cust-demo-2', 'سارا محمدی', '9121234568', dialCode, demoCountry);
-    insertCustomer(db, 'cust-demo-3', 'مریم کریمی', '9121234569', dialCode, demoCountry);
-  } else {
-    insertCustomer(db, 'cust-demo-1', 'Aarav Sharma', '9876543210', dialCode, demoCountry);
-    insertCustomer(db, 'cust-demo-2', 'Maya Iyer', '9876543211', dialCode, demoCountry);
-    insertCustomer(db, 'cust-demo-3', 'Kabir Khan', '9876543212', dialCode, demoCountry);
-  }
-
-  const managerName = lang === 'es' ? 'Gerente Demo' : lang === 'fr' ? 'Gérant Démo' : lang === 'pt' ? 'Gerente Demo'
-    : lang === 'de' ? 'Demo-Manager' : lang === 'tr' ? 'Demo Müdürü' : lang === 'fa' ? 'مدیر نمایشی' : 'Demo Manager';
-  const cashierName = lang === 'es' ? 'Cajero Demo' : lang === 'fr' ? 'Caissier Démo' : lang === 'pt' ? 'Caixa Demo'
-    : lang === 'de' ? 'Demo-Kassierer' : lang === 'tr' ? 'Demo Kasiyer' : lang === 'fa' ? 'صندوقدار نمایشی' : 'Demo Cashier';
-  const chefName = lang === 'es' ? 'Cocinero Demo' : lang === 'fr' ? 'Chef Démo' : lang === 'pt' ? 'Cozinheiro Demo'
-    : lang === 'de' ? 'Demo-Koch' : lang === 'tr' ? 'Demo Aşçı' : lang === 'fa' ? 'آشپز نمایشی' : 'Demo Chef';
-  // Demo staff accounts are inactive with random passwords to prevent usable default credentials.
-  insertStaffUser(db, 'user-demo-manager', managerName, 'manager@flo.local', 'manager', randomBytes(32).toString('hex'), 0);
-  insertStaffUser(db, 'user-demo-cashier', cashierName, 'cashier@flo.local', 'cashier', randomBytes(32).toString('hex'), 0);
-  insertStaffUser(db, 'user-demo-chef', chefName, 'chef@flo.local', 'chef', randomBytes(32).toString('hex'), 0);
-}
-
-export function seedSetupProfile(db: ReturnType<typeof getDatabase>, profile: string, serviceModel: string, language?: string, country?: string): void {
-  if (profile === 'express') {
-    seedExpressRestaurant(db, serviceModel, language);
-  } else if (profile === 'demo') {
-    seedDemoRestaurant(db, serviceModel, language, country);
   }
 }
 
@@ -538,7 +262,7 @@ router.post('/login', authRateLimit(), asyncHandler(async (req: Request, res: Re
       { expiresIn: expiresInFor(remember) }
     );
 
-    const tenant = buildLocalTenant(db, user.role);
+    const tenant = buildLocalTenant(db, user.id, user.role);
 
     res.json({
       access_token: token,
@@ -584,7 +308,7 @@ router.post('/tenants/select', (req: Request, res: Response) => {
       return res.status(401).json({ error: 'Invalid token' });
     }
 
-    const tenant = buildLocalTenant(db, user.role);
+    const tenant = buildLocalTenant(db, user.id, user.role);
 
     // Re-issue token with tenant context embedded (same payload — desktop is single-tenant)
     const remember = !!decoded.remember;
@@ -683,7 +407,7 @@ router.get('/me', (req: Request, res: Response) => {
       return res.status(401).json({ error: 'Invalid token' });
     }
 
-    const tenant = buildLocalTenant(db, user.role);
+    const tenant = buildLocalTenant(db, user.id, user.role);
 
     res.json({
       user: { id: user.id, name: user.name, email: user.email, role: user.role },
@@ -788,20 +512,25 @@ router.post('/recover-password', authRateLimit(), (req: Request, res: Response) 
       return res.status(pinResult.status).json({ error: pinResult.error });
     }
 
-    const activeOwnerCount = (db.prepare("SELECT COUNT(*) AS count FROM users WHERE role = 'owner' AND is_active = 1").get() as { count: number }).count;
-    const user = activeOwnerCount === 0
+    // Owners alone can hold the protected permissions, so a store whose active
+    // owners are all denied the configurable administrative capabilities strands.
+    const stranded = !hasActiveAdministrator();
+    const user = stranded
       ? db.prepare('SELECT * FROM users WHERE email = ? AND is_active = 1').get(email) as any
       : db.prepare('SELECT * FROM users WHERE email = ? AND role = ? AND is_active = 1').get(email, INITIAL_ADMIN_ROLE) as any;
     if (!user) {
-      return res.status(404).json({ error: 'No active owner account found with that email on this install' });
+      return res.status(404).json({ error: stranded
+        ? 'No active account found with that email on this install'
+        : 'No active owner account found with that email on this install' });
     }
 
     const hashedPassword = bcrypt.hashSync(new_password, 10);
     const changedAt = now();
     let restoredOwnerAccess = false;
     const updated = db.transaction(() => {
-      const currentOwnerCount = (db.prepare("SELECT COUNT(*) AS count FROM users WHERE role = 'owner' AND is_active = 1").get() as { count: number }).count;
-      if (currentOwnerCount > 0) {
+      // Re-checked in the transaction, so a concurrent write cannot turn a
+      // plain reset into a promotion.
+      if (hasActiveAdministrator()) {
         return db.prepare('UPDATE users SET password = ?, tokens_valid_after = ?, updated_at = ? WHERE id = ? AND role = ? AND is_active = 1')
           .run(hashedPassword, changedAt, changedAt, user.id, INITIAL_ADMIN_ROLE);
       }
@@ -810,7 +539,6 @@ router.post('/recover-password', authRateLimit(), (req: Request, res: Response) 
       return db.prepare(`
         UPDATE users SET password = ?, role = ?, tokens_valid_after = ?, updated_at = ?
         WHERE id = ? AND is_active = 1
-          AND NOT EXISTS (SELECT 1 FROM users WHERE role = 'owner' AND is_active = 1)
       `).run(hashedPassword, INITIAL_ADMIN_ROLE, changedAt, changedAt, user.id);
     })();
     if (updated.changes === 0) {
@@ -847,12 +575,14 @@ router.get('/setup/status', (_req: Request, res: Response) => {
     const db = getDatabase();
     const userCount = getUserCount(db);
     const needsSetup = userCount === 0;
+    const currencyReset = needsSetup ? getPendingCurrencyReset(db) : null;
     res.json({
       needsSetup,
       userCount,
       initialRole: INITIAL_ADMIN_ROLE,
       schemaVersion: getCurrentSchemaVersion(),
       masterPinAvailable: isMasterPinAvailable(),
+      currencyReset,
     });
   } catch (error: any) {
     console.error("[API] Internal error:", error);
@@ -872,6 +602,7 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
     if (getUserCount(db) > 0) {
       return res.status(403).json({ error: 'Setup already complete. This endpoint is disabled.' });
     }
+    const pendingCurrencyReset = getPendingCurrencyReset(db);
 
     const {
       name,
@@ -882,10 +613,10 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
       language,
       business_name,
       store_name,
-      country = 'IN',
-      currency = 'INR',
+      country,
+      currency,
       currency_symbol,
-      timezone = 'Asia/Kolkata',
+      timezone,
       business_address,
       address,
       business_phone,
@@ -896,20 +627,34 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
       billing_type,
       terms_accepted,
       master_pin,
+      owner_approval_pin,
+      owner_approval_pin_confirmation,
       cloud_server_url,
       email_product_updates,
       email_marketing,
     } = req.body;
     const email = normalizeEmail(req.body.email);
+    // Regional settings come from signup, never from a fallback — see
+    // docs/reference/product-invariants.md. There is no default country.
+    const resolvedCountry = typeof country === 'string' ? getCountryByCode(country) : undefined;
+    if (!resolvedCountry) {
+      return res.status(400).json({ error: 'A valid country is required' });
+    }
     const displayName = String(name || '').trim();
     const normalizedBusinessType = String(business_type || 'restaurant').trim();
     const normalizedSetupProfile = String(setup_profile || 'express').trim().toLowerCase();
     const normalizedServiceModel = String(service_model || 'qsr').trim().toLowerCase();
-    const normalizedCurrency = typeof currency === 'string' ? currency.trim().toUpperCase() : currency;
-    if (!isSyntacticallyValidCurrencyCode(normalizedCurrency)) {
+    // Omitted currency derives from the country profile; an explicitly-invalid
+    // one is rejected rather than silently replaced (resolveTenantCurrency's
+    // read-time leniency is the wrong tool for validating a write).
+    const normalizedCurrency = currency === undefined
+      ? resolvedCountry.currency
+      : typeof currency === 'string' ? currency.trim().toUpperCase() : currency;
+    if (!isSupportedCurrencyCode(normalizedCurrency)) {
       return res.status(400).json({ error: 'Invalid currency' });
     }
-    if (!isValidTimeZone(timezone)) {
+    const resolvedTimezone = timezone === undefined ? resolvedCountry.timezone : timezone;
+    if (!isValidTimeZone(resolvedTimezone)) {
       return res.status(400).json({ error: 'Invalid timezone' });
     }
     const storeName = String(store_name || business_name || '').trim();
@@ -918,7 +663,7 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
     const rawOutletPhone = String(business_phone || phone || '').trim();
     let outletPhone = '';
     if (rawOutletPhone) {
-      const normPhone = normalizeOptionalPhone(rawOutletPhone, country);
+      const normPhone = normalizeOptionalPhone(rawOutletPhone, resolvedCountry.code);
       if (!normPhone.valid) {
         return res.status(400).json({ error: normPhone.error || 'Invalid business phone number' });
       }
@@ -942,6 +687,14 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
     const masterPinRequired = isMasterPinAvailable();
     if (masterPinRequired && !/^\d{4}$/.test(String(master_pin || ''))) {
       return res.status(400).json({ error: 'A 4-digit Master PIN is required to complete setup' });
+    }
+
+    const ownerApprovalPin = String(owner_approval_pin || '');
+    if (!/^\d{4,6}$/.test(ownerApprovalPin)) {
+      return res.status(400).json({ error: 'A 4-6 digit owner Approval PIN is required to complete setup' });
+    }
+    if (ownerApprovalPin !== String(owner_approval_pin_confirmation || '')) {
+      return res.status(400).json({ error: 'Owner Approval PINs do not match' });
     }
 
     if (!VALID_BUSINESS_TYPES.has(normalizedBusinessType)) {
@@ -969,6 +722,7 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
 
     let userId = '';
     const hashedPassword = bcrypt.hashSync(password, 10);
+    const hashedApprovalPin = bcrypt.hashSync(ownerApprovalPin, 10);
 
     // Save Master PIN before committing user transaction so keyring errors leave setup retryable.
     if (masterPinRequired) {
@@ -988,17 +742,17 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
 
       userId = randomUUID();
       db.prepare(`
-        INSERT INTO users (id, name, email, password, role, is_active, terms_accepted_at, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(userId, displayName, email, hashedPassword, INITIAL_ADMIN_ROLE, 1, now(), now(), now());
+        INSERT INTO users (id, name, email, password, role, pin_hash, is_active, terms_accepted_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(userId, displayName, email, hashedPassword, INITIAL_ADMIN_ROLE, hashedApprovalPin, 1, now(), now(), now());
 
       upsertSettings(db, {
         business_name: resolvedStoreName,
         business_type: normalizedBusinessType,
-        country,
+        country: resolvedCountry.code,
         currency: normalizedCurrency,
-        currency_symbol: currency_symbol || getCurrencySymbol(normalizedCurrency, getCountryByCode(country)?.locale),
-        timezone,
+        currency_symbol: currency_symbol || getCurrencySymbol(normalizedCurrency, resolvedCountry.locale),
+        timezone: resolvedTimezone,
         language,
         business_address: outletAddress,
         business_phone: outletPhone,
@@ -1011,10 +765,10 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
         billing_type: billing_type || (normalizedServiceModel === 'qsr' ? 'prepaid' : 'postpaid'),
         tables_required: normalizedServiceModel === 'finedine' ? 'true' : 'false',
         service_model: normalizedServiceModel,
-        setup_profile: normalizedSetupProfile,
+        setup_profile: pendingCurrencyReset ? 'empty' : normalizedSetupProfile,
         onboarding_completed: 'true',
         // Confirm country if user explicitly selected it or differed from default.
-        ...countryConfirmationPatch(country, getSettingValue('country'), req.body.country_selected),
+        ...countryConfirmationPatch(resolvedCountry.code, getSettingValue('country'), req.body.country_selected),
         anonymous_data_consent: 'true',
         telemetry_enabled: 'true',
         telemetry_scope: 'usage_stats,country,app_version,platform,session_duration,feature_usage,error_diagnostics',
@@ -1028,7 +782,12 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
         cloud_services_disabled_by_user: 'false',
       });
 
-      seedSetupProfile(db, normalizedSetupProfile, normalizedServiceModel, language, country);
+      if (!pendingCurrencyReset) {
+        seedSetupProfile(db, normalizedSetupProfile, normalizedServiceModel, language, resolvedCountry.code);
+      }
+      if (pendingCurrencyReset) {
+        db.prepare("DELETE FROM _flo_meta WHERE key = 'currency_reset_pending'").run();
+      }
     })();
 
     // Reload cloud sync and registration profile immediately after setup.
@@ -1049,7 +808,7 @@ router.post('/setup/initialize', (req: Request, res: Response) => {
       { expiresIn: JWT_EXPIRES_IN }
     );
 
-    const tenant = buildLocalTenant(db, INITIAL_ADMIN_ROLE);
+    const tenant = buildLocalTenant(db, userId, INITIAL_ADMIN_ROLE);
 
     res.json({
       access_token: token,

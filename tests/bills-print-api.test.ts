@@ -66,6 +66,9 @@ try {
 }
 
 const db = getDatabase();
+// Regional settings come from signup, never a fallback; seed one
+// explicitly so resolveRegionalSnapshot() resolves.
+db.exec("INSERT OR IGNORE INTO settings (key, value) VALUES ('country', 'IN')");
 
 // Create prerequisite rows for foreign keys
 db.exec("INSERT OR IGNORE INTO users (id, name, password, role) VALUES ('user-1', 'Test User', 'hash', 'cashier')");

@@ -9,6 +9,8 @@ import { useFormatCurrency } from '@/hooks/useFormatCurrency';
 import { useCurrencyUnitAdapter } from '@/hooks/useCurrencyUnitAdapter';
 import { getCurrencyMinorUnitFactor } from '@/lib/countries';
 import { printerService } from '@/lib/printer/PrinterService';
+import { displayAmountToCents } from '@/lib/money';
+import { businessDateForInstant } from '@shared/business-date';
 /** Live day aggregates returned by GET /api/reports/x-report. Display totals
  *  are in tenant major units (minorFactor-divided); expectedCashCents is the
  *  integer-cents drawer expected figure. Do not rename fields — the backend
@@ -25,8 +27,14 @@ interface XReport {
   paymentMethods: { method: string | null; count: number; total: number }[];
   staffSales: { user_id: string; name: string; role: string; revenue: number; orderCount: number }[];
   taxComponents: unknown[];
-  /** Drawer expected figure in INTEGER cents (no opening float — the float
-   *  is captured at close). Cash-only raw filter, refunds by created_at. */
+  openingFloatCents: number | null;
+  payInCents: number;
+  payOutCents: number;
+  safeDropCents: number;
+  cashMovements: { id: number; movement_type: string; amount_cents: number; reason: string | null }[];
+  /** Drawer expected figure in INTEGER cents (no opening float — the float is
+   *  reported separately). Includes active movements, cash-only raw filter,
+   *  and refunds by created_at. */
   expectedCashCents: number;
   /** F3: server-resolved prior close (most recent scope='day' row with
    *  business_date < this.businessDate). Both fields are null when no
@@ -59,6 +67,10 @@ interface ZReport {
   payment_methods: { method: string; count: number; total_cents: number }[];
   staff_sales: { user_id: string; name: string; role: string; revenue_cents: number; orderCount: number }[];
   tax_components: unknown[];
+  pay_in_cents: number;
+  pay_out_cents: number;
+  safe_drop_cents: number;
+  cash_movements: { id: number; movement_type: string; amount_cents: number; reason: string | null }[];
   z_number: number;
   closed_by: string;
   closed_by_name: string;
@@ -77,24 +89,7 @@ export function useCashClose() {
   const fmt = useFormatCurrency();
   const timeZone = currentTenant?.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone;
   const dayStartTime = currentTenant?.business_day_start_time || '00:00';
-  const startMatch = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(dayStartTime.trim());
-  const nowInstant = new Date();
-  const localParts = new Intl.DateTimeFormat('en-US', {
-    timeZone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    hourCycle: 'h23',
-  }).formatToParts(nowInstant);
-  const localPart = (type: string) => localParts.find((part) => part.type === type)?.value ?? '';
-  const localDate = `${localPart('year')}-${localPart('month')}-${localPart('day')}`;
-  const localMinutes = Number(localPart('hour')) * 60 + Number(localPart('minute'));
-  const startMinutes = startMatch ? Number(startMatch[1]) * 60 + Number(startMatch[2]) : 0;
-  const todayLocal = startMatch && localMinutes < startMinutes
-    ? new Date(Date.UTC(Number(localPart('year')), Number(localPart('month')) - 1, Number(localPart('day')) - 1)).toISOString().slice(0, 10)
-    : localDate;
+  const todayLocal = businessDateForInstant({ instant: new Date(), timezone: timeZone, startTime: dayStartTime });
   // ── Close-day modal state ────────────────────────────────────────────────
   // Modal flow: open → load X (live aggregates) + prior-day Z (default float)
   // → operator edits float + counted → POST /cash-closures → immutable Z view
@@ -148,10 +143,10 @@ export function useCashClose() {
   // Storage minor-unit factor (`Math.pow(10, fractionDigits)`) is the cents
   // denominator; the adapter's `maxDecimals` would be wrong for IRR/Toman
   // (where display has 3 decimals but storage is still Rial-cents, factor 100).
-  const minorFactor = getCurrencyMinorUnitFactor(currentTenant?.currency || 'INR');
+  const minorFactor = getCurrencyMinorUnitFactor(currentTenant?.currency || '');
 
   // Prior business date = day before the modal's date. ISO date arithmetic on
-  // the YYYY-MM-DD string is timezone-safe — no need for `localDateInTimezone`
+  // the YYYY-MM-DD string is timezone-safe — no need for `businessDateForInstant`
   // in the renderer.
   const shiftDate = (yyyymmdd: string, deltaDays: number): string => {
     const d = new Date(`${yyyymmdd}T00:00:00Z`);
@@ -189,7 +184,10 @@ export function useCashClose() {
         // signal — transport errors set xError, leaving priorBusinessDate
         // null WITHOUT triggering the noPriorCloseHint (F7 discipline).
         if (!xError && xr) {
-          if (xr.priorClosedCashCents !== null && xr.priorBusinessDate) {
+          if (xr.openingFloatCents !== null) {
+            setOpeningFloatInput(unitAdapter.toDisplay(xr.openingFloatCents / minorFactor).toString());
+            setAlreadyClosedOverride(false);
+          } else if (xr.priorClosedCashCents !== null && xr.priorBusinessDate) {
             // F2: convert to display units via the adapter (Toman/Rial etc.)
             setOpeningFloatInput(unitAdapter.toDisplay(xr.priorClosedCashCents / minorFactor).toString());
             setAlreadyClosedOverride(false);
@@ -315,21 +313,11 @@ export function useCashClose() {
     setOpenToken((n) => n + 1);
   };
 
-  // Convert a display-amount input string to integer cents. The adapter's
-  // `toStored` returns the value in MAJOR units (Rial for IRR/Toman — the
-  // adapter folds the Toman-to-Rial ratio itself), so multiplying by the
-  // storage minor factor gives integer cents. Empty/invalid/negative →
-  // null: the operator can type `-5` and the input would render `-5`
-  // while submit sent 0, leaving a misleading variance preview and a
-  // 400 on a row that is about to become immutable. The X already
-  // exposes `expectedCashCents` in cents and the submit gate now reads
-  // `amountsValid`, so we can return null and let the caller decide.
-  const displayToCents = (raw: string): number | null => {
-    if (raw.trim() === '') return null;
-    const n = Number(raw);
-    if (!Number.isFinite(n) || n < 0) return null;
-    return Math.round(unitAdapter.toStored(n) * minorFactor);
-  };
+  // Shared display→cents semantics with shift close (lib/money.ts): the
+  // adapter's `toStored` returns MAJOR units, so multiply by the storage
+  // minor factor. Empty/invalid/negative → null (see that file).
+  const displayToCents = (raw: string): number | null =>
+    displayAmountToCents(raw, unitAdapter, minorFactor);
 
   const openingFloatCentsOrNull = displayToCents(openingFloatInput);
   const countedCashCentsOrNull = displayToCents(countedInput);

@@ -111,6 +111,9 @@ let managerUserId: string;
 
 function seedTestData() {
   const db = getDatabase();
+  // Regional settings come from signup, never a fallback; seed one
+  // explicitly so resolveRegionalSnapshot() resolves.
+  db.prepare(`INSERT INTO settings (key, value, updated_at) VALUES ('country', 'IN', ?) ON CONFLICT(key) DO UPDATE SET value='IN', updated_at=excluded.updated_at`).run(now());
 
   // Create a manager user with a hashed PIN
   managerUserId = 'mgr-test-001';

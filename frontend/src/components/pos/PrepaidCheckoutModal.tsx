@@ -77,7 +77,7 @@ interface Payment {
 
 type AmountTarget = { kind: 'payment'; index: number } | { kind: 'wallet' } | { kind: 'discount' } | null;
 
-export default function PrepaidCheckoutModal({ currency: _currency, onClose, onConfirm }: Props) {
+export default function PrepaidCheckoutModal({ onClose, onConfirm }: Props) {
   const cart = useCartStore();
   const customer = cart.customer;
   const t = useTranslations('pos');

@@ -286,7 +286,11 @@ function cancelInFlightWhatsAppWork(): void {
 async function waitForWhatsAppWork(): Promise<void> {
   const drain = (async () => {
     while (inFlightWhatsAppWork.size > 0) {
-      await Promise.allSettled([...inFlightWhatsAppWork]);
+      // Keys, not entries: the key is the in-flight operation. Spreading the Map
+      // yields [operation, cancel] entry arrays, which allSettled treats as
+      // non-thenable, so the loop would spin on microtasks and starve the timer
+      // that bounds this drain.
+      await Promise.allSettled([...inFlightWhatsAppWork.keys()]);
     }
   })();
   void drain.catch(() => {});
@@ -841,6 +845,12 @@ function queueCredentialWrite(socket: BaileysSocket, saveCreds: (...values: unkn
 }
 
 function startSocket(requestSignal?: AbortSignal): Promise<void> {
+  // Test processes never need a live WhatsApp session. Dialing out only adds
+  // third-party latency and a reconnect loop to an otherwise deterministic run.
+  if (process.env.FLO_WHATSAPP_SOCKET_DISABLED === '1') {
+    logWhatsApp('info', 'socket_start_skipped', { reason: 'externally_disabled' });
+    return Promise.resolve();
+  }
   const previousStart = whatsappStartPromise;
   if (previousStart && !whatsappStartController?.signal.aborted) {
     logWhatsApp('info', 'socket_start_deduplicated', { attemptId: whatsappStartAttempt });

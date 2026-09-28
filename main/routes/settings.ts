@@ -2,13 +2,16 @@ import { Router, Request, Response } from 'express';
 import expressRateLimit from 'express-rate-limit';
 import { getDatabase, now } from '../db';
 import { cloudSync, DEFAULT_CLOUD_SERVER_URL, normalizeCloudServerUrl } from '../services/cloud-sync';
-import { googleDrive } from '../services/google-drive';
-import { requireRole } from '../middleware/security';
-import { ROLE_ACCESS } from '../../shared/role-permissions';
+import { DRIVE_RESTORE_CONFIRMATION, getGoogleDriveErrorCode, googleDrive } from '../services/google-drive';
+import { requirePermission } from '../services/authorization';
 import { requireMasterPin } from '../middleware/master-pin';
 import { resolveTaxIdFormat, validateTaxRegistrationNumber } from '../services/tax';
 import { sendEvent } from '../services/telemetry';
-import { getCountryByCode, getCurrencySymbol, isValidTimeZone, type CountryLocaleOptions } from '../countries';
+import {
+  getCountryByCode, getCurrencySymbol, isValidTimeZone,
+  isLocalePreferenceKey, isLocalePreferenceSupported, resolveStoredLocalePreference,
+  type LocalePreferenceKey,
+} from '../countries';
 import { countryConfirmationPatch } from '../services/country-provenance';
 import {
   isValidCurrencyCode,
@@ -39,7 +42,15 @@ import {
 import { isThemeMode } from '../title-bar-theme';
 
 const router = Router();
-const settingsReadRateLimit = expressRateLimit({ windowMs: 60 * 1000, limit: 120, standardHeaders: true, legacyHeaders: false });
+const configuredSettingsReadLimit = Number.parseInt(process.env.FLO_SETTINGS_READ_RATE_LIMIT_MAX || '', 10);
+const settingsReadRateLimit = expressRateLimit({
+  windowMs: 60 * 1000,
+  limit: Number.isFinite(configuredSettingsReadLimit) && configuredSettingsReadLimit > 0
+    ? configuredSettingsReadLimit
+    : 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 const configuredSettingsWriteLimit = Number.parseInt(process.env.FLO_SETTINGS_WRITE_RATE_LIMIT_MAX || '', 10);
 const settingsWriteRateLimit = expressRateLimit({
   windowMs: 60 * 1000,
@@ -86,6 +97,10 @@ const SENSITIVE_SETTING_KEYS = new Set([
   'cloud_last_error',
 ]);
 
+function isGoogleDriveSettingKey(key: string): boolean {
+  return key.startsWith('google_drive_');
+}
+
 const OPTIONAL_SETTING_DEFAULTS: Record<string, string> = {
   bill_template: 'classic',
   bill_footer_message: '',
@@ -112,6 +127,7 @@ function maskSetting(key: string, value: string): string {
 function publicSettingsShape(settings: Record<string, string>): Record<string, string> {
   const publicSettings: Record<string, string> = {};
   for (const [key, value] of Object.entries(settings)) {
+    if (isGoogleDriveSettingKey(key)) continue;
     publicSettings[key] = maskSetting(key, value);
   }
   return publicSettings;
@@ -125,36 +141,6 @@ function boolFlag(value: unknown): string | undefined {
   return value ? 'true' : 'false';
 }
 
-// Neutral fallback preferences for locales without specific options.
-const NEUTRAL_LOCALE_PREFERENCES = {
-  currency_display: 'rial',
-  number_digits: 'locale',
-  calendar: 'locale',
-} as const;
-
-type LocalePreferenceKey = keyof typeof NEUTRAL_LOCALE_PREFERENCES;
-
-const LOCALE_OPTION_FIELDS: Record<LocalePreferenceKey, keyof CountryLocaleOptions> = {
-  currency_display: 'currencyDisplay',
-  number_digits: 'digits',
-  calendar: 'calendar',
-};
-
-function isLocalePreferenceKey(key: string): key is LocalePreferenceKey {
-  return key === 'currency_display' || key === 'number_digits' || key === 'calendar';
-}
-
-function isLocalePreferenceSupported(key: LocalePreferenceKey, value: string, countryCode: string): boolean {
-  if (value === NEUTRAL_LOCALE_PREFERENCES[key]) return true;
-  const options = getCountryByCode(countryCode)?.localeOptions?.[LOCALE_OPTION_FIELDS[key]];
-  return Array.isArray(options) && (options as readonly string[]).includes(value);
-}
-
-function resolveStoredLocalePreference(key: LocalePreferenceKey, stored: string | undefined, countryCode: string): string {
-  if (stored && isLocalePreferenceSupported(key, stored, countryCode)) return stored;
-  return NEUTRAL_LOCALE_PREFERENCES[key];
-}
-
 // Flags stored as strict '1'/'0' to match cloud database conventions.
 function bool01Flag(value: unknown): string | undefined {
   const flag = boolFlag(value);
@@ -162,7 +148,7 @@ function bool01Flag(value: unknown): string | undefined {
 }
 
 function deriveCurrencySymbol(currency: string, country: string): string {
-  return getCurrencySymbol(currency || 'INR', getCountryByCode(country || 'IN')?.locale) || currency || 'INR';
+  return getCurrencySymbol(currency || '', getCountryByCode(country)?.locale) || currency || '';
 }
 
 function isMaskedSecret(value: unknown): boolean {
@@ -172,10 +158,13 @@ function isMaskedSecret(value: unknown): boolean {
 function businessShape(s: Record<string, string>) {
   return {
     business_name: s.business_name || '',
-    timezone: s.timezone || 'Asia/Kolkata',
+    // Regional fields degrade to empty rather than throw — Settings must
+    // never fail to load for an authenticated user (should be unreachable
+    // post-setup; see docs/reference/product-invariants.md).
+    timezone: s.timezone || '',
     business_day_start_time: s.business_day_start_time || '00:00',
-    currency: s.currency || 'INR',
-    country: s.country || 'IN',
+    currency: s.currency || '',
+    country: s.country || '',
     language: s.language || 'en',
     tax_registration_number: s.tax_registration_number || '',
     state_code: s.state_code || '',
@@ -192,12 +181,13 @@ function businessShape(s: Record<string, string>) {
     bill_show_tax_breakdown: s.bill_show_tax_breakdown !== 'false',
     bill_show_customer_name: s.bill_show_customer_name !== 'false',
     bill_show_customer_phone: s.bill_show_customer_phone !== 'false',
+    bill_delivery_show_customer_phone_always: s.bill_delivery_show_customer_phone_always !== 'false',
     bill_show_table_number: s.bill_show_table_number !== 'false',
-    currency_display: resolveStoredLocalePreference('currency_display', s.currency_display, s.country || 'IN'),
-    number_digits: resolveStoredLocalePreference('number_digits', s.number_digits, s.country || 'IN'),
-    calendar: resolveStoredLocalePreference('calendar', s.calendar, s.country || 'IN'),
+    currency_display: resolveStoredLocalePreference('currency_display', s.currency_display, s.country || ''),
+    number_digits: resolveStoredLocalePreference('number_digits', s.number_digits, s.country || ''),
+    calendar: resolveStoredLocalePreference('calendar', s.calendar, s.country || ''),
     // Non-blocking informational tax format description for the UI.
-    tax_id_format: resolveTaxIdFormat(s.country || 'IN'),
+    tax_id_format: resolveTaxIdFormat(s.country || ''),
   };
 }
 
@@ -207,14 +197,14 @@ function taxShape(s: Record<string, string>) {
     tax_registration_number: s.tax_registration_number || '',
     state_code: s.state_code || '',
     tax_scheme: s.tax_scheme || 'regular',
-    country: s.country || 'IN',
-    tax_id_format: resolveTaxIdFormat(s.country || 'IN'),
+    country: s.country || '',
+    tax_id_format: resolveTaxIdFormat(s.country || ''),
   };
 }
 
 // ── Specific routes (must come BEFORE /:key wildcard) ─────────────────────
 
-router.get('/business', requireRole(...ROLE_ACCESS.allStaff), (req: Request, res: Response) => {
+router.get('/business', requirePermission('settings.view'), (req: Request, res: Response) => {
   try {
     const s = getAllSettings(getDatabase());
     res.json(businessShape(s));
@@ -224,13 +214,14 @@ router.get('/business', requireRole(...ROLE_ACCESS.allStaff), (req: Request, res
   }
 });
 
-router.put('/business', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.put('/business', requirePermission('settings.manage'), (req: Request, res: Response) => {
   try {
     const { business_name, timezone, business_day_start_time, currency, country, language,
       tax_registration_number, state_code, business_address, business_phone, instagram_handle,
       billing_type, tables_required, tax_registered,
       bill_show_name, bill_show_address, bill_show_phone, bill_show_tax_id,
       bill_show_tax_breakdown, bill_show_customer_name, bill_show_customer_phone, bill_show_table_number,
+      bill_delivery_show_customer_phone_always,
       currency_display, number_digits, calendar } = req.body;
     const normalizedCurrency = typeof currency === 'string' ? currency.trim().toUpperCase() : currency;
 
@@ -246,8 +237,15 @@ router.put('/business', requireRole(...ROLE_ACCESS.ownerManager), (req: Request,
 
     const db = getDatabase();
     const currentSettings = getAllSettings(db);
-    const effectiveCountry = country || currentSettings.country || 'IN';
-    const effectiveCurrency = normalizedCurrency || currentSettings.currency || 'INR';
+    if (normalizedCurrency !== undefined && normalizedCurrency !== currentSettings.currency) {
+      return res.status(409).json({
+        error: 'currency_change_requires_reset',
+        current_currency: currentSettings.currency || '',
+        requested_currency: normalizedCurrency,
+      });
+    }
+    const effectiveCountry = country || currentSettings.country || '';
+    const effectiveCurrency = normalizedCurrency || currentSettings.currency || '';
 
     // Validate locale preferences against country options, normalizing unsupported legacy values.
     const localeUpdates: Record<string, string> = {};
@@ -303,6 +301,7 @@ router.put('/business', requireRole(...ROLE_ACCESS.ownerManager), (req: Request,
       billing_type, tables_required, tax_registered,
       bill_show_name, bill_show_address, bill_show_phone, bill_show_tax_id,
       bill_show_tax_breakdown, bill_show_customer_name, bill_show_customer_phone, bill_show_table_number,
+      bill_delivery_show_customer_phone_always,
       ...localeUpdates,
       // Only mark country as user-confirmed if it actually changed in this submission.
       ...countryConfirmationPatch(country, currentSettings.country, req.body.country_selected),
@@ -330,7 +329,7 @@ function currenciesShape(s: Record<string, string>) {
   };
 }
 
-router.get('/currencies', requireRole(...ROLE_ACCESS.allStaff), (req: Request, res: Response) => {
+router.get('/currencies', requirePermission('settings.currencies.view'), (req: Request, res: Response) => {
   try {
     res.json(currenciesShape(getAllSettings(getDatabase())));
   } catch (error: any) {
@@ -339,7 +338,7 @@ router.get('/currencies', requireRole(...ROLE_ACCESS.allStaff), (req: Request, r
   }
 });
 
-router.put('/currencies', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.put('/currencies', requirePermission('settings.currencies.manage'), (req: Request, res: Response) => {
   try {
     const { base_currency, secondary_currencies, fx_refresh_minutes } = req.body;
     const db = getDatabase();
@@ -426,7 +425,7 @@ router.put('/currencies', requireRole(...ROLE_ACCESS.ownerManager), (req: Reques
 });
 
 // Force an immediate Frankfurter refresh (e.g. the owner tapping "Update rates").
-router.post('/currencies/refresh', requireRole(...ROLE_ACCESS.ownerManager), asyncHandler(async (req: Request, res: Response) => {
+router.post('/currencies/refresh', requirePermission('settings.currencies.manage'), asyncHandler(async (req: Request, res: Response) => {
   const updated = await refreshRates();
   res.json({ updated, ...currenciesShape(getAllSettings(getDatabase())) });
 }));
@@ -435,7 +434,7 @@ router.post('/currencies/refresh', requireRole(...ROLE_ACCESS.ownerManager), asy
 // so the Currencies UI can auto-fill the rate the moment the owner switches a
 // currency's source to "Live (Frankfurter)". Returns { base, code, rate } or a
 // 4xx/502 when the pair isn't quotable (e.g. an LBP base) or the fetch fails.
-router.get('/currencies/live-rate', requireRole(...ROLE_ACCESS.ownerManager), asyncHandler(async (req: Request, res: Response) => {
+router.get('/currencies/live-rate', requirePermission('settings.currencies.manage'), asyncHandler(async (req: Request, res: Response) => {
   const s = getAllSettings(getDatabase());
   const base = (isValidCurrencyCode(s.base_currency) ? s.base_currency : (s.currency || 'INR')).toUpperCase();
   const code = String(req.query.code || '').toUpperCase();
@@ -459,7 +458,7 @@ router.get('/currencies/live-rate', requireRole(...ROLE_ACCESS.ownerManager), as
 // Standalone exchange-rate trail for a currency (newest first), so the owner
 // can audit how a rate moved over time. Per-order rates at sale time live on
 // bills.payment_details; this is the independent rate log.
-router.get('/currencies/rate-history', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.get('/currencies/rate-history', requirePermission('settings.currencies.manage'), (req: Request, res: Response) => {
   try {
     const code = String(req.query.code || '').toUpperCase();
     if (!isValidCurrencyCode(code)) {
@@ -473,7 +472,7 @@ router.get('/currencies/rate-history', requireRole(...ROLE_ACCESS.ownerManager),
   }
 });
 
-router.get('/tax', requireRole(...ROLE_ACCESS.allStaff), (req: Request, res: Response) => {
+router.get('/tax', requirePermission('settings.view'), (req: Request, res: Response) => {
   try {
     const s = getAllSettings(getDatabase());
     res.json(taxShape(s));
@@ -483,7 +482,7 @@ router.get('/tax', requireRole(...ROLE_ACCESS.allStaff), (req: Request, res: Res
   }
 });
 
-router.put('/tax', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.put('/tax', requirePermission('tax-configuration.manage'), (req: Request, res: Response) => {
   try {
     const { tax_registered, tax_registration_number, state_code, tax_scheme, country } = req.body;
 
@@ -493,7 +492,7 @@ router.put('/tax', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res:
 
     const db = getDatabase();
     const currentSettings = getAllSettings(db);
-    const effectiveCountry = country || currentSettings.country || 'IN';
+    const effectiveCountry = country || currentSettings.country || '';
     if (tax_registration_number) {
       const { valid, format } = validateTaxRegistrationNumber(effectiveCountry, tax_registration_number);
       if (!valid && format) {
@@ -510,7 +509,7 @@ router.put('/tax', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res:
       tax_scheme,
       country,
       currency_symbol: country !== undefined
-        ? deriveCurrencySymbol(currentSettings.currency || 'INR', country || currentSettings.country || 'IN')
+        ? deriveCurrencySymbol(currentSettings.currency || '', country || currentSettings.country || '')
         : undefined,
     });
     cloudSync.refreshRegistrationProfile();
@@ -521,7 +520,7 @@ router.put('/tax', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res:
   }
 });
 
-router.get('/loyalty', requireRole(...ROLE_ACCESS.allStaff), (req: Request, res: Response) => {
+router.get('/loyalty', requirePermission('settings.view'), (req: Request, res: Response) => {
   try {
     const s = getAllSettings(getDatabase());
     res.json({
@@ -534,7 +533,7 @@ router.get('/loyalty', requireRole(...ROLE_ACCESS.allStaff), (req: Request, res:
   }
 });
 
-router.put('/loyalty', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.put('/loyalty', requirePermission('settings.manage'), (req: Request, res: Response) => {
   try {
     const { loyalty_enabled, global_cashback_percent } = req.body;
 
@@ -564,7 +563,7 @@ router.put('/loyalty', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, 
 
 // ─── Discount settings ──────────────────────────────────────────────────────
 
-router.get('/discount', requireRole(...ROLE_ACCESS.allStaff), (req: Request, res: Response) => {
+router.get('/discount', requirePermission('settings.view'), (req: Request, res: Response) => {
   try {
     const s = getAllSettings(getDatabase());
     res.json({
@@ -579,7 +578,7 @@ router.get('/discount', requireRole(...ROLE_ACCESS.allStaff), (req: Request, res
   }
 });
 
-router.put('/discount', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.put('/discount', requirePermission('settings.manage'), (req: Request, res: Response) => {
   try {
     const {
       discount_max_percentage,
@@ -628,7 +627,7 @@ router.put('/discount', requireRole(...ROLE_ACCESS.ownerManager), (req: Request,
 // ─── KDS settings (must come BEFORE /:key wildcard) ─────────────────────────
 
 // Mirrors KDS default view for the dashboard settings page.
-router.get('/kds', (_req: Request, res: Response) => {
+router.get('/kds', requirePermission('settings.view'), (_req: Request, res: Response) => {
   try {
     const s = getAllSettings(getDatabase());
     res.json({
@@ -640,7 +639,7 @@ router.get('/kds', (_req: Request, res: Response) => {
   }
 });
 
-router.put('/kds', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.put('/kds', requirePermission('settings.manage'), (req: Request, res: Response) => {
   try {
     const { kds_default_view } = req.body;
     if (kds_default_view !== undefined && !['tabs', 'kanban'].includes(kds_default_view)) {
@@ -685,7 +684,7 @@ function parseBoundedInt(value: unknown, min: number, max: number, fallback: num
   return Number.isInteger(parsed) && parsed >= min && parsed <= max ? parsed : fallback;
 }
 
-router.get('/order-numbering', requireRole(...ROLE_ACCESS.allStaff), (req: Request, res: Response) => {
+router.get('/order-numbering', requirePermission('settings.view'), (req: Request, res: Response) => {
   try {
     const s = getAllSettings(getDatabase());
     res.json(orderNumberingShape(s));
@@ -695,7 +694,7 @@ router.get('/order-numbering', requireRole(...ROLE_ACCESS.allStaff), (req: Reque
   }
 });
 
-router.put('/order-numbering', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.put('/order-numbering', requirePermission('settings.manage'), (req: Request, res: Response) => {
   try {
     const {
       order_number_prefix,
@@ -769,7 +768,7 @@ const CLOUD_ACCOUNT_UNAVAILABLE_ERROR = 'Cloud account services are unavailable 
 
 // ─── Cloud Sync settings (must come BEFORE /:key wildcard) ──────────────────
 
-router.get('/cloud', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.get('/cloud', requirePermission('cloud.manage'), (req: Request, res: Response) => {
   try {
     res.json(cloudSync.getStatus());
   } catch (error: any) {
@@ -778,7 +777,7 @@ router.get('/cloud', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, re
   }
 });
 
-router.put('/cloud', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.put('/cloud', requirePermission('cloud.manage'), (req: Request, res: Response) => {
   try {
     const {
       cloud_server_url,
@@ -830,7 +829,7 @@ router.put('/cloud', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, re
   }
 });
 
-router.post('/cloud/register', requireRole(...ROLE_ACCESS.ownerManager), asyncHandler(async (req: Request, res: Response) => {
+router.post('/cloud/register', requirePermission('cloud.manage'), asyncHandler(async (req: Request, res: Response) => {
   try {
     const deletionRequest = await cloudSync.getDeletionRequestStatus({
       allowRemote: cloudSync.isCloudAccountAvailable(),
@@ -865,7 +864,7 @@ router.post('/cloud/register', requireRole(...ROLE_ACCESS.ownerManager), asyncHa
   }
 }));
 
-router.post('/cloud/test', requireRole(...ROLE_ACCESS.ownerManager), asyncHandler(async (req: Request, res: Response) => {
+router.post('/cloud/test', requirePermission('cloud.manage'), asyncHandler(async (req: Request, res: Response) => {
   try {
     const result = await cloudSync.testConnection(getHttpRequestSignal(req));
     res.json(result);
@@ -875,7 +874,7 @@ router.post('/cloud/test', requireRole(...ROLE_ACCESS.ownerManager), asyncHandle
   }
 }));
 
-router.get('/cloud/account', requireRole(...ROLE_ACCESS.owner), asyncHandler(async (req: Request, res: Response) => {
+router.get('/cloud/account', requirePermission('cloud.account.manage'), asyncHandler(async (req: Request, res: Response) => {
   try {
     const cloudAccountAvailable = cloudSync.isCloudAccountAvailable();
     const signal = getHttpRequestSignal(req);
@@ -903,7 +902,7 @@ router.get('/cloud/account', requireRole(...ROLE_ACCESS.owner), asyncHandler(asy
   }
 }));
 
-router.put('/cloud/account/preferences', requireRole(...ROLE_ACCESS.owner), asyncHandler(async (req: Request, res: Response) => {
+router.put('/cloud/account/preferences', requirePermission('cloud.account.manage'), asyncHandler(async (req: Request, res: Response) => {
   if (!cloudSync.isCloudAccountAvailable()) {
     return res.status(409).json({ error: CLOUD_ACCOUNT_UNAVAILABLE_ERROR });
   }
@@ -917,7 +916,7 @@ router.put('/cloud/account/preferences', requireRole(...ROLE_ACCESS.owner), asyn
   }
 }));
 
-router.post('/cloud/account/verification', requireRole(...ROLE_ACCESS.owner), asyncHandler(async (req: Request, res: Response) => {
+router.post('/cloud/account/verification', requirePermission('cloud.account.manage'), asyncHandler(async (req: Request, res: Response) => {
   if (!cloudSync.isCloudAccountAvailable()) {
     return res.status(409).json({ error: CLOUD_ACCOUNT_UNAVAILABLE_ERROR });
   }
@@ -928,7 +927,7 @@ router.post('/cloud/account/verification', requireRole(...ROLE_ACCESS.owner), as
   }
 }));
 
-router.get('/cloud/delete-data/status', requireRole(...ROLE_ACCESS.owner), asyncHandler(async (req: Request, res: Response) => {
+router.get('/cloud/delete-data/status', requirePermission('cloud.account.manage'), asyncHandler(async (req: Request, res: Response) => {
   try {
     const deletionRequest = await cloudSync.getDeletionRequestStatus({ allowRemote: true, signal: getHttpRequestSignal(req) });
     res.json({
@@ -940,11 +939,11 @@ router.get('/cloud/delete-data/status', requireRole(...ROLE_ACCESS.owner), async
   }
 }));
 
-router.post('/cloud/stop-all', requireRole(...ROLE_ACCESS.owner), asyncHandler(async (req: Request, res: Response) => {
+router.post('/cloud/stop-all', requirePermission('cloud.account.manage'), asyncHandler(async (req: Request, res: Response) => {
   res.json(await cloudSync.stopAllCloudServices(getHttpRequestSignal(req)));
 }));
 
-router.post('/cloud/delete-data', requireRole(...ROLE_ACCESS.owner), requireMasterPin, asyncHandler(async (req: Request, res: Response) => {
+router.post('/cloud/delete-data', requirePermission('cloud.account.manage'), requireMasterPin, asyncHandler(async (req: Request, res: Response) => {
   if (req.body?.confirmation !== 'DELETE CLOUD DATA') {
     return res.status(400).json({ error: 'Type DELETE CLOUD DATA to confirm' });
   }
@@ -955,7 +954,7 @@ router.post('/cloud/delete-data', requireRole(...ROLE_ACCESS.owner), requireMast
   }
 }));
 
-router.post('/cloud/delete-data/cancel', requireRole(...ROLE_ACCESS.owner), requireMasterPin, asyncHandler(async (req: Request, res: Response) => {
+router.post('/cloud/delete-data/cancel', requirePermission('cloud.account.manage'), requireMasterPin, asyncHandler(async (req: Request, res: Response) => {
   try {
     res.json(await cloudSync.cancelDeletionRequest(getHttpRequestSignal(req)));
   } catch {
@@ -963,64 +962,87 @@ router.post('/cloud/delete-data/cancel', requireRole(...ROLE_ACCESS.owner), requ
   }
 }));
 
-// Google Drive backups — owner only, off by default.
-router.get('/google-drive', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
-  try {
-    res.json(googleDrive.getStatus());
-  } catch (error: any) {
-    console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
-  }
+// Google Drive backups - every Drive route is owner-only and returns only the
+// service's redacted status or an allowlisted error code.
+function googleDriveErrorResponse(res: Response, error: unknown): Response {
+  const code = getGoogleDriveErrorCode(error);
+  const status = code === 'permission_denied' ? 403
+    : code === 'conflict' ? 409
+      : ['warning_acknowledgement_required', 'restore_validation_failed', 'preferences_invalid'].includes(code) ? 400
+        : ['offline', 'rate_limited'].includes(code) ? 503
+          : ['configuration_unavailable', 'secure_storage_unavailable', 'not_connected', 'reauth_required', 'destination_required', 'destination_invalid'].includes(code) ? 409
+            : 502;
+  return res.status(status).json({ error: code });
+}
+
+router.get('/google-drive', requirePermission('google-drive.manage'), (_req: Request, res: Response) => {
+  try { return res.json(googleDrive.getStatus()); } catch (error) { return googleDriveErrorResponse(res, error); }
 });
 
-router.put('/google-drive', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.put('/google-drive', requirePermission('google-drive.manage'), asyncHandler(async (req: Request, res: Response) => {
   try {
-    const { frequency, retention_count } = req.body;
-    res.json(googleDrive.updatePreferences({ frequency, retention_count }));
-  } catch (error: any) {
-    console.error('[API] Google Drive preferences update failed:', error);
-    res.status(400).json({ error: 'Invalid Google Drive preferences' });
-  }
-});
+    const { frequency, retention_count, destination_folder_id, warning_acknowledged } = req.body || {};
+    if (warning_acknowledged === true) googleDrive.acknowledgeWarning();
+    let status = googleDrive.updatePreferences({ frequency, retention_count });
+    if (destination_folder_id !== undefined) status = await googleDrive.setDestination(destination_folder_id);
+    return res.json(status);
+  } catch (error) { return googleDriveErrorResponse(res, error); }
+}));
 
-router.post('/google-drive/connect', requireRole(...ROLE_ACCESS.owner), asyncHandler(async (req: Request, res: Response) => {
+router.get('/google-drive/destinations', requirePermission('google-drive.manage'), asyncHandler(async (_req: Request, res: Response) => {
+  try { return res.json({ destinations: await googleDrive.listDestinations() }); } catch (error) { return googleDriveErrorResponse(res, error); }
+}));
+
+router.post('/google-drive/destinations', requirePermission('google-drive.manage'), asyncHandler(async (_req: Request, res: Response) => {
+  try { return res.json(await googleDrive.createDestination()); } catch (error) { return googleDriveErrorResponse(res, error); }
+}));
+
+router.post('/google-drive/connect', requirePermission('google-drive.manage'), asyncHandler(async (req: Request, res: Response) => {
   try {
-    const status = await trackHttpRequestWork(req, googleDrive.connect(getHttpRequestSignal(req)));
-    res.json(status);
-  } catch (error: any) {
-    console.error('[API] Google Drive connection failed:', error);
+    const body = req.body || {};
+    const status = await trackHttpRequestWork(req, googleDrive.connect(getHttpRequestSignal(req), body.allow_switch === true, body.warning_acknowledged === true));
+    return res.json(status);
+  } catch (error) {
     if (getHttpRequestSignal(req)?.aborted) {
       if (!res.headersSent) res.status(503).end();
       else if (!res.writableEnded) res.destroy();
-      return;
+      return res;
     }
-    res.status(502).json({ error: 'Google Drive connection failed' });
+    return googleDriveErrorResponse(res, error);
   }
 }));
 
-router.post('/google-drive/disconnect', requireRole(...ROLE_ACCESS.owner), asyncHandler(async (_req: Request, res: Response) => {
-  try {
-    const status = await googleDrive.disconnect();
-    res.json(status);
-  } catch (error: any) {
-    console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
-  }
+router.post('/google-drive/disconnect', requirePermission('google-drive.manage'), asyncHandler(async (_req: Request, res: Response) => {
+  try { return res.json(await googleDrive.disconnect()); } catch (error) { return googleDriveErrorResponse(res, error); }
 }));
 
-router.post('/google-drive/backup-now', requireRole(...ROLE_ACCESS.owner), asyncHandler(async (req: Request, res: Response) => {
+router.post('/google-drive/backup-now', requirePermission('google-drive.manage'), asyncHandler(async (req: Request, res: Response) => {
   try {
-    const status = await trackHttpRequestWork(req, googleDrive.backupNow(getHttpRequestSignal(req)));
-    res.json(status);
-  } catch (error: any) {
-    console.error('[API] Google Drive backup failed:', error);
-    if (getHttpRequestSignal(req)?.aborted) {
-      if (!res.headersSent) res.status(503).end();
-      else if (!res.writableEnded) res.destroy();
-      return;
-    }
-    res.status(502).json({ error: 'Google Drive backup failed' });
-  }
+    if (req.body?.warning_acknowledged === true) googleDrive.acknowledgeWarning();
+    return res.status(202).json(googleDrive.startBackupJob('manual', req.body?.warning_acknowledged === true));
+  } catch (error) { return googleDriveErrorResponse(res, error); }
+}));
+
+router.get('/google-drive/jobs/:jobId', requirePermission('google-drive.manage'), (_req: Request, res: Response) => {
+  const job = googleDrive.getJob(_req.params.jobId as string);
+  if (!job) return res.status(404).json({ error: 'not_found' });
+  return res.json({ job });
+});
+
+router.post('/google-drive/jobs/:jobId/cancel', requirePermission('google-drive.manage'), (_req: Request, res: Response) => {
+  try { return res.json(googleDrive.cancelJob(_req.params.jobId as string)); } catch (error) { return googleDriveErrorResponse(res, error); }
+});
+
+router.get('/google-drive/backups', requirePermission('google-drive.manage'), asyncHandler(async (_req: Request, res: Response) => {
+  try { return res.json({ backups: await googleDrive.listRemoteBackups() }); } catch (error) { return googleDriveErrorResponse(res, error); }
+}));
+
+router.post('/google-drive/restore', requirePermission('google-drive.manage'), requireMasterPin, asyncHandler(async (req: Request, res: Response) => {
+  try {
+    const body = req.body || {};
+    if (body.confirmation !== DRIVE_RESTORE_CONFIRMATION) return res.status(400).json({ error: 'confirmation_required' });
+    return res.status(202).json(googleDrive.startRestoreJob({ fileId: body.file_id, expectedSha256: body.expected_sha256, confirmation: body.confirmation }));
+  } catch (error) { return googleDriveErrorResponse(res, error); }
 }));
 
 // ── Generic key-value routes (wildcard — must be last) ─────────────────────
@@ -1042,6 +1064,7 @@ const ALLOWED_WILDCARD_KEYS = new Set([
   'cash_drawer_pulse_enabled', 'cash_drawer_pulse_methods',
   'telemetry_enabled',
   'diagnostics_consent',
+  'diagnostics_transmission_enabled',
   'kds_enabled', 'server_app_enabled', 'kot_printing_enabled', 'server_app_bill_printing_enabled',
   'split_checks_enabled',
   BILL_LANGUAGE_POLICY_KEY, KOT_LANGUAGE_POLICY_KEY, Z_REPORT_LANGUAGE_POLICY_KEY,
@@ -1053,7 +1076,7 @@ function isAllowedWildcardKey(key: string): boolean {
   return ALLOWED_WILDCARD_KEYS.has(key) || /^tax_plugin_request:[A-Z]{2}$/.test(key);
 }
 
-router.get('/', requireRole(...ROLE_ACCESS.allStaff), (req: Request, res: Response) => {
+router.get('/', requirePermission('settings.view'), (req: Request, res: Response) => {
   try {
     const s = getAllSettings(getDatabase());
     res.json({ settings: publicSettingsShape(s) });
@@ -1063,7 +1086,7 @@ router.get('/', requireRole(...ROLE_ACCESS.allStaff), (req: Request, res: Respon
   }
 });
 
-router.get('/bill-templates', requireRole(...ROLE_ACCESS.ownerManager), (_req: Request, res: Response) => {
+router.get('/bill-templates', requirePermission('print-templates.view'), (_req: Request, res: Response) => {
   try {
     const plugins = listInstalledPrintTemplates().map((template) => {
       let storedWidths: string[] = [];
@@ -1114,6 +1137,7 @@ const PRINTING_BOOLEAN_KEYS = [
   'bill_show_customer_name',
   'bill_show_customer_phone',
   'bill_show_table_number',
+  'bill_delivery_show_customer_phone_always',
 ] as const;
 
 const PRINTING_BATCH_KEYS = new Set<string>([
@@ -1125,7 +1149,7 @@ const PRINTING_BATCH_KEYS = new Set<string>([
   'cash_drawer_pulse_methods',
 ]);
 
-router.put('/printing', settingsWriteRateLimit, requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.put('/printing', settingsWriteRateLimit, requirePermission('printers.manage'), (req: Request, res: Response) => {
   try {
     const payload = req.body;
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
@@ -1200,9 +1224,9 @@ router.put('/printing', settingsWriteRateLimit, requireRole(...ROLE_ACCESS.owner
   }
 });
 
-router.get('/:key', settingsReadRateLimit, requireRole(...ROLE_ACCESS.allStaff), (req: Request, res: Response) => {
+router.get('/:key', settingsReadRateLimit, requirePermission('settings.view'), (req: Request, res: Response) => {
   try {
-    if (SENSITIVE_SETTING_KEYS.has(req.params.key as string)) {
+    if (SENSITIVE_SETTING_KEYS.has(req.params.key as string) || isGoogleDriveSettingKey(req.params.key as string)) {
       return res.status(403).json({ error: 'This setting is sensitive and cannot be read directly' });
     }
     const key = String(req.params.key);
@@ -1222,7 +1246,7 @@ router.get('/:key', settingsReadRateLimit, requireRole(...ROLE_ACCESS.allStaff),
   }
 });
 
-router.put('/:key', settingsWriteRateLimit, requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.put('/:key', settingsWriteRateLimit, requirePermission('settings.manage'), (req: Request, res: Response) => {
   try {
     if (!isAllowedWildcardKey(req.params.key as string)) {
       return res.status(403).json({ error: 'This setting cannot be updated via wildcard route' });
@@ -1256,16 +1280,26 @@ router.put('/:key', settingsWriteRateLimit, requireRole(...ROLE_ACCESS.ownerMana
       valueToPersist = validation.stored;
     }
     const db = getDatabase();
+    if (req.params.key === 'currency') {
+      const currentCurrency = getAllSettings(db).currency || '';
+      if (valueToPersist !== currentCurrency) {
+        return res.status(409).json({
+          error: 'currency_change_requires_reset',
+          current_currency: currentCurrency,
+          requested_currency: valueToPersist,
+        });
+      }
+    }
     const wildcardKey = String(req.params.key);
     if (isLocalePreferenceKey(wildcardKey)) {
-      const countryCode = getAllSettings(db).country || 'IN';
+      const countryCode = getAllSettings(db).country || '';
       if (typeof value !== 'string' || !isLocalePreferenceSupported(wildcardKey, value, countryCode)) {
         return res.status(400).json({ error: `Invalid ${wildcardKey} for country ${countryCode}` });
       }
     }
 
     if (req.params.key === 'business_phone') {
-      const effectiveCountry = getAllSettings(db).country || 'IN';
+      const effectiveCountry = getAllSettings(db).country || '';
       const phoneRes = normalizeOptionalPhone(value, effectiveCountry);
       if (!phoneRes.valid) {
         return res.status(400).json({ error: phoneRes.error || 'Invalid business phone number' });

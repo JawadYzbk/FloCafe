@@ -33,6 +33,7 @@ import {
   type ItemTableBlock,
   type MessageBlock,
   type PaymentsBlock,
+  paymentDisplayRows,
   type TaxBreakdownBlock,
   type TotalsBlock,
 } from '@print/document';
@@ -67,6 +68,8 @@ function directionalValue(value: DirectionalText | null, base: TextDirection): s
 
 export interface WebPrintOptions {
   paperSize?: PaperSize;
+  /** Exact column count the configured printer declares; overrides `paperSize`. */
+  columns?: number;
   includeTaxId?: boolean;
   taxRegistrationNumber?: string;
   address?: string;
@@ -77,6 +80,7 @@ export interface WebPrintOptions {
   showTaxBreakdown?: boolean;
   showCustomerName?: boolean;
   showCustomerPhone?: boolean;
+  deliveryShowCustomerPhoneAlways?: boolean;
   showTableNumber?: boolean;
   /** Ignored for browser receipts: HTML uses locale currency formatting and code fallback. */
   useUnicode?: boolean;
@@ -99,7 +103,7 @@ export interface WebPrintOptions {
 /** Resolve tax-id label printed on receipt (special case for Iranian Economic Code). */
 function resolveTaxIdLabel(country: string | undefined, lang: Language): string {
   if (country?.toUpperCase() === 'IR') return printLabelResolver('receipt.economicCode', lang);
-  return getCountryByCode(country ?? 'IN')?.taxIdLabel || 'Tax ID';
+  return getCountryByCode(country ?? '')?.taxIdLabel || 'Tax ID';
 }
 
 /** Ensure the requested receipt language messages are loaded in memory. */
@@ -165,6 +169,7 @@ export async function printWebBill(
     };
 
     const triggerPrint = () => {
+      if (settled) return;
       try {
         if (printWindow.closed) {
           settle(new Error('Print window was closed before receipt could be printed'));
@@ -229,6 +234,7 @@ export function generateBillHtml(
     showTaxBreakdown = true,
     showCustomerName = true,
     showCustomerPhone = true,
+    deliveryShowCustomerPhoneAlways,
     showTableNumber = true,
     isReprint = false,
     trimDecimals = false,
@@ -239,7 +245,7 @@ export function generateBillHtml(
   const lang = languages[0] as Language;
 
   const document = buildFrontendBillDocument(bill, tenant, {
-    columns: columnsForReceiptPaperSize(paperSize === 'thermal80' ? 80 : 58),
+    columns: opts.columns ?? columnsForReceiptPaperSize(paperSize === 'thermal80' ? 80 : 58),
     businessName: showBusinessName ? (businessName ?? tenant.business_name) : undefined,
     address,
     phone,
@@ -251,6 +257,7 @@ export function generateBillHtml(
     showTaxBreakdown,
     showCustomerName,
     showCustomerPhone,
+    deliveryShowCustomerPhoneAlways,
     showTableNumber,
     isReprint,
     trimDecimals,
@@ -277,6 +284,7 @@ export function generateBillHtml(
     table: stripLabelPlaceholder(metaTableLabel),
     customer: documentLabel(customer?.nameLabel, 'pos.customer', lang),
     customerNo: documentLabel(customer?.phoneLabel, 'print.numberShort', lang),
+    deliveryAddress: documentLabel(customer?.addressLabel, 'print.deliverySlip.address', lang),
     rate: itemsBlock?.header.rate.primary ?? printLabelResolver('receipt.rate', lang),
     totalTax: surfaceLabel(totals?.tax?.label, 'pos.tax', 'receipt.totalTax', lang),
     deliveryCharge: surfaceLabel(totals?.deliveryCharge?.label, 'pos.delivery', 'receipt.deliveryCharge', lang),
@@ -336,8 +344,10 @@ export function generateBillHtml(
           <td class="text-end"><strong>${escapeHtml(L.date)}</strong> ${meta ? escapeHtml(formatReceiptDate(meta.timestamp.text, tenant, LANGUAGES[lang]?.locale ?? lang)) : ''}</td>
         </tr>
         ${meta?.table ? `<tr><td><strong>${escapeHtml(L.table)}</strong> ${escapeHtml(meta.table.name.text)}</td><td></td></tr>` : ''}
+        ${customer?.heading ? `<tr><td colspan="2"><strong>${escapeHtml(customer.heading.primary)}</strong></td></tr>` : ''}
         ${customer?.name ? `<tr><td><strong>${escapeHtml(L.customer)}</strong> ${escapeHtml(customer.name.text)}</td><td></td></tr>` : ''}
         ${customer?.phone ? `<tr><td><strong>${escapeHtml(L.customerNo)}</strong> ${directionalValue(customer.phone, base)}</td><td></td></tr>` : ''}
+        ${customer?.address ? `<tr><td><strong>${escapeHtml(L.deliveryAddress)}</strong> ${directionalValue(customer.address, base).replace(/\n/g, '<br>')}</td><td></td></tr>` : ''}
       </table>
     </div>
 
@@ -405,9 +415,9 @@ export function generateBillHtml(
         <tr><th colspan="2">${escapeHtml(L.paymentsHeader)}</th></tr>
       </thead>
       <tbody>
-        ${payments.lines.map((line) => `
-          <tr><td>${escapeHtml(paymentLineLabel(line.label))}${line.tenderCurrency && line.tenderAmount ? ` <span style="opacity:.6">(${escapeHtml(line.tenderAmount.toLocaleString())} ${escapeHtml(line.tenderCurrency)})</span>` : ''}</td><td class="text-end num">${fmtAmount(line.amount)}</td></tr>
-        `).join('')}
+        ${payments.lines.map((line) => paymentDisplayRows(line).map((row, rowIndex) => `
+          <tr><td>${escapeHtml(paymentLineLabel(row.label))}${rowIndex === 0 && line.tenderCurrency && line.tenderAmount ? ` <span style="opacity:.6">(${escapeHtml(line.tenderAmount.toLocaleString())} ${escapeHtml(line.tenderCurrency)})</span>` : ''}</td><td class="text-end num">${fmtAmount(row.amount)}</td></tr>
+        `).join('')).join('')}
       </tbody>
     </table>
     ` : ''}
@@ -471,7 +481,8 @@ function paymentLineLabel(label: { conceptId?: string; primary: string }): strin
 function getPaperStyles(size: PaperSize): string {
   const baseStyles = `
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, 'Segoe UI', Tahoma, 'Noto Naskh Arabic', 'Helvetica Neue', Arial, sans-serif; font-size: 12px; line-height: 1.4; color: #333; }
+    body { font-family: -apple-system, 'Segoe UI', Tahoma, 'Noto Naskh Arabic', 'Noto Sans Bengali', 'Vrinda', 'Bangla Sangam MN', 'Noto Sans Devanagari', 'Nirmala UI', 'Kohinoor Devanagari', 'Devanagari Sangam MN', 'Noto Sans Thai', 'Leelawadee UI', Thonburi, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', 'Hiragino Sans', 'Yu Gothic', 'Meiryo', 'Noto Sans CJK JP', 'Noto Sans JP', 'Helvetica Neue', Arial, sans-serif; font-size: 12px; line-height: 1.4; color: #333; }
+    body:lang(zh-TW) { font-family: -apple-system, 'Segoe UI', Tahoma, 'Noto Naskh Arabic', 'PingFang TC', 'Microsoft JhengHei', 'Noto Sans CJK TC', 'Noto Sans TC', 'Helvetica Neue', Arial, sans-serif; }
     .bill-container { max-width: 100%; margin: 0 auto; }
     .reprint-banner { text-align: center; font-size: 22px; font-weight: bold; letter-spacing: 2px; color: #c00; border: 3px solid #c00; padding: 6px; margin-bottom: 15px; }
     .online-order-banner { text-align: center; font-size: 18px; font-weight: bold; letter-spacing: 1px; border: 2px solid #333; padding: 6px; margin-bottom: 15px; }
@@ -520,7 +531,7 @@ function getPaperStyles(size: PaperSize): string {
 function formatAmount(value: number, tenant: ReceiptTenant, trimDecimals = false): string {
   const numeric = Number.isFinite(Number(value)) ? Number(value) : 0;
   const prefs = { currencyDisplay: tenant.currency_display, digits: tenant.number_digits };
-  const fractionDigits = getCurrencyFractionDigits(tenant.currency ?? 'INR');
+  const fractionDigits = getCurrencyFractionDigits(tenant.currency);
   const factor = 10 ** fractionDigits;
   const hasDecimals = fractionDigits > 0 && Math.round(numeric * factor) % factor !== 0;
   const isToman =
@@ -529,9 +540,9 @@ function formatAmount(value: number, tenant: ReceiptTenant, trimDecimals = false
 
   // trimDecimals hides trailing .00 only when there is no fractional part.
   if (trimDecimals && !hasDecimals && !isToman) {
-    const locale = getCountryByCode(tenant.country ?? 'IN')?.locale ?? 'en-US';
+    const locale = getCountryByCode(tenant.country)?.locale ?? 'en-US';
     const numberingSystem = tenant.number_digits === 'latin' ? 'latn' : undefined;
-    const currency = tenant.currency || 'INR';
+    const currency = tenant.currency;
     try {
       return new Intl.NumberFormat(locale, {
         style: 'currency',

@@ -3,6 +3,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
+const nativeFs = require('node:fs') as typeof import('node:fs');
+
 const Module = require('module');
 const originalLoad = Module._load;
 const testDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flo-production-restore-'));
@@ -24,6 +26,8 @@ import Database from 'better-sqlite3';
 import {
   closeDatabase,
   createBackup,
+  beginDatabaseReplacementJournal,
+  abortDatabaseReplacementJournal,
   getCurrentSchemaVersion,
   getDatabase,
   getDbPath,
@@ -55,7 +59,7 @@ function seedLinkedData(): void {
 
 function clearLinkedData(): void {
   const db = getDatabase();
-  db.exec('DELETE FROM order_items; DELETE FROM bills; DELETE FROM orders; DELETE FROM products; DELETE FROM categories;');
+  db.exec('DELETE FROM order_items; DELETE FROM bills; DELETE FROM orders; DELETE FROM inventory_movements; DELETE FROM products; DELETE FROM categories;');
 }
 
 function copyAndStamp(sourcePath: string, destinationPath: string, schemaVersion: number): void {
@@ -193,6 +197,102 @@ async function run() {
     const olderBackup = path.join(testDir, 'older-schema.db');
     copyAndStamp(sameSchemaBackup, olderBackup, currentVersion - 1);
 
+    const inconsistentLedgerBackup = path.join(testDir, 'inconsistent-ledger.db');
+    copyAndStamp(sameSchemaBackup, inconsistentLedgerBackup, currentVersion - 1);
+    const inconsistentLedgerDb = new Database(inconsistentLedgerBackup);
+    inconsistentLedgerDb.prepare('UPDATE products SET stock_quantity = ? WHERE id = ?').run(7, 'restore-product');
+    inconsistentLedgerDb.exec('DROP TABLE inventory_movements');
+    inconsistentLedgerDb.close();
+    const inconsistentRestore = restoreBackup(inconsistentLedgerBackup, false);
+    assert.equal(inconsistentRestore.success, false, 'data-only restore rejects stock without matching movement history');
+    assert.equal(
+      (getDatabase().prepare('SELECT stock_quantity FROM products WHERE id = ?').get('restore-product') as { stock_quantity: number }).stock_quantity,
+      0,
+      'rejected inconsistent restore leaves the live stock cache unchanged',
+    );
+
+    getDatabase().prepare('UPDATE products SET stock_quantity = ? WHERE id = ?').run(5, 'restore-product');
+    getDatabase().prepare(`
+      INSERT INTO inventory_movements (
+        product_id, quantity_delta, movement_type, reference_type, reference_id,
+        reason, actor_user_id, stock_after, created_at
+      ) VALUES (?, ?, 'adjustment', 'opening_balance', ?, ?, ?, ?, datetime('now'))
+    `).run('restore-product', 5, 'restore-product', 'Current opening balance', 'restore-station-chef', 5);
+    const zeroResetRestore = restoreBackup(olderBackup, false);
+    assert.equal(zeroResetRestore.success, false, 'data-only restore rejects an unaudited stock reset');
+    assert.equal(
+      (getDatabase().prepare('SELECT stock_quantity FROM products WHERE id = ?').get('restore-product') as { stock_quantity: number }).stock_quantity,
+      5,
+      'rejected stock-reset restore leaves the live stock cache unchanged',
+    );
+    assert.equal(
+      (getDatabase().prepare('SELECT COUNT(*) AS count FROM inventory_movements WHERE product_id = ?').get('restore-product') as { count: number }).count,
+      1,
+      'rejected stock-reset restore leaves movement history unchanged',
+    );
+
+    getDatabase().prepare('UPDATE products SET stock_quantity = 0 WHERE id = ?').run('restore-product');
+    getDatabase().prepare(`
+      INSERT INTO inventory_movements (
+        product_id, quantity_delta, movement_type, reference_type, reference_id,
+        reason, actor_user_id, stock_after, created_at
+      ) VALUES (?, ?, 'sale', 'order_item', ?, ?, ?, ?, datetime('now'))
+    `).run('restore-product', -5, 'partial-restore', 'Partial restore fixture', 'restore-station-chef', 0);
+    const partialRestoreBackup = path.join(testDir, 'partial-ledger-restore.db');
+    copyAndStamp(sameSchemaBackup, partialRestoreBackup, currentVersion - 1);
+    const partialRestoreDb = new Database(partialRestoreBackup);
+    partialRestoreDb.pragma('foreign_keys = OFF');
+    partialRestoreDb.exec('DROP TABLE products');
+    partialRestoreDb.close();
+    const partialRestore = restoreBackup(partialRestoreBackup, false);
+    assert.equal(partialRestore.success, false, 'data-only restore rejects movement history without products');
+    assert.equal(
+      (getDatabase().prepare('SELECT stock_quantity FROM products WHERE id = ?').get('restore-product') as { stock_quantity: number }).stock_quantity,
+      0,
+      'rejected partial restore leaves the zero stock cache unchanged',
+    );
+    assert.equal(
+      (getDatabase().prepare('SELECT COUNT(*) AS count FROM inventory_movements WHERE product_id = ?').get('restore-product') as { count: number }).count,
+      2,
+      'rejected partial restore preserves zero-ending movement history',
+    );
+    getDatabase().prepare('DELETE FROM inventory_movements WHERE product_id = ? AND reference_id = ?').run('restore-product', 'partial-restore');
+    getDatabase().prepare('UPDATE products SET stock_quantity = ? WHERE id = ?').run(5, 'restore-product');
+
+    const staleLedgerBackup = path.join(testDir, 'stale-ledger.db');
+    copyAndStamp(sameSchemaBackup, staleLedgerBackup, currentVersion - 1);
+    const staleLedgerDb = new Database(staleLedgerBackup);
+    staleLedgerDb.pragma('foreign_keys = OFF');
+    staleLedgerDb.exec('DROP TABLE inventory_movements');
+    staleLedgerDb.close();
+    const staleLedgerRestore = restoreBackup(staleLedgerBackup, false);
+    assert.equal(staleLedgerRestore.success, false, 'data-only restore rejects a merged stock and ledger mismatch');
+    assert.equal(
+      (getDatabase().prepare('SELECT stock_quantity FROM products WHERE id = ?').get('restore-product') as { stock_quantity: number }).stock_quantity,
+      5,
+      'rejected merged-state restore leaves the live stock cache unchanged',
+    );
+    assert.equal(
+      (getDatabase().prepare('SELECT stock_after FROM inventory_movements WHERE product_id = ? ORDER BY id DESC LIMIT 1').get('restore-product') as { stock_after: number }).stock_after,
+      5,
+      'rejected merged-state restore leaves the live movement history unchanged',
+    );
+
+    const legacyPreLedgerBackup = path.join(testDir, 'legacy-pre-ledger.db');
+    copyAndStamp(sameSchemaBackup, legacyPreLedgerBackup, currentVersion - 1);
+    const legacyPreLedgerDb = new Database(legacyPreLedgerBackup);
+    legacyPreLedgerDb.pragma('foreign_keys = OFF');
+    legacyPreLedgerDb.prepare('UPDATE products SET stock_quantity = ? WHERE id = ?').run(5, 'restore-product');
+    legacyPreLedgerDb.exec('DROP TABLE inventory_movements');
+    legacyPreLedgerDb.close();
+    const legacyPreLedgerRestore = restoreBackup(legacyPreLedgerBackup, false);
+    assert.equal(legacyPreLedgerRestore.success, false, 'pre-ledger backups with stock are rejected without movement history');
+    assert.equal(
+      (getDatabase().prepare('SELECT stock_quantity FROM products WHERE id = ?').get('restore-product') as { stock_quantity: number }).stock_quantity,
+      5,
+      'pre-ledger restore preserves the migrated stock cache',
+    );
+
     clearLinkedData();
     const restored = restoreBackup(olderBackup, false);
     assert.equal(restored.success, true, 'foreign-key-linked data-only restore succeeds');
@@ -263,6 +363,82 @@ async function run() {
     const direct = restoreBackup(sameSchemaBackup, true);
     assert.equal(direct.success, true, 'same-schema direct restore still succeeds');
     assertNoRestoreAttachment();
+
+    const recoveryArtifactsBeforeJournalTest = new Set(fs.readdirSync(path.join(testDir, 'backups')).filter((name) => /recovery-/.test(name)));
+    const mutableFs = nativeFs as unknown as { copyFileSync: typeof fs.copyFileSync; unlinkSync: typeof fs.unlinkSync };
+    const originalCopyFileSync = nativeFs.copyFileSync;
+    mutableFs.copyFileSync = ((source, target, mode) => {
+      originalCopyFileSync(source, target, mode);
+      if (String(source) === sameSchemaBackup) throw new Error('injected recovery copy failure');
+    }) as typeof fs.copyFileSync;
+    assert.throws(
+      () => beginDatabaseReplacementJournal(sameSchemaBackup, 'restore'),
+      /injected recovery copy failure/,
+      'failed recovery journal preparation propagates the copy failure',
+    );
+    mutableFs.copyFileSync = originalCopyFileSync;
+    const orphanedRecoveryArtifacts = fs.readdirSync(path.join(testDir, 'backups')).filter((name) => /recovery-/.test(name) && !recoveryArtifactsBeforeJournalTest.has(name));
+    assert.deepEqual(orphanedRecoveryArtifacts, [], 'failed journal preparation removes partial recovery artifacts');
+
+    const recoveryArtifactsBeforeDirectRestoreTest = new Set(fs.readdirSync(path.join(testDir, 'backups')).filter((name) => /recovery-/.test(name)));
+    mutableFs.copyFileSync = ((source, target, mode) => {
+      originalCopyFileSync(source, target, mode);
+      if (String(source) === getDbPath() && String(target).includes('flo-restore-recovery-')) throw new Error('injected direct recovery copy failure');
+    }) as typeof fs.copyFileSync;
+    assert.throws(
+      () => restoreBackup(sameSchemaBackup, true),
+      /injected direct recovery copy failure/,
+      'same-schema restore propagates a pre-journal recovery copy failure',
+    );
+    mutableFs.copyFileSync = originalCopyFileSync;
+    const orphanedDirectRecoveryArtifacts = fs.readdirSync(path.join(testDir, 'backups')).filter((name) => /recovery-/.test(name) && !recoveryArtifactsBeforeDirectRestoreTest.has(name));
+    assert.deepEqual(orphanedDirectRecoveryArtifacts, [], 'same-schema restore removes a partial pre-journal recovery copy');
+
+    const abortHandle = beginDatabaseReplacementJournal(sameSchemaBackup, 'restore');
+    const originalUnlinkSync = nativeFs.unlinkSync;
+    mutableFs.unlinkSync = ((target) => {
+      if (String(target) === abortHandle.recoveryPath) throw new Error('injected recovery cleanup failure');
+      return originalUnlinkSync(target);
+    }) as typeof fs.unlinkSync;
+    assert.throws(
+      () => abortDatabaseReplacementJournal(abortHandle),
+      /injected recovery cleanup failure/,
+      'prepared journal cleanup propagates artifact deletion failure',
+    );
+    mutableFs.unlinkSync = originalUnlinkSync;
+    assert.equal(fs.existsSync(abortHandle.journalPath), true, 'failed cleanup preserves the prepared journal');
+    assert.equal(fs.existsSync(abortHandle.recoveryPath), true, 'failed cleanup preserves the recovery database');
+    abortDatabaseReplacementJournal(abortHandle);
+
+    const cleanupCopyHandle = beginDatabaseReplacementJournal(sameSchemaBackup, 'restore');
+    const cleanupUnlinkSync = nativeFs.unlinkSync;
+    mutableFs.unlinkSync = ((target) => {
+      if (String(target).includes('.cleanup-')) throw new Error('injected cleanup-copy deletion failure');
+      return cleanupUnlinkSync(target);
+    }) as typeof fs.unlinkSync;
+    assert.throws(
+      () => abortDatabaseReplacementJournal(cleanupCopyHandle),
+      /injected cleanup-copy deletion failure/,
+      'cleanup-copy deletion failures remain visible to the replacement boundary',
+    );
+    mutableFs.unlinkSync = cleanupUnlinkSync;
+    assert.equal(fs.existsSync(cleanupCopyHandle.journalPath), true, 'cleanup-copy failure preserves the journal');
+    assert.equal(fs.existsSync(cleanupCopyHandle.recoveryPath), true, 'cleanup-copy failure preserves the recovery database');
+    assert.ok(
+      fs.readdirSync(path.dirname(cleanupCopyHandle.journalPath)).some((name) => name.startsWith(`${path.basename(cleanupCopyHandle.recoveryPath)}.cleanup-`)),
+      'cleanup-copy failure retains durable recovery evidence',
+    );
+    fs.unlinkSync(cleanupCopyHandle.journalPath);
+    fs.unlinkSync(cleanupCopyHandle.recoveryPath);
+    closeDatabase();
+    initDatabase();
+    assert.equal(fs.existsSync(cleanupCopyHandle.journalPath), false, 'startup consumes restored cleanup journal evidence');
+    assert.equal(fs.existsSync(cleanupCopyHandle.recoveryPath), false, 'startup consumes restored cleanup database evidence');
+    assert.equal(
+      fs.readdirSync(path.dirname(cleanupCopyHandle.journalPath)).some((name) => name.includes('.cleanup-')),
+      false,
+      'startup removes consumed cleanup evidence copies',
+    );
 
     const interruptedRecoverySource = (await createBackup()).path;
     const recoveryMarker = path.join(testDir, 'backups', 'flo-restore-recovery-test.db');

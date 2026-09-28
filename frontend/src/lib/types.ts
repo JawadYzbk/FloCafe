@@ -1,5 +1,6 @@
 import type { Language } from '@/lib/i18n';
 import type { CurrencyDisplay, DigitMode, CalendarMode } from '@/lib/countries';
+import type { PermissionId } from '../../../shared/permissions';
 
 export interface User {
   id: number;
@@ -24,6 +25,8 @@ export interface Tenant {
   plan: string;
   status: string;
   role?: string;
+  permission_ids?: PermissionId[];
+  authorization_revision?: string;
   language?: Language;
   /** Raw backend-authoritative print policies included in auth bootstrap. */
   bill_language_policy?: string | null;
@@ -33,6 +36,13 @@ export interface Tenant {
   currency_display?: CurrencyDisplay;
   number_digits?: DigitMode;
   calendar?: CalendarMode;
+  // Regional snapshot fields (docs/architecture/regional-settings.md) — derived from
+  // country + currency by resolveRegionalSnapshot(), not independent state.
+  currency_symbol?: string;
+  currency_position?: 'prefix' | 'suffix';
+  currency_fraction_digits?: number;
+  decimal_separator?: string;
+  group_separator?: string;
 }
 
 export interface Category {
@@ -66,9 +76,11 @@ export interface Product {
   name: string;
   sku: string | null;
   barcode: string | null;
-  sale_unit: 'each' | 'kg' | 'g' | 'lb';
+  sale_unit: 'each' | 'kg' | 'g' | 'lb' | 'ml' | 'cl' | 'l' | 'fl oz' | 'oz';
   allow_fractional_quantity: boolean;
   weight_precision: number;
+  inventory_product_id?: string | null;
+  inventory_deduction_quantity?: number | null;
   description: string | null;
   price: number;
   cost_price: number | null;
@@ -129,7 +141,7 @@ export interface Table {
   activeOrder?: Order | null;
   current_order?: Order | null;
   seated_at?: string | null;
-  reservation_customer_id?: number | null;
+  reservation_customer_id?: string | null;
   reservation_customer_name?: string | null;
   reservation_customer_phone?: string | null;
 }
@@ -157,6 +169,8 @@ export interface Order {
   order_number: string;
   table_id: string | null;
   customer_id: number | string | null;
+  /** Address confirmed for this delivery; printed in full on the courier slip. */
+  delivery_address?: string | null;
   type: 'dine_in' | 'takeaway' | 'delivery' | 'online';
   status: 'pending' | 'preparing' | 'ready' | 'served' | 'completed' | 'cancelled';
   subtotal: number;
@@ -176,11 +190,14 @@ export interface Order {
   external_order_id?: string | null;
   created_by: number;
   created_at: string;
+  cancelled_at?: string | null;
+  cancellation_reason?: string | null;
   items?: OrderItem[];
   table?: Table;
   customer?: Customer;
   bill?: Bill;
   bills?: Bill[];
+  whatsapp_receipt_status?: 'sent' | 'partial' | 'pending' | 'failed' | null;
 }
 
 export interface OrderItem {
@@ -220,7 +237,7 @@ export interface Bill {
   paid_amount: number;
   balance: number;
   payment_status: 'unpaid' | 'partial' | 'paid' | 'refunded' | 'partially_refunded';
-  payment_details: { method: string; payment_method_id?: number; amount: number; timestamp: string; tender_currency?: string; tender_amount?: number; exchange_rate?: number }[] | null;
+  payment_details: { method: string; payment_method_id?: number; amount: number; timestamp: string; tender_currency?: string; tender_amount?: number; exchange_rate?: number; tendered_amount?: number; change_amount?: number }[] | null;
   split_group_id?: string | null;
   split_label?: string | null;
   tax_breakdown?: { title: string; rate: number; amount: number }[] | null;

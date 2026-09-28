@@ -16,15 +16,16 @@ import {
 import { asyncHandler } from '../middleware/async-handler';
 import { notifyKdsUpdate, notifyOrderUpdated } from '../services/kds';
 import { printReceipt } from '../services/receipt';
-import { requireRole } from '../middleware/security';
-import { ROLE_ACCESS } from '../../shared/role-permissions';
+import { cloudSync } from '../services/cloud-sync';
+import { hasPermission, requirePermission } from '../services/authorization';
+import { ROLE_ACCESS, hasRole } from '../../shared/role-permissions';
+import { getOpenSession, isCashTender, NO_CASH_SESSION_ID, requireOpenSessionForCashTender } from '../services/shift-session-gate';
 import {
-  calculateConfiguredChargeTaxes,
-  combineItemAndChargeTaxes,
   getActiveCountryPack,
   scaleTaxSnapshots,
 } from '../services/tax';
 import { applyPayableRounding } from '../services/tax-engine';
+import { calculateOrderTotals, recomputeOrderTotals } from '../services/orders';
 import { sendEvent } from '../services/telemetry';
 import { getBaseCurrency, getSecondaryCurrencies } from '../currency-config';
 import {
@@ -35,10 +36,12 @@ import {
 } from '../countries';
 
 const router = Router();
-const OWNER_MANAGER_ROLE_PLACEHOLDERS = ROLE_ACCESS.ownerManager.map(() => '?').join(', ');
 
 export function getTenantCurrency(): string {
-  return resolveTenantCurrency(getSettingValue('currency'), getSettingValue('country'));
+  // '' rather than a default country code: resolveTenantCurrency throws
+  // RegionalNotConfiguredError on an unresolvable country instead of
+  // silently defaulting, which is what we want if this is ever actually null.
+  return resolveTenantCurrency(getSettingValue('currency'), getSettingValue('country') || '');
 }
 
 type BillLoyaltyRow = {
@@ -384,6 +387,10 @@ function checkPinRateLimit(key: string): boolean {
   return true;
 }
 
+export function resetPinRateLimitForTests(): void {
+  pinAttempts.clear();
+}
+
 function parsePaginationInteger(value: unknown, defaultValue: number): number | null {
   if (value === undefined || value === null || value === '') return defaultValue;
   if (Array.isArray(value)) return null;
@@ -392,7 +399,7 @@ function parsePaginationInteger(value: unknown, defaultValue: number): number | 
   return parsed;
 }
 
-router.get('/', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, res: Response) => {
+router.get('/', requirePermission('bills.read'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     let query = 'SELECT * FROM bills WHERE 1=1';
@@ -455,7 +462,7 @@ router.get('/', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, 
   }
 });
 
-router.get('/:id', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, res: Response) => {
+router.get('/:id', requirePermission('bills.read'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const bill = addBillLoyaltyFields(db, parseRowJson(db.prepare('SELECT * FROM bills WHERE id = ?').get(req.params.id)));
@@ -474,7 +481,7 @@ router.get('/:id', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Reques
 });
 
 // Get bill by order ID
-router.get('/order/:orderId', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, res: Response) => {
+router.get('/order/:orderId', requirePermission('bills.read'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const bill = addBillLoyaltyFields(db, parseRowJson(db.prepare('SELECT * FROM bills WHERE order_id = ? ORDER BY created_at DESC LIMIT 1').get(req.params.orderId)));
@@ -492,7 +499,7 @@ router.get('/order/:orderId', requireRole(...ROLE_ACCESS.ownerManagerCashier), (
   }
 });
 
-router.post('/generate', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, res: Response) => {
+router.post('/generate', requirePermission('bills.generate'), (req: Request, res: Response) => {
   try {
     const { order_id } = req.body;
 
@@ -520,7 +527,7 @@ router.post('/generate', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: 
         const orderTotal         = order.total           || 0;
 
         const currency = getTenantCurrency();
-        const pack = getActiveCountryPack(getSettingValue('country') || 'IN');
+        const pack = getActiveCountryPack(getSettingValue('country') || '');
         const { total: roundedOrderTotal, adjustment: orderRoundOff } = applyPayableRounding(orderTotal, pack, currency);
 
         const totalsChanged =
@@ -575,7 +582,7 @@ router.post('/generate', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: 
       const packagingCharge = order.packaging_charge || 0;
       const serviceCharge = order.service_charge || 0;
       const currency = getTenantCurrency();
-      const pack = getActiveCountryPack(getSettingValue('country') || 'IN');
+      const pack = getActiveCountryPack(getSettingValue('country') || '');
       const { total, adjustment: roundOff } = applyPayableRounding(order.total || 0, pack, currency);
 
       const runResult = db.prepare(`
@@ -598,7 +605,7 @@ router.post('/generate', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: 
     res.status(result.isNew ? 201 : 200).json({ bill: { ...result.bill, order: orderWithItems } });
   } catch (error: any) {
     console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Internal server error" });
   }
 });
 
@@ -1377,10 +1384,14 @@ export function syncUnpaidBillsForOrder(
 ): void {
   const bills = db.prepare('SELECT * FROM bills WHERE order_id = ? ORDER BY id').all(orderId) as any[];
   const splitBills = bills.some((bill) => bill.split_group_id);
-  if (splitBills && bills.some((bill) => bill.payment_status !== 'unpaid' || Number(bill.paid_amount || 0) > 0)) {
+  const settledSplitBill = (bill: { paid_amount?: number | string | null; payment_status?: string; total?: number | string | null }) =>
+    Number(bill.paid_amount || 0) > 0
+    || (bill.payment_status === 'paid' && Number(bill.total || 0) > 0)
+    || (bill.payment_status !== 'unpaid' && bill.payment_status !== 'paid');
+  if (splitBills && bills.some(settledSplitBill)) {
     throw Object.assign(new Error('Cannot modify an order after a split check is paid'), { statusCode: 409 });
   }
-  const unpaidBills = bills.filter((bill) => bill.payment_status !== 'paid');
+  const unpaidBills = bills.filter((bill) => bill.payment_status !== 'paid' || Number(bill.paid_amount || 0) === 0);
   if (unpaidBills.length === 0) return;
 
   const tenantCurrency = getTenantCurrency();
@@ -1475,18 +1486,27 @@ export function syncUnpaidBillsForOrder(
   `);
 
   bills.forEach((bill, index) => {
-    if (bill.payment_status === 'paid') return;
     const total = allocations.total[index];
+    const balance = Math.max(0, total - Number(bill.paid_amount || 0));
+    const zeroClosed = bill.payment_status === 'paid' && Number(bill.paid_amount || 0) === 0;
+    if (bill.payment_status === 'paid' && !zeroClosed) return;
     update.run(
       allocations.subtotal[index], allocations.taxAmount[index], breakdowns[index], snapshots[index],
       allocations.discountAmount[index], allocations.deliveryCharge[index], allocations.packagingCharge[index], allocations.serviceCharge[index],
-      allocations.roundOff[index], total, Math.max(0, total - Number(bill.paid_amount || 0)), now(), bill.id,
+      allocations.roundOff[index], total, balance, now(), bill.id,
     );
+    if (total <= 0 && balance <= 0) {
+      if (bill.payment_status !== 'paid') {
+        db.prepare(`UPDATE bills SET payment_status = 'paid', paid_at = ?, updated_at = ? WHERE id = ?`).run(now(), now(), bill.id);
+      }
+    } else if (zeroClosed) {
+      db.prepare(`UPDATE bills SET payment_status = 'unpaid', paid_at = NULL, updated_at = ? WHERE id = ?`).run(now(), bill.id);
+    }
   });
 }
 
 // Split unpaid dine-in bill into independently payable guest checks.
-router.post('/:id/split-check', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, res: Response) => {
+router.post('/:id/split-check', requirePermission('bills.generate'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     if (getSettingValue('split_checks_enabled') !== 'true') return res.status(403).json({ error: 'Split checks are not enabled' });
@@ -1805,7 +1825,7 @@ function paymentTransactionKey(payment: unknown): string | null {
     : null;
 }
 
-function transactionPaymentMatches(existing: any, candidate: PaymentInput, currency: string): boolean {
+function transactionPaymentMatches(existing: any, candidate: PaymentInput, currency: string, db: ReturnType<typeof getDatabase>): boolean {
   if (!existing) return false;
   if (existing.method !== candidate.method || existing.transaction_id !== candidate.transaction_id) return false;
   if ((existing.notes ?? null) !== (candidate.notes ?? null)) return false;
@@ -1815,7 +1835,7 @@ function transactionPaymentMatches(existing: any, candidate: PaymentInput, curre
   const factor = getCurrencyMinorUnitFactor(currency);
   const requestedMinorUnits = paymentAmountMinorUnits(candidate.amount, currency);
   const storedRequested = existing.requested_amount
-    ?? (existing.method === 'cash' && existing.tendered_amount !== undefined ? existing.tendered_amount : existing.amount);
+    ?? (isCashTender(db, existing) && existing.tendered_amount !== undefined ? existing.tendered_amount : existing.amount);
   return typeof storedRequested === 'number' && Math.round(storedRequested * factor) === requestedMinorUnits;
 }
 
@@ -1899,7 +1919,7 @@ function preparePaymentBatch(
   const replay = requestTransactionKeys.every((key, index) => (
     key !== null
     && existingTransactionKeys.has(key)
-    && transactionPaymentMatches(existingTransactionPayments.get(key), resolvedPayments[index], currency)
+    && transactionPaymentMatches(existingTransactionPayments.get(key), resolvedPayments[index], currency, db)
   ));
   if (replay) {
     return { bill, prepared: [], existingPayments, effectiveCustomerId, idempotentReplay: true };
@@ -1911,9 +1931,14 @@ function preparePaymentBatch(
     }
     if (key) seenTransactionKeys.add(key);
   }
+  if (bill.payment_status === 'refunded' || bill.payment_status === 'partially_refunded') {
+    throw Object.assign(new Error('Cannot accept payment on a refunded bill'), { statusCode: 409 });
+  }
   if (bill.payment_status === 'paid') throw Object.assign(new Error('Bill is already paid'), { statusCode: 400 });
   const remainingCents = Math.max(0, Math.round((Number(bill.total) - Number(bill.paid_amount || 0)) * minorFactor));
-  if (remainingCents <= 0) throw Object.assign(new Error('Bill is already fully paid'), { statusCode: 400 });
+  if (remainingCents <= 0) {
+    return { bill, prepared: [], existingPayments, effectiveCustomerId };
+  }
   // Multi-currency: settle every line in base-currency cents. A secondary-
   // currency tender is converted here, at the entry of the pipeline, so all
   // downstream allocation/rounding stays single-currency and unchanged.
@@ -1949,19 +1974,18 @@ function preparePaymentBatch(
     }
     return {
       payment: normalizedPayment,
-      method: normalizedPayment.method,
       requestedCents: amount,
       amountOmitted: amountValue === undefined,
     };
   });
-  const nonCashCents = raw.filter((line) => line.method !== 'cash').reduce((sum, line) => sum + line.requestedCents, 0);
+  const nonCashCents = raw.filter((line) => !isCashTender(db, line.payment)).reduce((sum, line) => sum + line.requestedCents, 0);
   if (nonCashCents > remainingCents) throw Object.assign(new Error('Non-cash payment exceeds the bill balance'), { statusCode: 400 });
   const cashRequiredCents = remainingCents - nonCashCents;
   // Partial payments remain supported. Cash is allocated up to the amount
   // needed after non-cash lines; a short tender simply leaves a partial bill.
   let cashLeft = cashRequiredCents;
   const prepared: PreparedPayment[] = raw.map((line) => {
-    if (line.method !== 'cash') return { payment: line.payment, amountCents: line.requestedCents, amountOmitted: line.amountOmitted };
+    if (!isCashTender(db, line.payment)) return { payment: line.payment, amountCents: line.requestedCents, amountOmitted: line.amountOmitted };
     const applied = Math.min(line.requestedCents, cashLeft);
     cashLeft -= applied;
     if (applied === 0 && line.payment.transaction_id) {
@@ -2035,6 +2059,10 @@ function applyPaymentBatch(
   if (idempotentReplay) {
     return { bill: parseRowJson(db.prepare('SELECT * FROM bills WHERE id = ?').get(billId)), walletDebited: false, loyaltyPointsEarned: 0 };
   }
+  // Shift enforcement (#279) runs after replay detection: retrying an already
+  // recorded payment must succeed even if its shift has since closed.
+  requireOpenSessionForCashTender(db, payments);
+  const activeSessionId = getOpenSession(db)?.id ?? NO_CASH_SESSION_ID;
   const currency = getTenantCurrency();
   const minorFactor = getCurrencyMinorUnitFactor(currency);
   const totalAppliedCents = prepared.reduce((sum, line) => sum + line.amountCents, 0);
@@ -2045,10 +2073,11 @@ function applyPaymentBatch(
   const paymentStatus = newBalanceCents === 0 ? 'paid' : 'partial';
   const newPayments = prepared.map((line) => ({
     ...line.payment,
+    cash_session_id: activeSessionId,
     amount: line.amountCents / minorFactor,
     requested_amount: (line.tenderedCents || line.amountCents) / minorFactor,
     amount_omitted: Boolean(line.amountOmitted),
-    ...(line.payment.method === 'cash' ? { tendered_amount: (line.tenderedCents || 0) / minorFactor, change_amount: (line.changeCents || 0) / minorFactor } : {}),
+    ...(isCashTender(db, line.payment) ? { tendered_amount: (line.tenderedCents || 0) / minorFactor, change_amount: (line.changeCents || 0) / minorFactor } : {}),
     timestamp: now(),
   }));
   let walletDebited = false;
@@ -2071,12 +2100,16 @@ function applyPaymentBatch(
   db.prepare(`UPDATE bills SET paid_amount = ?, balance = ?, payment_status = ?, payment_details = ?, paid_at = CASE WHEN ? = 'paid' THEN ? ELSE paid_at END, updated_at = ? WHERE id = ?`).run(newPaidCents / minorFactor, newBalanceCents / minorFactor, paymentStatus, JSON.stringify(allPayments), paymentStatus, paymentStatus === 'paid' ? changedAt : null, changedAt, billId);
   let loyaltyPointsEarned = 0;
   if (paymentStatus === 'paid') {
-    const unpaidSibling = db.prepare(`SELECT 1 FROM bills WHERE order_id = ? AND id != ? AND payment_status != 'paid' LIMIT 1`).get(bill.order_id, bill.id);
+    const unpaidSibling = db.prepare(`SELECT 1 FROM bills WHERE order_id = ? AND id != ? AND payment_status NOT IN ('paid', 'refunded', 'partially_refunded') LIMIT 1`).get(bill.order_id, bill.id);
     const orderFullyPaid = !unpaidSibling;
     if (orderFullyPaid) {
-      db.prepare("UPDATE orders SET status = 'completed', completed_at = ?, updated_at = ? WHERE id = ?").run(changedAt, changedAt, bill.order_id);
-      const order = db.prepare('SELECT table_id FROM orders WHERE id = ?').get(bill.order_id) as any;
-      if (order?.table_id) db.prepare("UPDATE tables SET status = 'available', updated_at = ? WHERE id = ?").run(changedAt, order.table_id);
+      // Payment must not resurrect terminal orders (VALID_TRANSITIONS.cancelled = []).
+      const order = db.prepare('SELECT status, table_id FROM orders WHERE id = ?').get(bill.order_id) as any;
+      const canComplete = order && !['cancelled', 'completed'].includes(order.status);
+      if (canComplete) {
+        db.prepare("UPDATE orders SET status = 'completed', completed_at = ?, updated_at = ? WHERE id = ?").run(changedAt, changedAt, bill.order_id);
+        if (order.table_id) db.prepare("UPDATE tables SET status = 'available', updated_at = ? WHERE id = ?").run(changedAt, order.table_id);
+      }
     }
     const cashback = calculateCashback(db, bill, effectiveCustomerId);
     const alreadyCredited = db.prepare(`SELECT id FROM loyalty_ledger WHERE bill_id = ? AND type = 'credit'`).get(bill.id);
@@ -2097,7 +2130,7 @@ function applyPaymentBatch(
   return result;
 }
 
-router.post('/:id/payment', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, res: Response) => {
+router.post('/:id/payment', requirePermission('payments.take'), (req: Request, res: Response) => {
   try {
     const payment = req.body;
     if (!payment || typeof payment !== 'object' || Array.isArray(payment)) {
@@ -2123,7 +2156,7 @@ router.post('/:id/payment', requireRole(...ROLE_ACCESS.ownerManagerCashier), (re
 });
 
 // Atomic split-payment batch endpoint applying payment lines in a single transaction.
-router.post('/:id/payments', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, res: Response) => {
+router.post('/:id/payments', requirePermission('payments.take'), (req: Request, res: Response) => {
   try {
     const body = req.body;
     if (!body || typeof body !== 'object' || Array.isArray(body)) {
@@ -2148,12 +2181,25 @@ router.post('/:id/payments', requireRole(...ROLE_ACCESS.ownerManagerCashier), (r
     res.json(result);
   } catch (error: any) {
     const statusCode = error.statusCode || 500;
+    const errorMessage = String(error.message || '');
+    const isCustomerMismatch = errorMessage === 'Payment customer does not match the bill customer';
     console.error('[API] Batch bill payment failed:', error);
+    if (statusCode >= 500 || isCustomerMismatch) {
+      try {
+        cloudSync.reportDiagnostic({
+          event_id: randomUUID(),
+          event_code: 'payment.batch.failed',
+          severity: 'error',
+          metadata: { status: statusCode, stage: 'payment_batch' },
+          occurred_at: new Date().toISOString(),
+        }, error);
+      } catch { /* diagnostics must never mask the original failure */ }
+    }
     res.status(statusCode).json({ error: statusCode >= 500 ? 'Bill payment failed' : error.message });
   }
 });
 
-router.post('/:id/applyDiscount', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.post('/:id/applyDiscount', requirePermission('bills.discount.apply'), (req: Request, res: Response) => {
   try {
     const { type, value, reason } = req.body;
 
@@ -2171,8 +2217,11 @@ router.post('/:id/applyDiscount', requireRole(...ROLE_ACCESS.ownerManager), (req
       return res.status(404).json({ error: 'Bill not found' });
     }
 
-    if (bill.payment_status === 'paid' || bill.payment_status === 'refunded') {
-      return res.status(400).json({ error: 'Cannot apply discount to a paid or refunded bill' });
+    if (bill.payment_status === 'refunded' || bill.payment_status === 'partially_refunded') {
+      return res.status(409).json({ error: 'Cannot apply discount to a refunded bill' });
+    }
+    if (bill.payment_status === 'paid') {
+      return res.status(400).json({ error: 'Cannot apply discount to a paid bill' });
     }
     if (bill.split_group_id) {
       return res.status(409).json({ error: 'Apply discounts before splitting a bill' });
@@ -2197,15 +2246,15 @@ router.post('/:id/applyDiscount', requireRole(...ROLE_ACCESS.ownerManager), (req
       const managerId = req.body.manager_id || req.body.user_id;
       let user: any = null;
       if (managerId) {
-        const candidate = db.prepare(`SELECT * FROM users WHERE id = ? AND pin_hash IS NOT NULL AND role IN (${OWNER_MANAGER_ROLE_PLACEHOLDERS}) AND is_active = 1`).get(managerId, ...ROLE_ACCESS.ownerManager) as any;
-        if (candidate && verifyPin(candidate.pin_hash, override_pin)) {
+        const candidate = db.prepare('SELECT * FROM users WHERE id = ? AND pin_hash IS NOT NULL AND is_active = 1').get(managerId) as any;
+        if (candidate && hasRole(candidate.role, ROLE_ACCESS.ownerManager) && hasPermission(candidate.id, 'bills.discount.apply') && verifyPin(candidate.pin_hash, override_pin)) {
           user = candidate;
         }
       }
       if (!user) {
-        const managers = db.prepare(`SELECT * FROM users WHERE pin_hash IS NOT NULL AND role IN (${OWNER_MANAGER_ROLE_PLACEHOLDERS}) AND is_active = 1`).all(...ROLE_ACCESS.ownerManager) as any[];
+        const managers = db.prepare('SELECT * FROM users WHERE pin_hash IS NOT NULL AND is_active = 1').all() as any[];
         for (const u of managers) {
-          if (verifyPin(u.pin_hash, override_pin)) {
+          if (hasRole(u.role, ROLE_ACCESS.ownerManager) && hasPermission(u.id, 'bills.discount.apply') && verifyPin(u.pin_hash, override_pin)) {
             user = u;
             break;
           }
@@ -2241,44 +2290,26 @@ router.post('/:id/applyDiscount', requireRole(...ROLE_ACCESS.ownerManager), (req
       }
     }
 
+    // An unpaid, unsplit bill's items are the order's active items, so the fresh
+    // sum is the only basis: the tax it rescales is a sum over those same items.
+    // The read and the recomputation below sit outside `withTxn` on purpose, and
+    // are safe only because no `await` separates them: adding one opens a window
+    // where the items change between what was summed and what is written.
+    const totals = calculateOrderTotals(db, bill.order_id);
     let discountAmount = 0;
     if (type === 'percentage') {
-      discountAmount = (bill.subtotal * Number(value)) / 100;
+      discountAmount = (totals.subtotal * Number(value)) / 100;
     } else {
       discountAmount = Number(value);
     }
     const currency = getTenantCurrency();
     const decimals = getCurrencyFractionDigits(currency);
-    const minorFactor = getCurrencyMinorUnitFactor(currency);
+    discountAmount = Math.min(discountAmount, totals.subtotal);
     discountAmount = Number(discountAmount.toFixed(decimals));
 
     // Derive undiscounted tax basis directly from active items to prevent compounding discounts.
-    const activeItems = db.prepare(
-      "SELECT * FROM order_items WHERE order_id = ? AND status NOT IN ('cancelled', 'voided', 'void_adjustment', 'refunded')"
-    ).all(bill.order_id) as any[];
-    let itemTaxAmount = 0;
-    let itemExclusiveTax = 0;
-    const itemBreakdowns: any[][] = [];
-    const itemSnapshots: (string | null)[] = [];
-    for (const item of activeItems) {
-      const taxAmount = item.tax_amount || 0;
-      itemTaxAmount += taxAmount;
-      if (item.tax_type !== 'inclusive') itemExclusiveTax += taxAmount;
-      if (item.tax_breakdown) {
-        try {
-          const breakdown = JSON.parse(item.tax_breakdown);
-          if (Array.isArray(breakdown)) itemBreakdowns.push(breakdown);
-        } catch { }
-      }
-      itemSnapshots.push(item.tax_snapshot || null);
-    }
-
-    const discountedSubtotal = Math.max(0, bill.subtotal - discountAmount);
-    const taxRatio = bill.subtotal > 0 ? discountedSubtotal / bill.subtotal : 1;
-    const newTaxAmount = Number((itemTaxAmount * taxRatio).toFixed(decimals));
-    const newExclusiveTax = Number((itemExclusiveTax * taxRatio).toFixed(decimals));
     const tenantInfo = {
-      country: getSettingValue('country') || 'IN',
+      country: getSettingValue('country') || '',
       business_type: getSettingValue('business_type') || 'restaurant',
       state_code: getSettingValue('state_code') || '',
       currency: getTenantCurrency(),
@@ -2287,37 +2318,35 @@ router.post('/:id/applyDiscount', requireRole(...ROLE_ACCESS.ownerManager), (req
     const customer = bill.customer_id
       ? db.prepare('SELECT * FROM customers WHERE id = ?').get(bill.customer_id) as any
       : null;
-    const chargeTaxes = calculateConfiguredChargeTaxes(tenantInfo, {
-      ...order,
-      packaging_charge: bill.packaging_charge || 0,
-      delivery_charge: bill.delivery_charge || 0,
-      service_charge: bill.service_charge || 0,
-    }, customer);
-    const taxRollup = combineItemAndChargeTaxes({
-      itemTaxAmount: newTaxAmount,
-      itemExclusiveTaxAmount: newExclusiveTax,
-      itemBreakdowns,
-      itemSnapshots,
-      itemTaxRatio: taxRatio,
-      chargeTaxes,
-      minorFactor,
+    // The bill is the settlement boundary: it rounds the tax even with no discount
+    // applied, which is why this site passes 'always'. Payable rounding is applied
+    // once, below, to the bill total only.
+    const { taxRollup, total: exactTotal } = recomputeOrderTotals({
+      tenantInfo,
+      chargeContext: {
+        ...order,
+        packaging_charge: bill.packaging_charge || 0,
+        delivery_charge: bill.delivery_charge || 0,
+        service_charge: bill.service_charge || 0,
+      },
+      customer,
+      totals,
+      discountAmount,
+      taxScaling: 'always',
     });
     const taxBreakdownJson = JSON.stringify(taxRollup.breakdowns);
-
-    const preRoundTotal = discountedSubtotal + taxRollup.exclusiveTaxAmount
-      + (bill.delivery_charge || 0) + (bill.packaging_charge || 0) + (bill.service_charge || 0);
-    const exactTotal = Number(preRoundTotal.toFixed(decimals));
     const pack = getActiveCountryPack(tenantInfo.country);
     const { total: newTotal, adjustment: newRoundOff } = applyPayableRounding(exactTotal, pack, currency);
     const newBalance = Math.max(0, newTotal - (bill.paid_amount || 0));
 
     const updatedBill = withTxn(() => {
       db.prepare(`
-        UPDATE bills SET discount_amount = ?, discount_type = ?, discount_value = ?,
+        UPDATE bills SET subtotal = ?, discount_amount = ?, discount_type = ?, discount_value = ?,
           discount_reason = ?, tax_amount = ?, tax_breakdown = ?, tax_snapshot = ?,
           total = ?, round_off = ?, balance = ?, updated_at = ?
         WHERE id = ?
       `).run(
+        totals.subtotal,
         discountAmount, type, value, reason || null, taxRollup.taxAmount, taxBreakdownJson,
         taxRollup.snapshotJson, newTotal, newRoundOff, newBalance, now(), req.params.id,
       );
@@ -2325,11 +2354,12 @@ router.post('/:id/applyDiscount', requireRole(...ROLE_ACCESS.ownerManager), (req
       // orders.total stays the exact, unrounded amount — only the bill (the
       // settlement boundary) holds the pack-rounded payable total (#170).
       db.prepare(`
-        UPDATE orders SET discount_amount = ?, discount_type = ?, discount_value = ?,
+        UPDATE orders SET subtotal = ?, discount_amount = ?, discount_type = ?, discount_value = ?,
           discount_reason = ?, tax_amount = ?, tax_breakdown = ?, tax_snapshot = ?,
           total = ?, round_off = ?, updated_at = ?
         WHERE id = ?
       `).run(
+        totals.subtotal,
         discountAmount, type, value, reason || null, taxRollup.taxAmount, taxBreakdownJson,
         taxRollup.snapshotJson, exactTotal, 0, now(), bill.order_id,
       );
@@ -2346,7 +2376,7 @@ router.post('/:id/applyDiscount', requireRole(...ROLE_ACCESS.ownerManager), (req
   }
 });
 
-router.post('/:id/markPrinted', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.post('/:id/markPrinted', requirePermission('bills.print'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const bill = db.prepare('SELECT * FROM bills WHERE id = ?').get(req.params.id);
@@ -2366,7 +2396,7 @@ router.post('/:id/markPrinted', requireRole(...ROLE_ACCESS.ownerManager), (req: 
 });
 
 // POST /api/bills/:id/print - Print or reprint bill
-router.post('/:id/print', requireRole(...ROLE_ACCESS.ownerManagerCashier), asyncHandler(async (req: Request, res: Response) => {
+router.post('/:id/print', requirePermission('printing.execute'), asyncHandler(async (req: Request, res: Response) => {
   try {
     const { print_type } = req.body;
 
@@ -2388,7 +2418,7 @@ router.post('/:id/print', requireRole(...ROLE_ACCESS.ownerManagerCashier), async
 }));
 
 // GET /api/bills/:id/print-history - Get print history for bill
-router.get('/:id/print-history', requireRole(...ROLE_ACCESS.ownerManagerCashier), (req: Request, res: Response) => {
+router.get('/:id/print-history', requirePermission('bills.read'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const prints = db.prepare(`

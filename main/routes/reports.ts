@@ -4,8 +4,7 @@ import {
   dayBoundsInTimezone, getDatabase, getSettingValue, localDateInTimezone, parseDbTimestamp,
   tenantBusinessDayStartTime,
 } from '../db';
-import { requireRole } from '../middleware/security';
-import { ROLE_ACCESS } from '../../shared/role-permissions';
+import { requirePermission } from '../services/authorization';
 import { getOrdersWithItemsForBills } from './bills';
 import { aggregateTaxComponents } from '../services/tax-components';
 import {
@@ -16,8 +15,15 @@ import {
   paymentBreakdown, expensesSummary, profitAndLoss, storeTzOffset,
 } from '../services/reports';
 import { getTenantCurrency } from '../services/refund';
-import { getCurrencyMinorUnitFactor } from '../countries';
+import { getCurrencyMinorUnitFactor, resolveRegionalSnapshot } from '../countries';
 import { computeDayAggregates, paymentMethodBreakdown } from './cash-closures';
+import { getCurrencyFractionDigits } from '../countries';
+import { buildDailySalesExportDataset } from '../services/daily-sales-export';
+import {
+  dailySalesExportFilename,
+  serializeDailySalesExportCsv,
+  serializeDailySalesExportXlsx,
+} from '../services/daily-sales-export-files';
 
 const router = Router();
 
@@ -37,8 +43,18 @@ const WEEKDAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', '
 // "occupying" its table until it's completed or cancelled.
 const ACTIVE_ORDER_STATUS_SQL = "o.status NOT IN ('completed', 'cancelled')";
 
+// Resolves through the country profile when the stored timezone is missing
+// or invalid, matching resolveRegionalSnapshot's own contract, instead of
+// letting bucketByLocalHourAndWeekday()/dayBoundsInTimezone() silently fall
+// back to UTC — reporting a tenant-local day or hour bucket in the wrong
+// zone produces incorrect report data. Only throws RegionalNotConfiguredError
+// when the country itself is unresolvable.
 function tenantTimezone(): string {
-  return getSettingValue('timezone') || 'Asia/Kolkata';
+  return resolveRegionalSnapshot({
+    country: getSettingValue('country') ?? undefined,
+    currency: getSettingValue('currency') ?? undefined,
+    timezone: getSettingValue('timezone') ?? undefined,
+  }).timezone;
 }
 
 function tenantStartTime(): string {
@@ -96,7 +112,7 @@ function pickExtreme(counts: number[], mode: 'max' | 'min', include: (count: num
   return best;
 }
 
-router.get('/daily-stats', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.get('/daily-stats', requirePermission('reports.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const minorFactor = getCurrencyMinorUnitFactor(getTenantCurrency(db));
@@ -107,7 +123,7 @@ router.get('/daily-stats', requireRole(...ROLE_ACCESS.ownerManager), (req: Reque
         COALESCE((SELECT SUM(paid_amount) FROM bills WHERE paid_at >= ? AND paid_at < ?), 0)
         - COALESCE((SELECT SUM(CAST(amount_cents AS REAL)) / ? FROM refunds WHERE created_at >= ? AND created_at < ?), 0) AS sales
     `).get(start, end, minorFactor, start, end) as { sales: number };
-    const paymentMethodsToday = paymentMethodBreakdown(db, today) as { total: number }[];
+    const paymentMethodsToday = paymentMethodBreakdown(db, { startDate: today }) as { total: number }[];
 
     const runningOrders = db.prepare(`
       SELECT COUNT(*) as count FROM orders WHERE status IN ('pending', 'preparing')
@@ -151,11 +167,11 @@ router.get('/daily-stats', requireRole(...ROLE_ACCESS.ownerManager), (req: Reque
     });
   } catch (error: any) {
     console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Internal server error" });
   }
 });
 
-router.get('/summary', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.get('/summary', requirePermission('reports.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const minorFactor = getCurrencyMinorUnitFactor(getTenantCurrency(db));
@@ -175,7 +191,7 @@ router.get('/summary', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, 
         - COALESCE((SELECT SUM(CAST(amount_cents AS REAL)) / ? FROM refunds WHERE created_at >= ? AND created_at < ?), 0) as collected
       FROM bills WHERE created_at >= ? AND created_at < ?
     `).get(start, end, minorFactor, start, end, start, end) as { count: number; total: number; collected: number };
-    const paymentMethodsToday = paymentMethodBreakdown(db, date);
+    const paymentMethodsToday = paymentMethodBreakdown(db, { startDate: date });
 
     const customersToday = db.prepare(`
       SELECT COUNT(*) as count FROM customers WHERE created_at >= ? AND created_at < ?
@@ -197,101 +213,11 @@ router.get('/summary', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, 
     });
   } catch (error: any) {
     console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Internal server error" });
   }
 });
 
-// Unified ERP-style financial report over a date range: sales, payment-method
-// breakdown, expenses, profit & loss, per-staff sales, item/category sales, and
-// a shift summary — everything connected in one payload so the Reports screen
-// and any accounting export see a single consistent picture of a period.
-router.get('/financial', requireRole('owner', 'manager'), (req: Request, res: Response) => {
-  try {
-    const db = getDatabase();
-    const startDate = reportDate(req.query.start_date, reportToday());
-    const endDate = reportDate(req.query.end_date, startDate);
-    const start = reportDayBounds(startDate)[0];
-    const end = reportDayBounds(endDate)[1];
-
-    // Sales — exclude cancelled orders. "net" is the order total (incl. tax and
-    // charges), "gross" the pre-discount item subtotal.
-    const sales = db.prepare(`
-      SELECT COUNT(*) AS order_count,
-        COALESCE(SUM(subtotal), 0) AS gross,
-        COALESCE(SUM(discount_amount), 0) AS discounts,
-        COALESCE(SUM(tax_amount), 0) AS tax,
-        COALESCE(SUM(total), 0) AS net
-      FROM orders
-      WHERE created_at >= ? AND created_at < ? AND status != 'cancelled'
-    `).get(start, end) as { order_count: number; gross: number; discounts: number; tax: number; net: number };
-    const collected = (db.prepare(
-      `SELECT COALESCE(SUM(paid_amount), 0) AS collected FROM bills WHERE created_at >= ? AND created_at < ?`,
-    ).get(start, end) as { collected: number }).collected;
-
-    const payments = paymentMethodBreakdown(db, startDate, endDate, true);
-
-    // Expenses (the expenses module) — compared by local incurred date.
-    const expenseTotal = (db.prepare(
-      `SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE date(incurred_at) >= date(?) AND date(incurred_at) <= date(?)`,
-    ).get(startDate, endDate) as { total: number }).total;
-    const expensesByCategory = db.prepare(`
-      SELECT category, COUNT(*) AS count, COALESCE(SUM(amount), 0) AS total
-      FROM expenses WHERE date(incurred_at) >= date(?) AND date(incurred_at) <= date(?)
-      GROUP BY category ORDER BY total DESC
-    `).all(startDate, endDate);
-
-    const staff = db.prepare(`
-      SELECT o.user_id, u.name AS staff_name, COUNT(*) AS order_count, COALESCE(SUM(o.total), 0) AS sales
-      FROM orders o LEFT JOIN users u ON u.id = o.user_id
-      WHERE o.created_at >= ? AND o.created_at < ? AND o.status != 'cancelled'
-      GROUP BY o.user_id ORDER BY sales DESC
-    `).all(start, end);
-
-    const items = db.prepare(`
-      SELECT oi.product_name, SUM(oi.quantity) AS quantity, COALESCE(SUM(oi.subtotal), 0) AS revenue
-      FROM order_items oi JOIN orders o ON o.id = oi.order_id
-      WHERE o.created_at >= ? AND o.created_at < ? AND o.status != 'cancelled'
-        AND oi.status NOT IN ('cancelled', 'voided', 'void_adjustment')
-      GROUP BY oi.product_name ORDER BY quantity DESC LIMIT 200
-    `).all(start, end);
-
-    const categories = db.prepare(`
-      SELECT COALESCE(c.name, '—') AS category, SUM(oi.quantity) AS quantity, COALESCE(SUM(oi.subtotal), 0) AS revenue
-      FROM order_items oi
-      JOIN orders o ON o.id = oi.order_id
-      LEFT JOIN products p ON p.id = oi.product_id
-      LEFT JOIN categories c ON c.id = p.category_id
-      WHERE o.created_at >= ? AND o.created_at < ? AND o.status != 'cancelled'
-        AND oi.status NOT IN ('cancelled', 'voided', 'void_adjustment')
-      GROUP BY category ORDER BY revenue DESC
-    `).all(start, end);
-
-    const shifts = db.prepare(`
-      SELECT COUNT(*) AS count,
-        SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open_count,
-        SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) AS closed_count
-      FROM shifts WHERE opened_at >= ? AND opened_at < ?
-    `).get(start, end);
-
-    const revenue = Number(sales.net) || 0;
-    res.json({
-      period: { start_date: startDate, end_date: endDate },
-      sales: { ...sales, collected },
-      payments,
-      expenses: { total: expenseTotal, by_category: expensesByCategory },
-      profit: { revenue, expenses: expenseTotal, net: revenue - expenseTotal },
-      staff,
-      items,
-      categories,
-      shifts,
-    });
-  } catch (error: any) {
-    console.error('[API] Internal error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-router.get('/financial-summary', requireRole(...ROLE_ACCESS.owner), (req: Request, res: Response) => {
+router.get('/financial-summary', requirePermission('reports.financial.view'), (req: Request, res: Response) => {
   try {
     const today = reportToday();
     const startDate = reportDate(req.query.start_date, today);
@@ -342,20 +268,20 @@ router.get('/financial-summary', requireRole(...ROLE_ACCESS.owner), (req: Reques
         billCount: Number(collections.bill_count || 0),
         refundCount: Number(refundTotals.refund_count || 0),
         averageOrderValue: collections.bill_count ? (grossCollected - refunded) / collections.bill_count : 0,
-        paymentMethods: paymentMethodBreakdown(db, startDate, endDate, true, true),
+        paymentMethods: paymentMethodBreakdown(db, { startDate, endDate, paidOnly: true, attributeRefundsToBillDate: true }),
         refunds,
       },
     });
   } catch (error: any) {
     console.error('[API] Internal error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Internal server error" });
   }
 });
 
 // Dynamic tax-component report for receipt/report consumers. Components are
 // derived item by item so mixed legacy + categorized bills cannot double-count
 // the categorized portion already present in the bill-level tax_breakdown.
-router.get('/tax-components', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.get('/tax-components', requirePermission('reports.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const today = reportToday();
@@ -399,11 +325,11 @@ router.get('/tax-components', requireRole(...ROLE_ACCESS.ownerManager), (req: Re
     });
   } catch (error: any) {
     console.error('[API] Tax component report failed:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Internal server error" });
   }
 });
 
-router.get('/sales', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.get('/sales', requirePermission('reports.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const today = reportToday();
@@ -438,7 +364,7 @@ router.get('/sales', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, re
       .sort(([left], [right]) => left.localeCompare(right))
       .map(([date, totals]) => ({ date, ...totals }));
 
-    const byPaymentMethod = paymentMethodBreakdown(db, startDate, endDate, true) as { method: string; count: number; total: number }[];
+    const byPaymentMethod = paymentMethodBreakdown(db, { startDate, endDate, paidOnly: true }) as { method: string; count: number; total: number }[];
 
     const byOrderType = db.prepare(`
       SELECT type, COUNT(*) as count, SUM(total) as total
@@ -458,11 +384,11 @@ router.get('/sales', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, re
     });
   } catch (error: any) {
     console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Internal server error" });
   }
 });
 
-router.get('/topProducts', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.get('/topProducts', requirePermission('reports.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const today = reportToday();
@@ -492,11 +418,11 @@ router.get('/topProducts', requireRole(...ROLE_ACCESS.ownerManager), (req: Reque
     res.json({ topProducts });
   } catch (error: any) {
     console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Internal server error" });
   }
 });
 
-router.get('/recentOrders', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.get('/recentOrders', requirePermission('reports.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const requestedLimit = Number(req.query.limit);
@@ -566,11 +492,11 @@ router.get('/recentOrders', requireRole(...ROLE_ACCESS.ownerManager), (req: Requ
     res.json({ recentOrders: ordersWithItems });
   } catch (error: any) {
     console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Internal server error" });
   }
 });
 
-router.get('/tables', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.get('/tables', requirePermission('reports.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const [start, end] = reportDayBounds(reportToday());
@@ -602,7 +528,7 @@ router.get('/tables', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, r
     });
   } catch (error: any) {
     console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Internal server error" });
   }
 });
 
@@ -610,7 +536,7 @@ router.get('/tables', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, r
 // AOV, top staff, top categories, busiest/idlest hour & day-of-week, and
 // average kitchen prep time, aggregated over a trailing window (default 30
 // days) so hour/day patterns reflect a consistent trend rather than one day.
-router.get('/insights', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.get('/insights', requirePermission('reports.view'), (req: Request, res: Response) => {
   try {
     const db = getDatabase();
     const minorFactor = getCurrencyMinorUnitFactor(getTenantCurrency(db));
@@ -708,7 +634,7 @@ router.get('/insights', requireRole(...ROLE_ACCESS.ownerManager), (req: Request,
     });
   } catch (error: any) {
     console.error("[API] Internal error:", error);
-    res.status(500).json({ error: "Internal server error" });
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Internal server error" });
   }
 });
 
@@ -717,7 +643,7 @@ router.get('/insights', requireRole(...ROLE_ACCESS.ownerManager), (req: Request,
 // All are owner/manager (financial data). Every response carries `meta` (range,
 // timezone, generatedAt) so the UI and exports agree on the window.
 
-const ownerManager = requireRole('owner', 'manager');
+const ownerManager = requirePermission('reports.view');
 function withMeta<T extends object>(req: Request, build: (bounds: [string, string], range: { startDate: string; endDate: string }, tz: number) => T) {
   const r = resolvedRange(req);
   return { meta: reportMeta(r), ...build(r.bounds, r.range, storeTzOffset()) } as { meta: ReturnType<typeof reportMeta> } & T;
@@ -747,8 +673,10 @@ router.get('/profit-loss', ownerManager, (req, res) => guard(res, () => withMeta
 // Reuses the snapshot pipeline from `cash-closures.ts` so the X read and
 // the stored Z snapshot never drift apart. Same role gate as the other
 // owner/manager reports. Refund attribution matches financial-summary
-// (paid_at) for display totals; the cash-only expected figure uses refunds
-// by `refunds.created_at` for drawer reality.
+// (paid_at) for display totals; the cash-only expected figure includes active
+// movements and uses refunds by `refunds.created_at` for drawer reality. The
+// opening float is reported separately and intentionally excluded from X's
+// expected figure.
 //
 // UNIT CONVENTIONS for the X envelope (do not rename fields):
 //   * grossCollected, refunded, netCollected, paymentMethods[].total,
@@ -758,12 +686,12 @@ router.get('/profit-loss', ownerManager, (req, res) => guard(res, () => withMeta
 //     client must convert the counted input to cents before subtracting).
 //
 // X vs Z expected (deliberate gap, not a bug):
-//   X's expectedCashCents excludes the opening float — the float is only
-//   captured at close. Same-day X and Z expected values therefore differ
-//   by exactly opening_float_cents. Consumers must not compare them
-//   directly; X is the live drawer expectation, Z is the point-in-time
-//   snapshot that bakes in the float.
-router.get('/x-report', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+//   X's expectedCashCents excludes the opening float, which is reported
+//   separately. Same-day X and Z expected values therefore differ by exactly
+//   opening_float_cents. Consumers must not compare them directly; X is the
+//   live drawer expectation, Z is the point-in-time snapshot that bakes in the
+//   float.
+router.get('/x-report', requirePermission('reports.view'), (req: Request, res: Response) => {
   try {
     const today = reportToday();
     const date = reportDate(req.query.date, today);
@@ -809,7 +737,16 @@ router.get('/x-report', requireRole(...ROLE_ACCESS.ownerManager), (req: Request,
           orderCount: row.orderCount,
         })),
         taxComponents: aggregates.taxComponents,
-        expectedCashCents: aggregates.cashSalesCents - aggregates.cashRefundsByCreatedAtCents,
+        openingFloatCents: aggregates.cashMovements.find((movement) => movement.movement_type === 'opening_float')?.amount_cents ?? null,
+        payInCents: aggregates.payInCents,
+        payOutCents: aggregates.payOutCents,
+        safeDropCents: aggregates.safeDropCents,
+        cashMovements: aggregates.cashMovements,
+        expectedCashCents: aggregates.cashSalesCents
+          + aggregates.payInCents
+          - aggregates.payOutCents
+          - aggregates.safeDropCents
+          - aggregates.cashRefundsByCreatedAtCents,
         // F3: server-resolved prior close; null fields when no prior close
         // exists. The frontend only shows the "no prior close" hint when
         // this is genuinely null (never on transport error).
@@ -821,7 +758,7 @@ router.get('/x-report', requireRole(...ROLE_ACCESS.ownerManager), (req: Request,
     });
   } catch (error: any) {
     console.error('[API] Internal error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Internal server error" });
   }
 });
 
@@ -829,7 +766,7 @@ router.get('/x-report', requireRole(...ROLE_ACCESS.ownerManager), (req: Request,
 // Reads the immutable `cash_closures` row for the requested business date.
 // 404 with `{ alreadyClosed: false }` when no day-close row exists yet.
 // Same role gate as /x-report.
-router.get('/z-report', requireRole(...ROLE_ACCESS.ownerManager), (req: Request, res: Response) => {
+router.get('/z-report', requirePermission('reports.view'), (req: Request, res: Response) => {
   try {
     const today = reportToday();
     const date = reportDate(req.query.date, today);
@@ -854,6 +791,9 @@ router.get('/z-report', requireRole(...ROLE_ACCESS.ownerManager), (req: Request,
         expected_cash_cents: row.expected_cash_cents,
         counted_cash_cents: row.counted_cash_cents,
         variance_cents: row.variance_cents,
+        pay_in_cents: row.pay_in_cents,
+        pay_out_cents: row.pay_out_cents,
+        safe_drop_cents: row.safe_drop_cents,
         gross_collected_cents: row.gross_collected_cents,
         refunded_cents: row.refunded_cents,
         net_collected_cents: row.net_collected_cents,
@@ -862,6 +802,7 @@ router.get('/z-report', requireRole(...ROLE_ACCESS.ownerManager), (req: Request,
         payment_methods: JSON.parse(row.payment_methods_json || '[]'),
         staff_sales: JSON.parse(row.staff_sales_json || '[]'),
         tax_components: JSON.parse(row.tax_components_json || '[]'),
+        cash_movements: JSON.parse(row.cash_movements_json || '[]'),
         z_number: row.z_number,
         closed_by: row.closed_by,
         closed_by_name: userRow?.name ?? row.closed_by,
@@ -871,7 +812,50 @@ router.get('/z-report', requireRole(...ROLE_ACCESS.ownerManager), (req: Request,
     });
   } catch (error: any) {
     console.error('[API] Internal error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Internal server error" });
+  }
+});
+
+// Owner-only daily sales export (xlsx workbook or summary/items CSV pair).
+// Accounting lives in buildDailySalesExportDataset; serializers only encode.
+router.get('/daily-sales/export', requirePermission('reports.daily-sales.export'), async (req: Request, res: Response) => {
+  try {
+    const date = reportDate(req.query.date, reportToday());
+    const format = req.query.format === 'csv' ? 'csv' : req.query.format === 'xlsx' ? 'xlsx' : null;
+    if (!format) {
+      return res.status(400).json({ error: 'format must be xlsx or csv' });
+    }
+    const part = req.query.part === 'summary' || req.query.part === 'items' ? req.query.part : undefined;
+    if (format === 'csv' && !part) {
+      return res.status(400).json({ error: 'CSV export requires part=summary or part=items' });
+    }
+
+    const dataset = buildDailySalesExportDataset(date);
+    const filename = dailySalesExportFilename(date, format, part);
+
+    if (format === 'xlsx') {
+      const buffer = await serializeDailySalesExportXlsx(dataset, {
+        fractionDigits: getCurrencyFractionDigits(dataset.summary.currency),
+      });
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      return res.send(buffer);
+    }
+
+    const csv = serializeDailySalesExportCsv(dataset, part!);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    return res.send(csv);
+  } catch (error: unknown) {
+    const statusCode = typeof error === 'object' && error !== null
+      ? (error as { statusCode?: number }).statusCode
+      : undefined;
+    const message = error instanceof Error ? error.message : 'Internal server error';
+    if (statusCode === 409) {
+      return res.status(409).json({ error: message });
+    }
+    console.error('[API] Daily sales export error:', error);
+    res.status(statusCode || 500).json({ error: statusCode ? message : 'Internal server error' });
   }
 });
 

@@ -1,9 +1,9 @@
 import Decimal from 'decimal.js';
 import { getDatabase, getSettingValue } from '../db';
 import { getBundledCountryPack } from '../tax-packs/bundled';
-import { getCountryByCode, getCurrencyFractionDigits, getCurrencyMinorUnitFactor, type TaxIdFormat } from '../countries';
+import { getCountryByCode, getCurrencyFractionDigits, getCurrencyMinorUnitFactor, resolveTenantCurrency, type TaxIdFormat } from '../countries';
 
-interface TenantInfo {
+export interface TenantInfo {
   country: string;
   business_type: string;
   state_code: string;
@@ -21,7 +21,7 @@ interface Product {
   tax_behavior?: 'country_default' | 'inclusive' | 'exclusive' | 'exempt';
 }
 
-interface Customer {
+export interface Customer {
   taxRegistrationNumber?: string;
   customer_state_code?: string;
 }
@@ -706,14 +706,12 @@ export async function calculateTaxPreview(req: any, res: any): Promise<void> {
     });
 
     const tenantInfo: TenantInfo = {
-      country: settings.country || 'IN',
+      country: settings.country || '',
       business_type: settings.business_type || 'restaurant',
       state_code: settings.state_code || '',
       taxes_enabled: settings.taxes_enabled === 'true',
     };
-    const currency = settings.currency && /^[A-Z]{3}$/.test(settings.currency)
-      ? settings.currency
-      : getCountryByCode(tenantInfo.country)?.currency || 'INR';
+    const currency = resolveTenantCurrency(settings.currency, tenantInfo.country);
     tenantInfo.currency = currency;
     const decimals = getCurrencyFractionDigits(currency);
     const minorFactor = getCurrencyMinorUnitFactor(currency);

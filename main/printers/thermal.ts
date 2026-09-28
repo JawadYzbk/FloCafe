@@ -14,7 +14,7 @@ import {
   dotsForPaperWidth,
   capabilitiesForPrinter,
 } from './profiles';
-import { getCountryByCode, getCurrencyFractionDigits, getCurrencySymbol, resolveTenantCurrency } from '../countries';
+import { getCountryByCode, getCurrencyFractionDigits, getCurrencySymbol, resolveRegionalSnapshot, resolveTenantCurrency } from '../countries';
 import { resolveTaxComponents } from '../services/tax-components';
 import { loadInstalledPrintTemplate, parseBillTemplateSelection } from '../services/print-templates';
 import { renderMerchantReceiptViaDocument } from './document-merchant';
@@ -22,8 +22,7 @@ import { correlationId, type FloErrorCode } from '../errors';
 import { sendEvent } from '../services/telemetry';
 import { cloudSync } from '../services/cloud-sync';
 import { randomUUID } from 'crypto';
-import CodepageEncoder from '@point-of-sale/codepage-encoder';
-import { printLabel, isGeneratedPrintLanguage } from '../print/print-labels.generated';
+import { printLabel } from '../print/print-labels.generated';
 import type { PrintConceptId } from '../../shared/print/concepts';
 import {
   declaredTemplateChargeRows,
@@ -36,34 +35,92 @@ import { renderBillDocumentToClassicLines, renderClassicReceiptViaDocument } fro
 import { renderBillDocumentToCompactLines, renderCompactReceiptViaDocument } from './document-compact';
 import { renderKotDocumentToLines, renderKotViaDocument } from './document-kot';
 import {
-  GENERIC_THERMAL_CAPABILITIES,
-  normalizeThermalText as normalizeThermalTextByCapabilities,
+  renderDeliverySlipViaDocument,
+  type DeliverySlipItemRow,
+  type DeliverySlipOrderRow,
+} from './document-delivery-slip';
+import type { DeliverySlipAddressSource } from '../../shared/print';
+import {
   isThermalTextRepresentable,
-  selectThermalCodePage,
-  escPosCodePageId,
-  mergeThermalCapabilities,
   type ThermalCodePage,
   type ThermalPrinterCapabilities,
 } from '../../shared/print/thermal-capabilities';
 import { ippGetPrinters, ippGetDefaultPrinterName, ippGetPrinterAttributes, ippPrintRaw } from './ipp-client';
-import { buildRasterDiagnosticBands, encodeRasterFeedAndCut, encodeRasterUnits, rasterCapabilityEnabled, type RasterSemanticUnit } from '../../shared/print/raster';
+import { buildRasterDiagnosticBands, encodeRasterFeedAndCut, encodeRasterUnits, rasterCapabilityEnabled } from '../../shared/print/raster';
 import type { RasterSemanticLineGroup } from '../../shared/print/raster';
 import type { PrintDocument } from '../../shared/print/document';
-import { CURRENCY_ASCII_MAP, normalizeCurrencyToAscii } from '../../shared/print/currency';
-import { columnsForPaperWidth as columnsForConfiguredPaperWidth, fitThermalLine, wrapToDisplayCells } from '../../shared/print/width';
+import { columnsForPaperWidth as columnsForConfiguredPaperWidth, displayCellWidth, padToDisplayCells, truncateToDisplayCells } from '../../shared/print/width';
 import {
   bilingualLabelLines,
   buildZReportDocument,
   containsRtlScript,
   layoutStyledUnit,
+  optionalPaymentAmount,
+  projectCashTender,
   selectBilingualFit,
   thermalDisplayWidth,
-  type PrintWarning as SharedPrintWarning,
   type SemanticLabel,
   type ThermalLayoutContext,
   type ZReportDocument,
   type ZReportPrintData,
 } from '../../shared/print';
+import {
+  type PrintWarning,
+  type RasterLineUnit,
+  itemNameWidth,
+  itemAmountWidth,
+  itemRows,
+  addonRows,
+  financialRows,
+  formatCurrency,
+  rightAlign,
+  truncate,
+  truncateShapedLine,
+  normalizePrintLanguage,
+  wrapText,
+  pushWrapped,
+  pushCenteredWrapped,
+  appendPoweredByFooter,
+  normalizeThermalText,
+  maskPhoneOnReceipt,
+  resolveCurrencyPrefix,
+  appendCashDrawerPulse,
+  buildEscPos,
+  parseAddons,
+} from './formatting-helpers';
+
+export {
+  type PrintWarning,
+  type RasterLineUnit,
+  itemNameWidth,
+  itemAmountWidth,
+  itemRows,
+  addonRows,
+  financialRows,
+  formatCurrency,
+  rightAlign,
+  truncate,
+  truncateShapedLine,
+  normalizePrintLanguage,
+  wrapText,
+  pushWrapped,
+  pushCenteredWrapped,
+  appendPoweredByFooter,
+  normalizeThermalText,
+  maskPhoneOnReceipt,
+  resolveCurrencyPrefix,
+  appendCashDrawerPulse,
+  buildEscPos,
+};
+
+export function hasFinancialPrintWarning(warnings: readonly PrintWarning[]): boolean {
+  return warnings.some((warning) => warning.kind === 'financial');
+}
+
+export function makeFinancialPrintRefusalMessage(warnings: readonly PrintWarning[]): string {
+  const row = warnings.find((warning) => warning.kind === 'financial');
+  return `Receipt not printed: a financial row contains unsupported printer text${row?.text ? `: ${row.text}` : '.'} Use a supported printer profile or system/browser printing.`;
+}
 
 export type PrintResult = {
   ok: boolean;
@@ -78,17 +135,6 @@ export type PrintResult = {
   printerStatus?: number;
   warnings?: PrintWarning[];
 };
-
-export type PrintWarning = SharedPrintWarning;
-
-export function hasFinancialPrintWarning(warnings: readonly PrintWarning[]): boolean {
-  return warnings.some((warning) => warning.kind === 'financial');
-}
-
-export function makeFinancialPrintRefusalMessage(warnings: readonly PrintWarning[]): string {
-  const row = warnings.find((warning) => warning.kind === 'financial');
-  return `Receipt not printed: a financial row contains unsupported printer text${row?.text ? `: ${row.text}` : '.'} Use a supported printer profile or system/browser printing.`;
-}
 
 const FINANCIAL_PRINT_REFUSAL_DIAGNOSTIC = 'Receipt not printed: unsupported financial row';
 
@@ -107,6 +153,7 @@ export type DispatchResult = {
 export type PrintFailureClass =
   | 'not_configured'
   | 'offline'
+  | 'needs_attention'
   | 'queue_unavailable'
   | 'spooler_error'
   | 'driver_error'
@@ -128,7 +175,7 @@ const XML_ENTITIES: Record<string, string> = {
 export function sanitizePowerShellStderr(stderr?: string): string {
   if (!stderr) return '';
   const raw = String(stderr).trim();
-  if (!raw.includes('#< CLIXML')) {
+  if (!raw.includes('#< CLIXML') && !raw.includes('<Objs')) {
     return raw;
   }
 
@@ -150,20 +197,34 @@ export function sanitizePowerShellStderr(stderr?: string): string {
     return errorMatches.join('\n').trim();
   }
 
+  // No structured error-stream content — e.g. only progress-record CLIXML
+  // (<Obj S="progress">...), as emitted by module auto-loading during
+  // `Add-Type`. Strip every CLIXML envelope wherever it appears in the
+  // buffer, not just a leading header, and keep the surrounding plain text.
   return raw
-    .replace(/^#<\s*CLIXML[\r\n]*/i, '')
+    .replace(/#<\s*CLIXML[\r\n]*/gi, '')
+    .replace(/<Objs[^>]*>.*?<\/Objs>/gs, '')
     .replace(/_x000D__x000A_/g, '\n')
     .replace(/_x([0-9a-fA-F]{4})_/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
     .trim();
 }
+
+// A network printer that refuses the socket is as gone as an unplugged one; the
+// errnos are matched lowercased because `value` is.
+const NETWORK_UNREACHABLE_RE = /\bconnect (?:econnrefused|ehostunreach|enetunreach)\b/;
 
 /** Stable, privacy-safe classification for fleet telemetry. */
 export function classifyPrintFailure(detail?: string): PrintFailureClass {
   const value = sanitizePowerShellStderr(detail).toLowerCase();
   if (!value) return 'unknown';
   if (value.includes('no printer configured') || value.includes('no windows printer configured')) return 'not_configured';
-  if (value.includes('offline') || value.includes('use printer offline') || value.includes('disconnected')) return 'offline';
-  if (value.includes('not accepting') || value.includes('queue') && value.includes('unavailable') || value.includes('cannot open printer')) return 'queue_unavailable';
+  // The queue the till was told to use is gone: `lp` cannot even name it. Anchored
+  // on `lp:` so a Node filesystem ENOENT is not blamed on the printer.
+  if (value.includes('lp: no such file or directory') || value.includes('printer or class does not exist') || value.includes('no default destination')) return 'not_configured';
+  if (value.includes('offline') || value.includes('use printer offline') || value.includes('disconnected') || value.includes('printer is not available') || NETWORK_UNREACHABLE_RE.test(value)) return 'offline';
+  // The printer is present but needs a person: paper, cover, or a vendor error flag.
+  if (value.includes('out of paper') || value.includes('paper jam') || value.includes('cover is open') || value.includes('needs attention') || value.includes('reported an error')) return 'needs_attention';
+  if (value.includes('not accepting') || value.includes('queue is disabled') || value.includes('disabled since') || value.includes('queue') && value.includes('unavailable') || value.includes('cannot open printer')) return 'queue_unavailable';
   if (value.includes('spool') || value.includes('startdocprinter') || value.includes('startpageprinter')) return 'spooler_error';
   if (value.includes('driver') || value.includes('no driver')) return 'driver_error';
   if (value.includes('access denied') || value.includes('permission')) return 'permission_denied';
@@ -185,9 +246,6 @@ const isMasBuild =
   (process as NodeJS.Process & { mas?: boolean }).mas === true;
 const PRINTER_DETECTION_TIMEOUT_MS = 10_000;
 
-const RECEIPT_BRANDING = 'Powered by FloPOS (flopos.com)';
-const RECEIPT_BRANDING_NAME = RECEIPT_BRANDING;
-const RECEIPT_BRANDING_URL = 'flopos.com';
 export type PrinterColumnWidth = 36 | 42 | 48;
 
 export interface PrinterInfo {
@@ -470,6 +528,38 @@ async function isMacOSDefaultPrinter(name: string, signal?: AbortSignal): Promis
   }
 }
 
+// Windows PowerShell 5.1 encodes redirected stdout/stderr with the console/OEM
+// code page, so decoding those bytes as UTF-8 turns accented diagnostics into
+// replacement characters. Every helper therefore switches its .NET writers to
+// UTF-8 explicitly, and the console code page too where a console exists. The
+// module-loading progress record is silenced because it is framing, not a
+// device reason. Best-effort on purpose: this must never be able to break
+// printing, so a failure here leaves the default streams in place.
+const POWERSHELL_UTF8_PRELUDE = `
+$ProgressPreference = 'SilentlyContinue'
+try {
+  $floUtf8 = New-Object -TypeName System.Text.UTF8Encoding -ArgumentList $false
+  $floOut = New-Object -TypeName System.IO.StreamWriter -ArgumentList ([Console]::OpenStandardOutput()), $floUtf8
+  $floErr = New-Object -TypeName System.IO.StreamWriter -ArgumentList ([Console]::OpenStandardError()), $floUtf8
+  $floOut.AutoFlush = $true
+  $floErr.AutoFlush = $true
+  [Console]::SetOut($floOut)
+  [Console]::SetError($floErr)
+  [Console]::OutputEncoding = $floUtf8
+} catch { }
+`;
+
+/** Command line for a Windows PowerShell helper, with the UTF-8 stream
+ * contract prefixed so no helper can emit console-code-page output. */
+function windowsPowerShellCommandArgs(script: string): string[] {
+  return [
+    '-NoProfile',
+    '-NonInteractive',
+    '-EncodedCommand',
+    Buffer.from(`${POWERSHELL_UTF8_PRELUDE}${script}`, 'utf16le').toString('base64'),
+  ];
+}
+
 // Enumerate printers via Get-CimInstance (Win32_Printer) using -EncodedCommand.
 const DETECT_WINDOWS_PRINTERS_SCRIPT = `
 $ErrorActionPreference = 'Stop'
@@ -479,6 +569,7 @@ try {
     ConvertTo-Json -Compress
 } catch {
   [Console]::Error.WriteLine($_.Exception.Message)
+  [Console]::Error.Flush()
   exit 1
 }
 `;
@@ -494,10 +585,9 @@ async function detectWindowsPrinters(signal?: AbortSignal): Promise<PrinterInfo[
   const printers: PrinterInfo[] = [];
 
   try {
-    const encoded = Buffer.from(DETECT_WINDOWS_PRINTERS_SCRIPT, 'utf16le').toString('base64');
     const { stdout } = await execFileAsync(
       'powershell',
-      ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+      windowsPowerShellCommandArgs(DETECT_WINDOWS_PRINTERS_SCRIPT),
       { encoding: 'utf8', timeout: PRINTER_DETECTION_TIMEOUT_MS, signal, windowsHide: true, maxBuffer: 10 * 1024 * 1024 },
     );
 
@@ -527,7 +617,13 @@ async function detectWindowsPrinters(signal?: AbortSignal): Promise<PrinterInfo[
       }
     }
   } catch (err) {
-    console.log('[Printer] Could not detect Windows printers via Get-CimInstance:', err);
+    // The detection script is also passed as -EncodedCommand, and the app log
+    // tail is attached to support tickets, so the raw error (whose message
+    // embeds the command line) must never be logged.
+    const rawDetail = sanitizePowerShellStderr(String((err as { stderr?: unknown })?.stderr || '').trim())
+      || describeWindowsPrintProcessFailure(err);
+    const detail = capWindowsPrintDetail(rawDetail);
+    console.log(`[Printer] Could not detect Windows printers via Get-CimInstance: ${detail}`);
   }
 
   return printers;
@@ -826,7 +922,15 @@ export async function printKOT(order: any, items: any[], stationName: string, us
     const db = getDatabase();
     const biz = db.prepare('SELECT * FROM settings LIMIT 1').get() as any;
     const locale = biz?.country ? getCountryByCode(biz.country)?.locale ?? 'en-US' : 'en-US';
-    const timezone = getSettingValue('timezone') || 'Asia/Kolkata';
+    // Resolves through the country profile when the stored timezone is
+    // missing or invalid, matching resolveRegionalSnapshot's own contract.
+    // Throws RegionalNotConfiguredError (naming country, the actual missing
+    // field) only when the country itself is unresolvable.
+    const timezone = resolveRegionalSnapshot({
+      country: getSettingValue('country') ?? undefined,
+      currency: getSettingValue('currency') ?? undefined,
+      timezone: getSettingValue('timezone') ?? undefined,
+    }).timezone;
     const tzOptions = { timeZone: timezone };
 
     const warnings: PrintWarning[] = [];
@@ -887,8 +991,124 @@ export async function printKOT(order: any, items: any[], stationName: string, us
   }
 }
 
-/** Report print failure via telemetry tiers (best-effort, non-blocking). */
-function reportPrintFailure(kind: 'receipt' | 'kot', result: PrintResult): void {
+/** Dispatch a rendered delivery slip to the resolved printer. */
+export async function printDeliverySlip(
+  order: DeliverySlipOrderRow,
+  items: readonly DeliverySlipItemRow[],
+  contact: { name?: string; phone?: string; address?: string; addressSource?: DeliverySlipAddressSource | null },
+  useUnicode: boolean = false,
+  targetPrinter?: { readonly id?: unknown; readonly name?: unknown; readonly connection_type?: string; readonly paper_width?: string; readonly profile_id?: string },
+  signal?: AbortSignal,
+  arabicShapingOverride?: boolean,
+  language?: string,
+  showCustomerPhone?: boolean,
+): Promise<DispatchResult> {
+  try {
+    if (signal?.aborted) return { ok: false, detail: 'Print cancelled during shutdown' };
+    const printer = targetPrinter || getPrinterConfig();
+    if (!printer) {
+      return { ok: false, detail: 'No printer configured' };
+    }
+
+    const { profile, columns: cols, capabilities } = resolvePrinterContext(printer, arabicShapingOverride);
+    const db = getDatabase();
+    // Key/value table: a `SELECT * LIMIT 1` row has no `country` property, so
+    // reading it that way silently pins the slip date to en-US.
+    const countryCode = getSettingValue('country') ?? '';
+    const storeLanguage = getSettingValue('language') ?? undefined;
+    const locale = countryCode ? getCountryByCode(countryCode)?.locale ?? 'en-US' : 'en-US';
+    const timezone = resolveRegionalSnapshot({
+      country: getSettingValue('country') ?? undefined,
+      currency: getSettingValue('currency') ?? undefined,
+      timezone: getSettingValue('timezone') ?? undefined,
+    }).timezone;
+
+    const warnings: PrintWarning[] = [];
+    const nativeCapabilities = nativeFallbackCapabilities(capabilities);
+    const renderWith = (caps: ThermalPrinterCapabilities) => renderDeliverySlipViaDocument(order, items, contact, {
+      columns: cols,
+      language: normalizePrintLanguage(language ?? storeLanguage),
+      locale,
+      timezone,
+      useUnicode,
+      arabicShaping: caps.shaping.arabic,
+      cutMode: profile.cutMode,
+      capabilities: caps,
+      showCustomerPhone: showCustomerPhone ?? true,
+    });
+
+    let data: Buffer;
+    if (rasterCapabilityEnabled(capabilities)) {
+      const documentResult = renderWith(capabilities);
+      const nativeResult = renderWith(nativeCapabilities);
+      const rasterized = await rasterizeDocumentLines(documentResult.lines, documentResult.warnings, {
+        useUnicode,
+        cutMode: profile.cutMode,
+        arabicShaping: capabilities.shaping.arabic,
+        columns: cols,
+        language: normalizePrintLanguage(language ?? storeLanguage),
+        capabilities,
+        requestPrefix: 'delivery-slip',
+      }, documentResult.rasterGroups);
+      if (rasterized.rasterSelected && !rasterized.rasterFailed) {
+        data = rasterized.data;
+        warnings.push(...rasterized.warnings);
+      } else {
+        // The native bytes are going to the printer, so its warnings are the
+        // ones staff must see, or an unrepresentable address reports success.
+        data = nativeResult.data;
+        warnings.push(...nativeResult.warnings, ...rasterized.warnings);
+      }
+    } else {
+      const nativeResult = renderWith(capabilities);
+      data = nativeResult.data;
+      warnings.push(...nativeResult.warnings);
+    }
+
+    if (hasFinancialPrintWarning(warnings)) {
+      return { ok: false, detail: makeFinancialPrintRefusalMessage(warnings), failureClass: 'unsupported', warnings };
+    }
+    const dispatch = await dispatchPrint(printer, data, signal);
+    return warnings.length > 0 ? { ...dispatch, warnings } : dispatch;
+  } catch (error: unknown) {
+    console.error('[Printer] Delivery slip print error:', error);
+    return { ok: false, detail: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+export async function printDeliverySlipDetailed(...args: Parameters<typeof printDeliverySlip>): Promise<PrintResult> {
+  const id = correlationId();
+  try {
+    const dispatch = await printDeliverySlip(...args);
+    const result: PrintResult = dispatch.ok
+      ? { ok: true, correlationId: id, stage: 'dispatch', warnings: dispatch.warnings }
+      : {
+        ok: false,
+        code: 'print.delivery_slip.failed',
+        correlationId: id,
+        stage: 'dispatch',
+        detail: dispatch.detail,
+        failureClass: dispatch.failureClass || classifyPrintFailure(dispatch.detail),
+        platformErrorCode: dispatch.platformErrorCode || extractPlatformErrorCode(dispatch.detail),
+        jobId: dispatch.jobId,
+        driverName: dispatch.driverName,
+        printerStatus: dispatch.printerStatus,
+        warnings: dispatch.warnings,
+      };
+    if (!result.ok) reportPrintFailure('delivery_slip', result);
+    return result;
+  } catch (error) {
+    const detail = (error as Error).message;
+    const result: PrintResult = { ok: false, code: 'print.delivery_slip.failed', correlationId: id, stage: 'dispatch', detail, failureClass: classifyPrintFailure(detail), platformErrorCode: extractPlatformErrorCode(detail) };
+    reportPrintFailure('delivery_slip', result);
+    return result;
+  }
+}
+
+/**
+ * Report print failure via telemetry tiers (best-effort, non-blocking).
+ */
+function reportPrintFailure(kind: 'receipt' | 'kot' | 'delivery_slip', result: PrintResult): void {
   let connectionType = 'unknown';
   try {
     connectionType = getPrinterConfig()?.connection_type || 'unknown';
@@ -1102,7 +1322,8 @@ function receiptDocumentLines(
   cutMode: PrinterCutMode,
   capabilities: ThermalPrinterCapabilities,
 ): RasterDocumentLines | null {
-  const biz = business || { name: 'Store', address: '', phone: '', taxRegistrationNumber: '' };
+  // See formatReceipt's identical placeholder below for why country + currency are both required.
+  const biz = business || { name: 'Store', address: '', phone: '', taxRegistrationNumber: '', country: 'US', currency: 'USD' };
   const rasterBiz = {
     ...biz,
     ...(biz.customer_phone ? { customer_phone: maskPhoneOnReceipt(String(biz.customer_phone)) } : {}),
@@ -1339,7 +1560,11 @@ export function formatReceipt(order: any, bill: any, business?: any, template?: 
   console.log('[Printer] formatReceipt - items count:', order?.items?.length || 0, 'cols:', cols);
 
   const lang = normalizePrintLanguage(language);
-  const biz = business || { name: 'Store', address: '', phone: '', taxRegistrationNumber: '' };
+  // No business info supplied at all (e.g. a synthetic preview) — a neutral
+  // explicit country + currency, never a default country or INR
+  // (docs/reference/product-invariants.md). resolveTenantCurrency validates the
+  // country before it ever looks at currency, so both must be present.
+  const biz = business || { name: 'Store', address: '', phone: '', taxRegistrationNumber: '', country: 'US', currency: 'USD' };
   // Merchant templates resolve through document pipeline; pack templates use compliance renderer.
   const selection = parseBillTemplateSelection(template);
   const templateCapabilities = selection?.source === 'pack' || selection?.source === 'merchant'
@@ -1447,7 +1672,9 @@ function renderEscposLineTemplateV1(payload: any, profile: { columns: number; la
   const fractionDigits = getCurrencyFractionDigits(currency);
   const trimDecimals = biz.trim_decimals === true;
   const locale = getCountryByCode(biz.country)?.locale ?? 'en-US';
-  const prefix = resolveCurrencyPrefix(biz.currency_symbol || getCurrencySymbol(currency, locale) || currency, useUnicode, capabilities, false, currency);
+  // CLDR-derived only — a stored currency_symbol setting is not an input
+  // (docs/reference/product-invariants.md: no per-store override of a snapshot value).
+  const prefix = resolveCurrencyPrefix(getCurrencySymbol(currency, locale) || currency, useUnicode, capabilities, false, currency);
   const normalize = (text: string): string => normalizeThermalText(text, capabilities);
   const configuredTaxLabel = normalize(sanitizeTemplateLabelText(String(payload?.fields?.taxRegistrationNumberLabel || getCountryByCode(biz.country)?.taxIdLabel || 'Tax ID')));
   const taxComponents = resolveTaxComponents({ ...bill, items: order.items });
@@ -1474,8 +1701,16 @@ function renderEscposLineTemplateV1(payload: any, profile: { columns: number; la
   lines.push(normalize(printLabel(lang, 'receipt.date')) + ': ' + date.toLocaleDateString(locale + '-u-nu-latn', tzOptions));
   lines.push(normalize(printLabel(lang, 'print.time')) + ': ' + date.toLocaleTimeString(locale + '-u-nu-latn', tzOptions));
   if (biz.show_table_number !== false && order.table?.name) lines.push(truncateShapedLine(formatTableLabel(order.table.name, lang), cols, arabicShaping, lang, capabilities));
+  // The heading marks these as the customer's details, so a receipt that also
+  // prints the store address cannot read as carrying a second business address.
+  const deliveryAddress = String(order?.delivery_address ?? '').trim();
+  if (deliveryAddress.length > 0) lines.push(normalize(printLabel(lang, 'print.customerDetails')));
   if (biz.show_customer_name !== false && biz.customer_name) lines.push(truncateShapedLine(printLabel(lang, 'pos.customer') + ': ' + biz.customer_name, cols, arabicShaping, lang, capabilities));
   if (biz.show_customer_phone !== false && biz.customer_phone) lines.push(normalize(printLabel(lang, 'print.numberShort')) + ': ' + biz.customer_phone);
+  if (deliveryAddress.length > 0) {
+    // Wrapped, not truncated, so the courier reads the whole address.
+    pushWrapped(lines, normalize(printLabel(lang, 'print.deliverySlip.address')) + ': ' + deliveryAddress, cols, lang, capabilities);
+  }
   lines.push(dash);
   lines.push(pluginItemHeader(layout, cols, lang, capabilities));
   lines.push(dash);
@@ -1542,8 +1777,23 @@ function renderEscposLineTemplateV1(payload: any, profile: { columns: number; la
       if (payments && Array.isArray(payments)) {
         for (const payment of payments) {
           if (payment && payment.method) {
+            const amount = Number(payment.amount) || 0;
             const methodLabel = truncate(resolvePaymentMethodLabel(String(payment.method), lang), cols - 12, lang, capabilities);
-            pushFinancialLines(financialRows(methodLabel, formatCurrency(payment.amount, prefix, locale, trimDecimals, fractionDigits), cols, lang, capabilities));
+            pushFinancialLines(financialRows(methodLabel, formatCurrency(amount, prefix, locale, trimDecimals, fractionDigits), cols, lang, capabilities));
+            const tender = projectCashTender({
+              method: String(payment.method),
+              amount,
+              tendered: optionalPaymentAmount(payment.tendered_amount),
+              change: optionalPaymentAmount(payment.change_amount),
+            });
+            if (tender) {
+              const tenderedLabel = truncate(printLabel(lang, 'receipt.cashReceived'), cols - 12, lang, capabilities);
+              pushFinancialLines(financialRows(tenderedLabel, formatCurrency(tender.tendered, prefix, locale, trimDecimals, fractionDigits), cols, lang, capabilities));
+              if (tender.change > 0) {
+                const changeLabel = truncate(printLabel(lang, 'pos.changeReturned'), cols - 12, lang, capabilities);
+                pushFinancialLines(financialRows(changeLabel, formatCurrency(tender.change, prefix, locale, trimDecimals, fractionDigits), cols, lang, capabilities));
+              }
+            }
           }
         }
       }
@@ -1567,12 +1817,6 @@ function renderEscposLineTemplateV1(payload: any, profile: { columns: number; la
   return buildEscPos(lines, useUnicode, { cutMode, arabicShaping, columns: cols, language: lang, capabilities, financialLineRanges }, warnings);
 }
 
-export function appendPoweredByFooter(lines: string[], cols: number = 48): void {
-  lines.push('', '');
-  for (const line of wrapText(RECEIPT_BRANDING, cols)) {
-    lines.push('{CENTER}{FONT_B}' + line + '{/FONT_B}{/CENTER}');
-  }
-}
 
 /** Compact thermal receipt: builds PrintDocument and renders via document-compact pipeline. */
 export function formatCompactReceipt(order: any, bill: any, biz: any, cols: number = 48, useUnicode: boolean = false, isReprint: boolean = false, cutMode: PrinterCutMode = 'full', warnings?: PrintWarning[], arabicShaping: boolean = false, lang: string = 'en', additionalLanguage?: string, capabilities?: ThermalPrinterCapabilities): Buffer {
@@ -1732,7 +1976,7 @@ function pluginSummaryRow(label: string, amount: string, layout: any, cols: numb
     ], Math.max(0, cols - labelWidth - amountWidth), cols);
   }
   const safeLabel = truncate(normalizedLabel, cols - 12, lang, capabilities);
-  return safeLabel + rightAlign(amount, cols - safeLabel.length);
+  return safeLabel + rightAlign(amount, cols - displayCellWidth(safeLabel));
 }
 
 function composePluginColumns(columns: Array<PluginLineColumn & { value: string }>, gap: number, cols: number): string {
@@ -1742,174 +1986,22 @@ function composePluginColumns(columns: Array<PluginLineColumn & { value: string 
     Number(column.width),
     column.align || 'left',
   )).join(separator);
-  return truncateCell(line, cols, false).padEnd(Math.min(cols, line.length));
+  return padToDisplayCells(truncateCell(line, cols, false), cols);
 }
 
 function alignCell(value: string, width: number, align: PluginColumnAlign): string {
-  const text = truncateCell(value, width, true);
-  if (align === 'right') return text.padStart(width);
-  if (align === 'center') {
-    const left = Math.floor((width - text.length) / 2);
-    return ' '.repeat(Math.max(0, left)) + text.padEnd(Math.max(0, width - left));
-  }
-  return text.padEnd(width);
+  return padToDisplayCells(truncateCell(value, width, true), width, align);
 }
 
 function truncateCell(text: string, length: number, ellipsis: boolean): string {
   const value = String(text || '');
   if (length <= 0) return '';
-  if (value.length <= length) return value;
-  if (!ellipsis || length <= 2) return value.slice(0, length);
-  return value.slice(0, length - 2) + '..';
+  if (displayCellWidth(value) <= length) return value;
+  if (!ellipsis || length <= 2) return truncateToDisplayCells(value, length);
+  return truncateToDisplayCells(value, length - 2) + '..';
 }
 
-// Item row layout: [ name (nameLen) ][ qty (4) ][ amount right-aligned (amtLen) ].
-// Inline layout with overflow handled on full-width lines.
-export function itemNameWidth(cols: number, amtLen: number): number {
-  return Math.max(1, cols - 4 - amtLen);
-}
 
-export function itemAmountWidth(
-  order: { items?: Array<{ total?: number; addons?: unknown }> } | null | undefined,
-  prefix: string,
-  locale: string,
-  trimDecimals: boolean,
-  cols: number,
-  fractionDigits: number = 2,
-): number {
-  // rightAlign() keeps at least one separator before an amount, so reserve
-  // that separator when a long currency prefix expands the amount column.
-  let width = 10;
-  for (const item of order?.items ?? []) {
-    width = Math.max(width, formatCurrency(item.total ?? 0, prefix, locale, trimDecimals, fractionDigits).length + 1);
-    for (const addon of parseAddons(item.addons)) {
-      if (addon?.price) {
-        width = Math.max(width, formatCurrency(addon.price, prefix, locale, trimDecimals, fractionDigits).length + 1);
-      }
-    }
-  }
-  return Math.min(width, Math.max(1, cols - 5));
-}
-
-export function itemRows(item: any, nameLen: number, amtLen: number, cols: number, prefix: string, locale: string = 'en-US', trimDecimals: boolean = false, language: string = 'en', fractionDigits: number = 2, capabilities?: ThermalPrinterCapabilities): string[] {
-  const qtyW = 4;
-  const productName = normalizeThermalText(item.product_name, capabilities);
-  const amount = formatCurrency(item.total, prefix, locale, trimDecimals, fractionDigits);
-  const qty = String(item.quantity).padEnd(qtyW);
-  const maxLine1Name = Math.max(1, nameLen - 1);
-
-  if (productName.length <= maxLine1Name) {
-    const label = productName.padEnd(nameLen) + qty;
-    return [label + rightAlign(amount, cols - label.length)];
-  }
-
-  const nameLines = wrapText(productName, maxLine1Name);
-  const firstLineName = (nameLines[0] || '').padEnd(nameLen);
-  const firstRowLabel = firstLineName + qty;
-  const firstRow = firstRowLabel + rightAlign(amount, cols - firstRowLabel.length);
-
-  const result = [firstRow];
-  for (let i = 1; i < nameLines.length; i++) {
-    result.push(nameLines[i]);
-  }
-  return result;
-}
-
-export function addonRows(addon: any, nameLen: number, amtLen: number, cols: number, prefix: string, locale: string = 'en-US', trimDecimals: boolean = false, language: string = 'en', fractionDigits: number = 2, capabilities?: ThermalPrinterCapabilities): string[] {
-  const addonName = normalizeThermalText(addon.name, capabilities);
-  const quantity = typeof addon.quantity === 'number' && addon.quantity > 1 ? ` x${addon.quantity}` : '';
-  const fullName = '  + ' + addonName + quantity;
-
-  if (!addon.price) {
-    const lines = wrapText(fullName, cols);
-    return lines.map((l) => l + ' '.repeat(Math.max(0, cols - l.length)));
-  }
-
-  const price = formatCurrency(addon.price, prefix, locale, trimDecimals, fractionDigits);
-
-  if (fullName.length <= nameLen) {
-    const label = fullName.padEnd(nameLen);
-    return [label + rightAlign(price, cols - label.length)];
-  }
-
-  const nameLines = wrapText(fullName, nameLen);
-  const firstLine = (nameLines[0] || '').padEnd(nameLen);
-  const firstRow = firstLine + rightAlign(price, cols - firstLine.length);
-
-  const result = [firstRow];
-  for (let i = 1; i < nameLines.length; i++) {
-    result.push('    ' + nameLines[i]);
-  }
-  return result;
-}
-
-export function financialRows(label: string, value: string, cols: number, _language: string = 'en', capabilities?: ThermalPrinterCapabilities): string[] {
-  const normalizedLabel = normalizeThermalText(label, capabilities);
-  const safeLabel = capabilities?.raster.enabled === true && !isThermalTextRepresentable(normalizedLabel, capabilities)
-    ? normalizedLabel
-    : normalizedLabel.slice(0, Math.max(1, cols - 1));
-  const inlineWidth = Math.max(1, cols - safeLabel.length - 1);
-  if (value.length <= inlineWidth) {
-    return [safeLabel + rightAlign(value, cols - safeLabel.length)];
-  }
-  return [safeLabel, ...wrapValue(value, cols)];
-}
-
-function wrapValue(value: string, cols: number): string[] {
-  const width = Math.max(1, cols);
-  const lines: string[] = [];
-  for (let offset = 0; offset < value.length; offset += width) {
-    lines.push(value.slice(offset, offset + width));
-  }
-  return lines.length > 0 ? lines : [''];
-}
-
-function parseAddons(addons: any): any[] {
-  return Array.isArray(addons) ? addons : [];
-}
-
-function getSafeLatnLocale(locale: string | undefined): string {
-  if (!locale) return 'en-US-u-nu-latn';
-  if (/-nu-[a-z0-9]+/i.test(locale)) {
-    return locale.replace(/-nu-[a-z0-9]+/i, '-nu-latn');
-  }
-  if (locale.includes('-u-')) {
-    return `${locale}-nu-latn`;
-  }
-  return `${locale}-u-nu-latn`;
-}
-
-export function formatCurrency(amount: number, prefix: string, locale: string = 'en-US', trimDecimals: boolean = false, fractionDigits: number = 2): string {
-  const numeric = Number(amount) || 0;
-  const factor = 10 ** fractionDigits;
-  const hasDecimals = Math.round(numeric * factor) % factor !== 0;
-  const safeLocale = getSafeLatnLocale(locale);
-  const formattedNum = numeric.toLocaleString(safeLocale, {
-    minimumFractionDigits: trimDecimals && !hasDecimals ? 0 : fractionDigits,
-    maximumFractionDigits: fractionDigits,
-  }).replace(/[\u00A0\u202F]/g, ' ');
-  return prefix + formattedNum;
-}
-
-export function rightAlign(text: string, width: number = 24): string {
-  return ' '.repeat(Math.max(1, width - text.length)) + text;
-}
-
-export function truncate(text: string, length: number, _language: string = 'en', capabilities?: ThermalPrinterCapabilities): string {
-  const normalizedText = normalizeThermalText(text, capabilities);
-  if (capabilities?.raster.enabled === true && !isThermalTextRepresentable(normalizedText, capabilities)) return normalizedText;
-  return normalizedText.length > length ? normalizedText.substring(0, length - 2) + '..' : normalizedText;
-}
-
-export function truncateShapedLine(text: string, length: number, arabicShaping: boolean, language: string = 'en', capabilities?: ThermalPrinterCapabilities): string {
-  const normalizedText = normalizeThermalText(text, capabilities);
-  return arabicShaping && hasArabicScript(normalizedText) ? truncate(normalizedText, Math.max(1, length), language, capabilities) : normalizedText;
-}
-
-/** Resolve receipt label language; falls back to English for unknown languages. */
-export function normalizePrintLanguage(language?: string): string {
-  return language && isGeneratedPrintLanguage(language) ? language : 'en';
-}
 
 const PAYMENT_METHOD_CONCEPTS: Record<string, PrintConceptId> = {
   cash: 'pos.methodCash',
@@ -1933,27 +2025,6 @@ function capitalize(text: string): string {
   return text.length > 0 ? text.charAt(0).toUpperCase() + text.slice(1) : text;
 }
 
-export function wrapText(text: string, cols: number): string[] {
-  return wrapToDisplayCells(text, cols);
-}
-
-export function pushWrapped(lines: string[], text: string, cols: number, _language: string = 'en', capabilities?: ThermalPrinterCapabilities): void {
-  const normalized = normalizeThermalText(text, capabilities);
-  if (capabilities?.raster.enabled === true && !isThermalTextRepresentable(normalized, capabilities)) {
-    lines.push(normalized);
-    return;
-  }
-  for (const line of wrapText(normalized, cols)) lines.push(line);
-}
-
-export function pushCenteredWrapped(lines: string[], text: string, cols: number, _language: string = 'en', capabilities?: ThermalPrinterCapabilities): void {
-  const normalized = normalizeThermalText(text, capabilities);
-  if (capabilities?.raster.enabled === true && !isThermalTextRepresentable(normalized, capabilities)) {
-    lines.push('{CENTER}' + normalized + '{/CENTER}');
-    return;
-  }
-  for (const line of wrapText(normalized, cols)) lines.push('{CENTER}' + line + '{/CENTER}');
-}
 
 /** Kitchen order ticket: builds KotDocument and renders via document-kot pipeline. */
 export function formatKOT(order: any, items: any[], stationName: string, cols: number = 48, useUnicode: boolean = false, cutMode: PrinterCutMode = 'full', locale: string = 'en-US', tzOptions?: any, warnings?: PrintWarning[], arabicShaping: boolean = false, language?: string, capabilities?: ThermalPrinterCapabilities): Buffer {
@@ -2020,9 +2091,10 @@ export function buildTestPage(paperWidth: string = '80mm', cutMode: PrinterCutMo
 /**
  * Build the ESC/POS bytes for a Z-report (cierre de caja) from a stored
  * `cash_closures` row. Day-close, no bill — sections in spec print order:
- * header → Z number + business date + period → opening float → sales by
- * payment method → refunds → tax breakdown → staff sales → expected /
- * counted / variance (variance emphasized) → operator + signature → footer.
+ * header → Z number + business date + period → opening float → cash
+ * movements → sales by payment method → refunds → tax breakdown → staff
+ * sales → expected / counted / variance (variance emphasized) → operator +
+ * signature → footer.
  * The byte builder never touches the drawer pulse; that is appended by
  * `printZReport` (the route layer) so the byte form is reusable for the
  * WebUSB `bytes: number[]` branch where the renderer dispatches.
@@ -2033,18 +2105,22 @@ export function buildZReportBody(z: any, language?: string, printer?: { columns?
   const additionalLanguage = z?.__additionalLanguage
     ? normalizePrintLanguage(z.__additionalLanguage)
     : undefined;
-  const tz = getSettingValue('timezone') || 'Asia/Kolkata';
   const settingsRows = getDatabase()
     .prepare('SELECT key, value FROM settings')
     .all() as { key: string; value: string }[];
   const settings: Record<string, string> = Object.fromEntries(
     settingsRows.map((r) => [r.key, r.value]),
   );
-  const currency = resolveTenantCurrency(settings.currency, settings.country);
+  // Single resolution for currency/locale/timezone — resolves the stored
+  // timezone through the country profile when missing or invalid, instead of
+  // leaving it undefined (which would use the server's own host timezone,
+  // not the tenant's, for the printed period timestamps).
+  const snapshot = resolveRegionalSnapshot(settings);
+  const currency = snapshot.currency;
   const fractionDigits = getCurrencyFractionDigits(currency);
   const factor = 10 ** fractionDigits;
-  const countryCode = settings.country;
-  const locale = getCountryByCode(countryCode)?.locale ?? 'en-US';
+  const locale = snapshot.locale;
+  const tz = snapshot.timezone;
   const prefix = resolveCurrencyPrefix(
     getCurrencySymbol(currency, locale),
     false,
@@ -2056,7 +2132,7 @@ export function buildZReportBody(z: any, language?: string, printer?: { columns?
     try {
       const d = parseDbTimestamp(iso);
       if (isNaN(d.getTime())) return iso;
-      return d.toLocaleString('en-US-u-nu-latn', tz ? { timeZone: tz } : undefined);
+      return d.toLocaleString('en-US-u-nu-latn', { timeZone: tz });
     } catch {
       return iso;
     }
@@ -2070,6 +2146,9 @@ export function buildZReportBody(z: any, language?: string, printer?: { columns?
     periodStart: localTime(z?.period_start),
     periodEnd: localTime(z?.period_end),
     openingFloatCents: Number(z?.opening_float_cents) || 0,
+    payInCents: Number(z?.pay_in_cents) || 0,
+    payOutCents: Number(z?.pay_out_cents) || 0,
+    safeDropCents: Number(z?.safe_drop_cents) || 0,
     paymentMethods: (Array.isArray(z?.payment_methods) ? z.payment_methods : []).map((row: any) => ({
       method: String(row?.method || ''),
       count: Number(row?.count) || 0,
@@ -2128,6 +2207,12 @@ export function buildZReportBody(z: any, language?: string, printer?: { columns?
 
   pushZReportHeading(sections, zDocument.openingFloat.label, zContext, true);
   sections.push('{FINANCIAL}' + rightAlign(formatAmount(zDocument.openingFloat.cents), cols));
+  sections.push('');
+
+  pushZReportSectionHeading(sections, zDocument.cashMovements.heading, zContext);
+  pushZReportLabelValue(sections, zDocument.cashMovements.payIn.label, formatAmount(zDocument.cashMovements.payIn.cents), zContext);
+  pushZReportLabelValue(sections, zDocument.cashMovements.payOut.label, formatAmount(zDocument.cashMovements.payOut.cents), zContext);
+  pushZReportLabelValue(sections, zDocument.cashMovements.safeDrop.label, formatAmount(zDocument.cashMovements.safeDrop.cents), zContext);
   sections.push('');
 
   pushZReportSectionHeading(sections, zDocument.payments.heading, zContext);
@@ -2323,281 +2408,7 @@ export async function printZReport(z: any, signal?: AbortSignal, targetPrinter?:
   }
 }
 
-// Every ASCII fallback is no wider than 3 characters, so currency labels such
-// as USD/EUR/INR have a stable reserved slot in receipt amount columns.
-// CURRENCY_ASCII_MAP is imported from shared/print/currency.
 
-const CURRENCY_TOKEN_RE = new RegExp(
-  Object.keys(CURRENCY_ASCII_MAP)
-    .sort((left, right) => right.length - left.length)
-    .map((value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-    .join('|'),
-  'g',
-);
-
-const ESC_POS_CONTROL_TOKEN_RE = /\{\/?(?:CENTER|BOLD|DOUBLE_HEIGHT|DOUBLE_WIDTH|FONT_B)\}|\{(?:CUT|FEED|INIT|STORE_NAME|FINANCIAL)\}/g;
-
-export function normalizeThermalText(text: string, capabilities: ThermalPrinterCapabilities = GENERIC_THERMAL_CAPABILITIES): string {
-  if (capabilities.raster.enabled === true && !isThermalTextRepresentable(text, capabilities)) return text;
-  return normalizeThermalTextByCapabilities(text, capabilities);
-}
-
-export function maskPhoneOnReceipt(phone: string): string {
-  if (!phone || phone.length < 4) return phone;
-  return 'x'.repeat(phone.length - 4) + phone.slice(-4);
-}
-
-// Resolves currency symbol into printed text padded to minimum 3-column slot.
-// Must run before rightAlign() computes padding.
-export function resolveCurrencyPrefix(symbol: string, useUnicode: boolean, capabilities?: ThermalPrinterCapabilities, preserveConfiguredSymbol = false, currencyCode?: string): string {
-  // Normalize fa-IR IRR token to avoid unshaped output on generic ESC/POS printers.
-  const normalizedSymbol = preserveConfiguredSymbol ? symbol : (symbol === 'ریال' ? 'IRR' : symbol);
-  if (preserveConfiguredSymbol) return normalizedSymbol;
-  const isAsciiSafe = /^[\x00-\x7F]+$/.test(normalizedSymbol);
-  const normalizedForCapabilities = capabilities
-    ? normalizeThermalTextByCapabilities(normalizedSymbol, capabilities)
-    : normalizedSymbol;
-  const fallbackCurrency = currencyCode || normalizedSymbol.slice(0, 3).toUpperCase() || 'Rs';
-  const mappedFallback = normalizedSymbol === '¥' && currencyCode && currencyCode !== 'JPY'
-    ? fallbackCurrency
-    : (CURRENCY_ASCII_MAP[normalizedSymbol] || fallbackCurrency);
-  const rawPrefix = capabilities
-    ? (normalizedSymbol.trim().length > 0 && selectThermalCodePage(normalizedForCapabilities, capabilities) !== null
-      ? normalizedForCapabilities
-      : mappedFallback)
-    : (normalizedSymbol.trim().length > 0 && (useUnicode || isAsciiSafe))
-      ? normalizedSymbol
-      : mappedFallback;
-  const prefix = rawPrefix;
-  return prefix.length >= 3 ? prefix : ' '.repeat(3 - prefix.length) + prefix;
-}
-
-// Arabic/Persian scripts require contextual shaping; allowed only when profile declares support.
-const ARABIC_SCRIPT_GLOBAL_RE = /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/g;
-const ARABIC_SHAPING_ALLOWED_GLOBAL_RE = /[\u200C\u200D\u200F\u2026]/g;
-const ESCPOS_TEXT_CONTROL_RE = /[\x00-\x1F\x7F]/g;
-
-function hasArabicScript(text: string): boolean {
-  return /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/.test(text);
-}
-
-/** Precise warning that distinguishes Arabic shaping from generic unsupported chars. */
-function makeUnsupportedLineWarning(isStoreName: boolean, text: string): string {
-  const label = isStoreName ? 'Store name' : 'Receipt line';
-  const why = hasArabicScript(text)
-    ? 'it contains Persian/Arabic script and the printer does not declare Arabic shaping support'
-    : 'it contains unsupported characters';
-  return `${label} was not printed because ${why}: ${text}`;
-}
-
-export function appendCashDrawerPulse(data: Buffer): Buffer {
-  return Buffer.concat([data, Buffer.from([0x1B, 0x70, 0x00, 0x19, 0xFA])]);
-}
-
-/** Build ESC/POS bytes and classify unsupported financial rows for transport guard. */
-export interface RasterLineUnit {
-  readonly lineIndex: number;
-  readonly lineCount?: number;
-  readonly unit: RasterSemanticUnit;
-}
-
-export function buildEscPos(lines: string[], _useUnicode: boolean = false, options: { cutMode?: PrinterCutMode; arabicShaping?: boolean; columns?: number; language?: string; capabilities?: ThermalPrinterCapabilities; rasterUnits?: readonly RasterLineUnit[]; rasterFailures?: readonly { lineIndex: number; lineCount: number; financial: boolean }[]; financialLineRanges?: readonly { lineIndex: number; lineCount: number }[] } = {}, warnings?: PrintWarning[]): Buffer<ArrayBuffer> {
-  const buf: number[] = [];
-  const useLegacyUnicode = options.capabilities === undefined && _useUnicode;
-  const capabilities = mergeThermalCapabilities(options.capabilities, options.arabicShaping);
-  const hasNativeCodePage = capabilities.encoding.codePages.some((codePage) => codePage !== 'ascii');
-  let activeCodePage = capabilities.encoding.preferredCodePage;
-  const rasterEntries = options.rasterUnits ?? [];
-  const rasterFailures = options.rasterFailures ?? [];
-  const financialLineRanges = options.financialLineRanges ?? [];
-  const rasterByLine = new Map<number, typeof rasterEntries[number]['unit']>();
-  const rasterLineCounts = new Map<number, number>();
-  const rasterRanges: Array<{ start: number; end: number }> = [];
-  const failedRasterRanges: Array<{ start: number; end: number }> = [];
-  for (const entry of rasterEntries) rasterLineCounts.set(entry.lineIndex, (rasterLineCounts.get(entry.lineIndex) ?? 0) + 1);
-  const encodedRasterByLine = new Map<number, Uint8Array>();
-  let financialRasterFailure = rasterFailures.some((failure) => failure.financial);
-  let financialTextFailure = false;
-  for (const entry of rasterEntries) {
-    const lineCount = entry.lineCount ?? 1;
-    const lineIndexValid = Number.isSafeInteger(entry.lineIndex) && entry.lineIndex >= 0
-      && Number.isSafeInteger(lineCount) && lineCount > 0 && entry.lineIndex + lineCount <= lines.length;
-    const financial = entry.unit.financial === true;
-    const overlaps = lineIndexValid && rasterRanges.some((range) => entry.lineIndex < range.end && entry.lineIndex + lineCount > range.start);
-    const bindingError = !lineIndexValid
-      ? 'Raster unit line range is outside the print document'
-      : (rasterLineCounts.get(entry.lineIndex) ?? 0) > 1 || overlaps
-        ? 'Multiple raster units share one line index'
-        : null;
-    if (bindingError) {
-      if (financial) financialRasterFailure = true;
-      if (warnings) warnings.push({
-        field: financial ? 'financial row' : 'receipt line',
-        text: entry.unit.unitId,
-        message: bindingError,
-        kind: financial ? 'financial' : 'line',
-      });
-      continue;
-    }
-    try {
-      if (!rasterCapabilityEnabled(capabilities)) throw new Error('Raster output is not enabled for this printer profile');
-      encodedRasterByLine.set(entry.lineIndex, encodeRasterUnits([entry.unit], capabilities));
-      rasterByLine.set(entry.lineIndex, entry.unit);
-      rasterRanges.push({ start: entry.lineIndex, end: entry.lineIndex + lineCount });
-    } catch (error) {
-      failedRasterRanges.push({ start: entry.lineIndex, end: entry.lineIndex + lineCount });
-      if (financial) financialRasterFailure = true;
-      const message = error instanceof Error ? error.message : String(error);
-      if (!warnings) throw new Error(message);
-      warnings.push({
-        field: financial ? 'financial row' : 'receipt line',
-        text: entry.unit.unitId,
-        message,
-        kind: financial ? 'financial' : 'line',
-      });
-    }
-  }
-  if (financialRasterFailure) return Buffer.alloc(0);
-
-  const resetAllStyles = () => {
-    buf.push(0x1B, 0x45, 0x00);
-    buf.push(0x1B, 0x21, 0x00);
-    buf.push(0x1B, 0x61, 0x00);
-  };
-
-  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
-    if (rasterFailures.some((failure) => Number.isSafeInteger(failure.lineIndex)
-      && Number.isSafeInteger(failure.lineCount)
-      && failure.lineIndex <= lineIndex
-      && lineIndex < failure.lineIndex + failure.lineCount)) continue;
-    if (failedRasterRanges.some((range) => range.start <= lineIndex && lineIndex < range.end)) continue;
-    let line = lines[lineIndex];
-    const rasterUnit = rasterByLine.get(lineIndex);
-    if (rasterUnit) {
-      const rasterBytes = encodedRasterByLine.get(lineIndex);
-      if (rasterBytes) {
-        resetAllStyles();
-        buf.push(...rasterBytes);
-        resetAllStyles();
-      }
-      continue;
-    }
-    if (rasterRanges.some((range) => range.start < lineIndex && lineIndex < range.end)) continue;
-    if (line.includes('{INIT}')) {
-      buf.push(0x1B, 0x40);
-      resetAllStyles();
-      if (!useLegacyUnicode && activeCodePage !== 'ascii') {
-        buf.push(0x1B, 0x74, escPosCodePageId(activeCodePage));
-      }
-      continue;
-    }
-
-    if (line.includes('{FEED}')) {
-      buf.push(0x1B, 0x64, 0x05);
-      continue;
-    }
-
-    if (line.includes('{CUT}')) {
-      buf.push(0x1B, 0x64, 0x05);
-      if (options.cutMode === 'partial') {
-        buf.push(0x1D, 0x56, 0x42, 0x00);
-      } else {
-        buf.push(0x1D, 0x56, 0x00);
-      }
-      continue;
-    }
-
-    if (!useLegacyUnicode && !hasNativeCodePage) line = normalizeCurrencyToAscii(line);
-    line = normalizeThermalTextByCapabilities(line, capabilities);
-
-    const isStoreName = line.includes('{STORE_NAME}');
-    const isFinancial = line.includes('{FINANCIAL}') || financialLineRanges.some((range) => Number.isSafeInteger(range.lineIndex)
-      && Number.isSafeInteger(range.lineCount)
-      && range.lineIndex <= lineIndex
-      && lineIndex < range.lineIndex + range.lineCount);
-    line = line.replace(/\{STORE_NAME\}/g, '');
-    let printableLine = line.replace(ESC_POS_CONTROL_TOKEN_RE, '');
-    const lineBold = line.includes('{BOLD}');
-    const lineDH = line.includes('{DOUBLE_HEIGHT}');
-    let lineDW = line.includes('{DOUBLE_WIDTH}');
-    const lineFontB = line.includes('{FONT_B}');
-    const center = line.startsWith('{CENTER}') && line.includes('{/CENTER}');
-    if (lineDW && Number.isInteger(options.columns) && (options.columns as number) > 0) {
-      const styleText = printableLine.replace(CURRENCY_TOKEN_RE, '');
-      const columns = options.columns as number;
-      if (thermalDisplayWidth(styleText) > Math.floor(columns / 2) && thermalDisplayWidth(styleText) <= columns) {
-        line = line.replace(/\{DOUBLE_WIDTH\}|\{\/DOUBLE_WIDTH\}/g, '');
-        lineDW = false;
-        printableLine = line.replace(ESC_POS_CONTROL_TOKEN_RE, '');
-      }
-    }
-    const textWithoutSupportedCurrency = printableLine.replace(CURRENCY_TOKEN_RE, '');
-    const selectedCodePage = selectThermalCodePage(textWithoutSupportedCurrency, capabilities);
-    if (/[^\x00-\x7F]/.test(textWithoutSupportedCurrency)) {
-      // Emit Arabic/Persian script only when profile declares shaping support and line has no other non-ASCII.
-      const arabicOnly = capabilities.shaping.arabic
-        && hasArabicScript(printableLine)
-        && !/[^\x00-\x7F]/.test(
-          textWithoutSupportedCurrency
-            .replace(ARABIC_SCRIPT_GLOBAL_RE, '')
-            .replace(ARABIC_SHAPING_ALLOWED_GLOBAL_RE, '')
-        );
-      const codePageRepresentable = isThermalTextRepresentable(textWithoutSupportedCurrency, capabilities);
-      if (!arabicOnly && !codePageRepresentable) {
-        if (isFinancial) financialTextFailure = true;
-        if (warnings) {
-          const text = printableLine.trim();
-          warnings.push({
-            field: isFinancial ? 'financial row' : isStoreName ? 'store name' : 'receipt line',
-            text,
-            message: makeUnsupportedLineWarning(isStoreName, text),
-            kind: isFinancial ? 'financial' : 'line',
-          });
-        }
-        continue;
-      }
-      line = line.replace(ESCPOS_TEXT_CONTROL_RE, '');
-      printableLine = line.replace(ESC_POS_CONTROL_TOKEN_RE, '');
-      if (Number.isInteger(options.columns) && (options.columns as number) > 0) {
-        const maxCols = lineDW ? Math.floor((options.columns as number) / 2) : (options.columns as number);
-        line = truncate(printableLine, Math.max(1, maxCols), options.language, capabilities);
-      }
-    }
-
-    // ESC/POS mode byte bit 0 selects the character font: 0 = Font A (12x24,
-    // the default), 1 = Font B (9x17, condensed). No token means Font A.
-
-    line = line.replace(ESC_POS_CONTROL_TOKEN_RE, '');
-    if (Number.isInteger(options.columns) && (options.columns as number) > 0) {
-      line = fitThermalLine(line, options.columns as number, lineDW);
-    }
-
-    buf.push(0x1B, 0x61, center ? 0x01 : 0x00);
-
-    let mode = 0;
-    if (lineDH) mode |= 0x10;
-    if (lineDW) mode |= 0x20;
-    if (lineBold) mode |= 0x08;
-    if (lineFontB) mode |= 0x01;
-    buf.push(0x1B, 0x21, mode);
-    if (selectedCodePage && selectedCodePage !== activeCodePage && !useLegacyUnicode) {
-      buf.push(0x1B, 0x74, escPosCodePageId(selectedCodePage));
-      activeCodePage = selectedCodePage;
-    }
-
-    if (lineBold) {
-      buf.push(0x1B, 0x45, 0x01);
-    }
-
-    const encodedText = !useLegacyUnicode && selectedCodePage
-      ? CodepageEncoder.encode(line, selectedCodePage)
-      : Buffer.from(line, 'utf8');
-    buf.push(...encodedText);
-    buf.push(0x0A);
-  }
-
-  return financialTextFailure ? Buffer.alloc(0) : Buffer.from(buf);
-}
 
 /** Convert the command subset emitted by buildEscPos() into a paperless text preview. */
 export function escPosToText(data: Buffer | Uint8Array): string {
@@ -2687,6 +2498,7 @@ export async function printViaNetwork(ip: string, port: number, data: Buffer, si
   return new Promise((resolve) => {
     const client = new net.Socket();
     let settled = false;
+    let connected = false;
     let timer: NodeJS.Timeout | null = null;
 
     const onAbort = (): void => {
@@ -2703,6 +2515,7 @@ export async function printViaNetwork(ip: string, port: number, data: Buffer, si
     };
 
     client.connect(port, ip, () => {
+      connected = true;
       // For small payloads (typical text receipts <4KB), write directly in a single pass.
       if (data.length <= NETWORK_PRINT_CHUNK_SIZE) {
         client.write(data, () => {
@@ -2758,7 +2571,10 @@ export async function printViaNetwork(ip: string, port: number, data: Buffer, si
 
     client.setTimeout(5000, () => {
       client.destroy();
-      finish({ ok: false, detail: `Timed out connecting to ${ip}:${port}` });
+      finish({
+        ok: false,
+        detail: connected ? `Timed out writing to ${ip}:${port}` : `Timed out connecting to ${ip}:${port}`,
+      });
     });
     signal?.addEventListener('abort', onAbort, { once: true });
     if (signal?.aborted) onAbort();
@@ -3039,6 +2855,7 @@ ${WINSPOOL_HELPER_SOURCE}
   exit 0
 } catch {
   [Console]::Error.WriteLine($_.Exception.Message)
+  [Console]::Error.Flush()
   exit 1
 }
 `;
@@ -3065,6 +2882,53 @@ function parseWindowsPrintOutput(output: unknown): Pick<DispatchResult, 'jobId' 
   return parsed;
 }
 
+// Node's execFile error message embeds the complete command line, which for the
+// raw-print helper is `powershell ... -EncodedCommand <base64>`. Process-level
+// failures (timeout, kill, launch failure) report an empty stderr, so that
+// message must never become the printer detail.
+const WINDOWS_PRINT_DETAIL_MAX_LENGTH = 400;
+const WINDOWS_PRINT_COMMAND_EVIDENCE = /Command failed:|-EncodedCommand/i;
+
+/** Stable classification of a failed Windows PowerShell subprocess. */
+export function describeWindowsPrintProcessFailure(error: unknown): string {
+  const failure = (error || {}) as { name?: unknown; code?: unknown; killed?: unknown; signal?: unknown };
+  if (failure.name === 'AbortError' || failure.code === 'ABORT_ERR') return 'Windows print command was cancelled';
+  if (failure.killed === true || failure.code === 'ETIMEDOUT') return 'Windows print command timed out';
+  // Spawn-level failures report an errno string instead of an exit status.
+  if (typeof failure.code === 'string') return 'Could not start the Windows print helper';
+  if (typeof failure.signal === 'string' && failure.signal) return `Windows print helper was terminated (${failure.signal})`;
+  if (typeof failure.code === 'number') return `Windows print helper exited with code ${failure.code}`;
+  return 'Windows raw print failed';
+}
+
+function redactWindowsPrintPayloadPath(detail: string, payloadPath: string): string {
+  if (!detail || !payloadPath) return detail;
+  return detail
+    .split(payloadPath).join('<payload file>')
+    .split(path.dirname(payloadPath)).join('<temp directory>');
+}
+
+const WINDOWS_PRINT_TRUNCATION_SUFFIX = ' [truncated]';
+
+function capWindowsPrintDetail(detail: string): string {
+  if (detail.length <= WINDOWS_PRINT_DETAIL_MAX_LENGTH) return detail;
+  const maxContentLength = Math.max(0, WINDOWS_PRINT_DETAIL_MAX_LENGTH - WINDOWS_PRINT_TRUNCATION_SUFFIX.length);
+  return `${detail.slice(0, maxContentLength).trimEnd()}${WINDOWS_PRINT_TRUNCATION_SUFFIX}`;
+}
+
+/** Bounded, leak-free diagnostic for a failed Windows raw-print subprocess. */
+function describeWindowsRawPrintFailure(
+  error: unknown,
+  options: { payloadPath: string; printerName?: string },
+): string {
+  const cleanStderr = sanitizePowerShellStderr(String((error as { stderr?: unknown })?.stderr || '').trim());
+  const detail = cleanStderr && !WINDOWS_PRINT_COMMAND_EVIDENCE.test(cleanStderr)
+    ? cleanStderr
+    : describeWindowsPrintProcessFailure(error);
+  const redacted = redactWindowsPrintPayloadPath(detail, options.payloadPath).trim();
+  return capWindowsPrintDetail(redacted) || `Windows raw print failed for "${options.printerName || 'printer'}"`;
+}
+
 async function printViaUSBWindows(data: Buffer, printerName?: string, signal?: AbortSignal): Promise<DispatchResult> {
   if (!printerName) {
     const detail = 'No Windows printer configured; refusing to guess a target';
@@ -3078,11 +2942,9 @@ async function printViaUSBWindows(data: Buffer, printerName?: string, signal?: A
   try {
     fs.writeFileSync(tmpFile, data);
 
-    const encoded = Buffer.from(WINSPOOL_HELPER_SCRIPT, 'utf16le').toString('base64');
-
     const { stdout } = await execFileAsync(
       'powershell',
-      ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+      windowsPowerShellCommandArgs(WINSPOOL_HELPER_SCRIPT),
       {
         encoding: 'utf8',
         timeout: 20000,
@@ -3096,13 +2958,11 @@ async function printViaUSBWindows(data: Buffer, printerName?: string, signal?: A
     console.log(`[Printer] Windows raw print accepted for "${printerName}" (${String(stdout).trim()})`);
     return { ok: true, ...metadata };
   } catch (err: any) {
-    const rawStderr = String(err.stderr || '').trim();
-    const cleanStderr = sanitizePowerShellStderr(rawStderr);
-    const detail = cleanStderr || String(err.message || '').trim();
+    const detail = describeWindowsRawPrintFailure(err, { payloadPath: tmpFile, printerName });
     console.error(`[Printer] Windows raw print failed for "${printerName}": ${detail}`);
     return {
       ok: false,
-      detail: detail || `Windows raw print failed for "${printerName}"`,
+      detail,
       failureClass: classifyPrintFailure(detail),
       platformErrorCode: extractPlatformErrorCode(detail),
       ...parseWindowsPrintOutput(err.stdout),

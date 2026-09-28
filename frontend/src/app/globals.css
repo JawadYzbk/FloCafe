@@ -5,7 +5,7 @@
 @custom-variant dark (&:is(.dark *));
 
 :root {
-  --font-sans: "Geist", system-ui, sans-serif;
+  --font-sans: "Geist", "Noto Sans Devanagari", "Nirmala UI", "Kohinoor Devanagari", "Devanagari Sangam MN", system-ui, sans-serif;
   --font-mono: "Geist Mono", monospace;
   --radius: 0.625rem;
   --background: oklch(1 0 0);
@@ -26,6 +26,11 @@
   --border: oklch(0.922 0 0);
   --input: oklch(0.922 0 0);
   --ring: oklch(0.708 0 0);
+  /* Semantic surfaces: new UI uses these instead of raw gray or indigo
+   * utilities. Existing raw-color usage migrates only when that page is
+   * already being touched, not as a standalone sweep. */
+  --panel: var(--card);
+  --selected-row: #e8ebff;
   --chart-1: oklch(0.646 0.222 41.116);
   --chart-2: oklch(0.6 0.118 184.704);
   --chart-3: oklch(0.398 0.07 227.392);
@@ -84,7 +89,6 @@ input[type="number"] {
   min-block-size: var(--flo-titlebar-height);
   align-items: center;
   overflow: hidden;
-  border-block-end: 1px solid var(--border);
   background: var(--background);
   color: var(--foreground);
   -webkit-app-region: drag;
@@ -172,6 +176,49 @@ body:has(.flo-title-bar__fallback-controls) .flo-title-bar__safe-area {
 .flo-title-bar__fallback-button--close:hover {
   background: #e81123;
   color: #ffffff;
+}
+
+/* Windows/Linux application menu: Electron never draws a menu bar for a
+ * frameless window, so the title bar renders the top-level labels and each
+ * click pops that entry's real submenu from the main-process menu. macOS
+ * renders nothing here and keeps its native menu bar. Logical properties keep
+ * the row on the inline-start edge for RTL locales; the buttons are already
+ * no-drag through the shared `.flo-title-bar button` rule above. */
+.flo-title-bar__menu {
+  gap: 0.125rem;
+}
+
+.flo-title-bar__menu-button {
+  padding: 0.25rem 0.5rem;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--foreground);
+  font-size: 0.75rem;
+  line-height: 1rem;
+  white-space: nowrap;
+}
+
+.flo-title-bar__menu-button:hover {
+  background: var(--accent);
+  color: var(--accent-foreground);
+}
+
+/* Dead-center business identity similar to modern desktop title bars (e.g. VS Code). */
+.flo-title-bar__identity {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  max-inline-size: min(45vw, 24rem);
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  line-height: 1.15;
+  text-align: center;
+  user-select: none;
 }
 
 .flo-title-bar--root-drag {
@@ -317,6 +364,8 @@ div:hover > .flo-toast-drain,
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
+  --color-panel: var(--panel);
+  --color-selected-row: var(--selected-row);
   --color-chart-1: var(--chart-1);
   --color-chart-2: var(--chart-2);
   --color-chart-3: var(--chart-3);
@@ -360,6 +409,8 @@ div:hover > .flo-toast-drain,
   --border: oklch(1 0 0 / 12%);
   --input: oklch(1 0 0 / 18%);
   --ring: oklch(0.556 0 0);
+  --panel: var(--card);
+  --selected-row: oklch(0.24 0.03 264);
   --chart-1: oklch(0.488 0.243 264.376);
   --chart-2: oklch(0.696 0.17 162.48);
   --chart-3: oklch(0.769 0.188 70.08);
@@ -378,30 +429,6 @@ div:hover > .flo-toast-drain,
    * has limited contrast on this surface; components using bg-brand-light with
    * text-brand should add dark:text-indigo-300 for legibility. */
   --color-brand-light: oklch(0.20 0.03 270);
-}
-
-/* The standalone Server App is always light, even when the root layout enables dark mode.
- * Reset shared tokens here so reused components retain their light appearance. */
-.server-app-light {
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.97 0 0);
-  --accent-foreground: oklch(0.205 0 0);
-  --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
-  --color-brand-light: #e8ebff;
 }
 
 html.dark::-webkit-scrollbar-thumb,

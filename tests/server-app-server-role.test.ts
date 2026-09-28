@@ -38,7 +38,15 @@ async function postJson(baseUrl: string, pathName: string, body: unknown, token?
     },
     body: JSON.stringify(body),
   });
-  return { status: response.status, body: await response.json() };
+  const text = await response.text();
+  const parsedBody = (() => {
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
+    }
+  })();
+  return { status: response.status, body: parsedBody };
 }
 
 async function getJson(baseUrl: string, pathName: string, token?: string) {
@@ -71,11 +79,23 @@ async function main() {
 
   await startServerApp();
   const baseUrl = `http://127.0.0.1:${getServerAppPort()}`;
+  // This test bypasses the shared test harness (initDatabase() directly, not
+  // initTestDb()), so it doesn't get the central seedTestRegionalDefaults()
+  // choke point. Now that seedInstallDefaults() no longer writes a country
+  // row, a plain UPDATE against a nonexistent row silently no-ops — upsert
+  // instead so these settings always actually take effect.
+  const setSetting = (key: string, value: string) =>
+    db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value);
 
   try {
-    db.prepare("UPDATE settings SET value = 'CO' WHERE key = 'country'").run();
-    db.prepare("UPDATE settings SET value = 'COP' WHERE key = 'currency'").run();
-    db.prepare("UPDATE settings SET value = '$' WHERE key = 'currency_symbol'").run();
+    setSetting('country', '');
+    const unconfiguredInfo = await getJson(baseUrl, '/api/server-app/info');
+    assert.equal(unconfiguredInfo.status, 409, 'Server App refuses to format regional values before a country is configured');
+    assert.equal(unconfiguredInfo.body.error, 'regional_not_configured');
+
+    setSetting('country', 'CO');
+    setSetting('currency', 'COP');
+    setSetting('currency_symbol', '$');
     const copInfo = await getJson(baseUrl, '/api/server-app/info');
     assert.equal(copInfo.status, 200);
     assert.deepEqual({
@@ -92,9 +112,9 @@ async function main() {
       fractionDigits: 0,
     }, 'Server App exposes the COP regional values derived from current settings');
 
-    db.prepare("UPDATE settings SET value = 'KW' WHERE key = 'country'").run();
-    db.prepare("UPDATE settings SET value = 'KWD' WHERE key = 'currency'").run();
-    db.prepare("UPDATE settings SET value = 'KWD' WHERE key = 'currency_symbol'").run();
+    setSetting('country', 'KW');
+    setSetting('currency', 'KWD');
+    setSetting('currency_symbol', 'KWD');
     const kwdInfo = await getJson(baseUrl, '/api/server-app/info');
     assert.equal(kwdInfo.status, 200);
     assert.deepEqual({
@@ -106,10 +126,10 @@ async function main() {
     }, {
       country: 'KW',
       currency: 'KWD',
-      symbol: 'KWD',
+      symbol: 'د.ك.',
       position: 'suffix',
       fractionDigits: 3,
-    }, 'Server App exposes the KWD regional values derived from current settings');
+    }, 'Server App exposes the KWD regional values derived from current settings, from CLDR rather than a stored override');
 
     for (const role of ['cashier', 'chef']) {
       const response = await postJson(baseUrl, '/api/auth/login', {
@@ -133,6 +153,33 @@ async function main() {
       assert.equal(me.status, 200, `${role} token remains valid on /api/auth/me`);
       assert.equal(me.body.user.role, role, `/api/auth/me returns ${role} role`);
     }
+
+    const liveServerLogin = await postJson(baseUrl, '/api/auth/login', {
+      email: 'server@server-app.test', password: 'ServerPass123!',
+    });
+    db.prepare(`INSERT INTO user_permission_overrides
+      (user_id, permission_id, effect, updated_by, created_at, updated_at)
+      VALUES ('server-app-server', 'server-app.use', 'deny', 'server-app-owner', ?, ?)`)
+      .run(now(), now());
+    const deniedLiveSession = await getJson(baseUrl, '/api/auth/me', liveServerLogin.body.access_token);
+    assert.equal(deniedLiveSession.status, 403, 'Server App permission denial applies to an existing session immediately');
+    db.prepare("DELETE FROM user_permission_overrides WHERE user_id = 'server-app-server'").run();
+
+    // Protected forwarded routes must rate-limit LAN clients before auth or downstream work.
+    const customerResponses = await Promise.all(
+      Array.from({ length: 151 }, () => postJson(baseUrl, '/api/customers', {})),
+    );
+    assert.equal(customerResponses.filter(({ status }) => status === 401).length, 150, 'customer requests below the limit reach authentication');
+    assert.equal(customerResponses.filter(({ status }) => status === 429).length, 1, 'customer requests over the limit are throttled on localhost');
+
+    const printKotResponses = await Promise.all(
+      Array.from({ length: 29 }, () => postJson(baseUrl, '/api/printers/print-kot', {})),
+    );
+    assert(printKotResponses.every(({ status }) => status === 401), 'KOT requests below the shared print limit reach authentication');
+    const printBillBeforeLimit = await postJson(baseUrl, '/api/printers/print-bill', {});
+    assert.equal(printBillBeforeLimit.status, 401, 'KOT and bill requests share the print limit before it is exceeded');
+    const printLimit = await postJson(baseUrl, '/api/printers/print-kot', {});
+    assert.equal(printLimit.status, 429, 'print requests over the shared limit are throttled on localhost');
   } finally {
     await stopServerApp();
     closeDatabase();

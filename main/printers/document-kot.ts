@@ -6,12 +6,12 @@ import type { PrintConceptId } from '../../shared/print/concepts';
 import type { PrinterCutMode } from './profiles';
 import type { ThermalPrinterCapabilities } from '../../shared/print/thermal-capabilities';
 import type { RasterSemanticLineGroup } from '../../shared/print/raster';
-import type { PrintWarning } from './thermal';
 import {
   buildEscPos,
   truncate,
   truncateShapedLine,
-} from './thermal';
+  type PrintWarning,
+} from './formatting-helpers';
 import {
   GENERIC_THERMAL_CAPABILITIES,
   isThermalTextRepresentable,
@@ -20,6 +20,7 @@ import {
   thermalTextFallback,
 } from '../../shared/print/thermal-capabilities';
 import { detectPrintLanguageDirection } from './document-classic';
+import { displayCellWidth } from '../../shared/print/width';
 import {
   buildKotDocument,
   isKotItemPending,
@@ -231,11 +232,11 @@ function kotHeaderLines(header: KotHeaderBlock, options: KotDocumentRenderOption
 function kotItemLines(row: KotItemsBlock['rows'][number], cols: number, arabicShaping: boolean, language: string, capabilities?: ThermalPrinterCapabilities): string[] {
   const lines: string[] = [];
   const itemPrefix = row.quantity + 'x  ';
-  lines.push('{DOUBLE_HEIGHT}{BOLD}' + itemPrefix + truncateShapedLine(row.name.text, Math.max(1, cols - itemPrefix.length), arabicShaping, language, capabilities) + '{/BOLD}{/DOUBLE_HEIGHT}');
+  lines.push('{DOUBLE_HEIGHT}{BOLD}' + itemPrefix + truncateShapedLine(row.name.text, Math.max(1, cols - displayCellWidth(itemPrefix)), arabicShaping, language, capabilities) + '{/BOLD}{/DOUBLE_HEIGHT}');
   for (const addon of row.addons) {
     const quantity = addon.quantity ?? 1;
     const quantitySuffix = quantity > 1 ? ` x${quantity}` : '';
-    const name = truncate(addonName(addon), Math.max(1, cols - 4 - quantitySuffix.length), language, capabilities);
+    const name = truncate(addonName(addon), Math.max(1, cols - 4 - displayCellWidth(quantitySuffix)), language, capabilities);
     lines.push('  + ' + name + quantitySuffix);
   }
   if (row.specialInstructions) {

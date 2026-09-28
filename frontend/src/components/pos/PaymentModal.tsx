@@ -77,7 +77,7 @@ const BUILT_IN_PAYMENT_KEYS = {
   card: 'methodCard',
 } as const satisfies Record<'cash' | 'card', PosKey>;
 
-export default function PaymentModal({ bill, currency: _currency, onClose, onPaid, onBillUpdate }: Props) {
+export default function PaymentModal({ bill, onClose, onPaid, onBillUpdate }: Props) {
   const remaining = Number(bill.balance);
   const cartCustomerId = useCartStore((s) => s.customerId);
   const cartCustomer = useCartStore((s) => s.customer);
@@ -499,8 +499,8 @@ export default function PaymentModal({ bill, currency: _currency, onClose, onPai
 
   const tenantForShare = {
     business_name: currentTenant?.business_name || tCommon('businessNameFallback'),
-    currency: currentTenant?.currency || 'INR',
-    country: currentTenant?.country || 'IN',
+    currency: currentTenant?.currency || '',
+    country: currentTenant?.country || '',
   };
 
   const handleSendWhatsApp = async () => {
